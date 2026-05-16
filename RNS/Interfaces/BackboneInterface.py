@@ -34,7 +34,6 @@ import socket
 import select
 import time
 import sys
-import os
 import RNS
 
 class HDLC():
@@ -280,7 +279,7 @@ class BackboneInterface(Interface):
         if interface.socket:
             fileno = interface.socket.fileno()
             if fileno in BackboneInterface.spawned_interface_filenos:
-                try: BackboneInterface.epoll.modify(fileno, select.EPOLLOUT)
+                try: BackboneInterface.epoll.modify(fileno, select.EPOLLIN | select.EPOLLOUT)
                 except Exception as e:
                     RNS.log(f"Error occurred on {interface} while modifying socket EPOLL state: {e}", RNS.LOG_WARNING)
                     raise e
@@ -295,17 +294,19 @@ class BackboneInterface(Interface):
                 try:
                     while True:
                         events = BackboneInterface.epoll.poll(1)
-                        for fileno, event in BackboneInterface.epoll.poll(1):
+                        for fileno, event in events:
                             if fileno in BackboneInterface.spawned_interface_filenos:
                                 spawned_interface = BackboneInterface.spawned_interface_filenos[fileno]
                                 client_socket = spawned_interface.socket
+                                socket_closed = False
                                 if client_socket and fileno == client_socket.fileno() and (event & select.EPOLLIN):
                                     try: received_bytes = client_socket.recv(spawned_interface.HW_MTU)
                                     except Exception as e:
                                         RNS.log(f"Error while reading from {spawned_interface}: {e}", RNS.LOG_DEBUG)
                                         received_bytes = b""
 
-                                    if len(received_bytes): spawned_interface.receive(received_bytes)
+                                    if len(received_bytes):
+                                        spawned_interface.receive(received_bytes)
                                     else:
                                         BackboneInterface.deregister_fileno(fileno); client_socket.close()
                                         try:
@@ -320,8 +321,9 @@ class BackboneInterface(Interface):
                                         except Exception as e: RNS.log(f"Error while removing spawned interface from {pif}: {e}", RNS.LOG_ERROR)
 
                                         spawned_interface.receive(received_bytes)
+                                        socket_closed = True
                                 
-                                elif client_socket and fileno == client_socket.fileno() and (event & select.EPOLLOUT):
+                                if not socket_closed and client_socket and fileno == client_socket.fileno() and (event & select.EPOLLOUT):
                                     try: written = client_socket.send(spawned_interface.transmit_buffer)
                                     except Exception as e:
                                         written = 0
@@ -352,7 +354,7 @@ class BackboneInterface(Interface):
                                     spawned_interface.txb += written
                                     if spawned_interface.parent_interface: spawned_interface.parent_interface.txb += written
                                 
-                                elif client_socket and fileno == client_socket.fileno() and event & (select.EPOLLHUP):
+                                if not socket_closed and client_socket and fileno == client_socket.fileno() and event & (select.EPOLLHUP):
                                     BackboneInterface.deregister_fileno(fileno)
                                     try:
                                         if fileno in BackboneInterface.spawned_interface_filenos: BackboneInterface.spawned_interface_filenos.pop(fileno)

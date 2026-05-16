@@ -39,6 +39,8 @@ import os
 import RNS
 from threading import Lock
 
+QORTAL_RNS_DEDICATED_LOCAL_IO = os.environ.get("QORTAL_RNS_DEDICATED_LOCAL_IO", "1") != "0"
+
 class HDLC():
     FLAG              = 0x7E
     ESC               = 0x7D
@@ -86,7 +88,7 @@ class LocalClientInterface(Interface):
         self.frame_buffer     = b""
         self.transmit_buffer  = b""
 
-        if RNS.vendor.platformutils.use_epoll(): self.epoll_backend = True
+        if RNS.vendor.platformutils.use_epoll() and not QORTAL_RNS_DEDICATED_LOCAL_IO: self.epoll_backend = True
 
         self.pause_on_client_sleep = False
 
@@ -123,6 +125,7 @@ class LocalClientInterface(Interface):
         self.writing = False
 
         self._force_bitrate = False
+        self.send_lock = Lock()
 
         self.announce_rate_target  = None
         self.announce_rate_grace   = None
@@ -130,6 +133,8 @@ class LocalClientInterface(Interface):
 
         if connected_socket == None:
             if not self.epoll_backend:
+                if QORTAL_RNS_DEDICATED_LOCAL_IO:
+                    RNS.log(f"Using dedicated local shared I/O thread for {self}", RNS.LOG_INFO)
                 thread = threading.Thread(target=self.read_loop)
                 thread.daemon = True
                 thread.start()
@@ -241,7 +246,8 @@ class LocalClientInterface(Interface):
                             time.sleep(s)
 
                     data = bytes([HDLC.FLAG])+HDLC.escape(data)+bytes([HDLC.FLAG])
-                    self.socket.sendall(data)
+                    with self.send_lock:
+                        self.socket.sendall(data)
                     self.writing = False
                     self.txb += len(data)
                     if hasattr(self, "parent_interface") and self.parent_interface != None:
@@ -460,7 +466,16 @@ class LocalServerInterface(Interface):
             if hasattr(self, "_force_bitrate"): spawned_interface._force_bitrate = self._force_bitrate
             RNS.Transport.interfaces.append(spawned_interface)
             RNS.Transport.local_client_interfaces.append(spawned_interface)
-            BackboneInterface.add_client_socket(client_socket, spawned_interface)
+            if spawned_interface.epoll_backend:
+                BackboneInterface.add_client_socket(client_socket, spawned_interface)
+            else:
+                try: client_socket.setblocking(True)
+                except Exception as e: RNS.log(f"Could not set local shared client socket to blocking mode: {e}", RNS.LOG_WARNING)
+                if QORTAL_RNS_DEDICATED_LOCAL_IO:
+                    RNS.log(f"Using dedicated local shared I/O thread for {spawned_interface}", RNS.LOG_INFO)
+                thread = threading.Thread(target=spawned_interface.read_loop)
+                thread.daemon = True
+                thread.start()
             self.clients += 1
             return True
 
