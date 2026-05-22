@@ -402,7 +402,7 @@ class Reticulum:
                     RNS.log("Existing shared instance required, but this instance started as shared instance. Aborting startup.", RNS.LOG_VERBOSE)
 
                 else:
-                    RNS.Transport.interfaces.append(interface)
+                    RNS.Transport.add_interface(interface)
                     self.shared_instance_interface = interface
                     self.is_shared_instance = True
                     RNS.log("Started shared instance interface: "+str(interface), RNS.LOG_DEBUG)
@@ -422,7 +422,7 @@ class Reticulum:
                         interface._force_bitrate = True
                         RNS.log(f"Forcing shared instance bitrate of {RNS.prettyspeed(interface.bitrate)}", RNS.LOG_WARNING)
                         interface.optimise_mtu()
-                    RNS.Transport.interfaces.append(interface)
+                    RNS.Transport.add_interface(interface)
                     self.is_shared_instance = False
                     self.is_standalone_instance = False
                     self.is_connected_to_shared_instance = True
@@ -915,7 +915,7 @@ class Reticulum:
                         interface.ifac_identity = RNS.Identity.from_bytes(interface.ifac_key)
                         interface.ifac_signature = interface.ifac_identity.sign(RNS.Identity.full_hash(interface.ifac_key))
 
-                    RNS.Transport.interfaces.append(interface)
+                    RNS.Transport.add_interface(interface)
                     interface.final_init()
 
             interface = None
@@ -1077,7 +1077,7 @@ class Reticulum:
                     interface.ifac_identity = RNS.Identity.from_bytes(interface.ifac_key)
                     interface.ifac_signature = interface.ifac_identity.sign(RNS.Identity.full_hash(interface.ifac_key))
 
-                RNS.Transport.interfaces.append(interface)
+                RNS.Transport.add_interface(interface)
                 interface.final_init()
 
     def _default_ar_target(self):
@@ -1234,28 +1234,43 @@ class Reticulum:
 
     def _used_destination_data(self, destination_hash):
         if self.is_connected_to_shared_instance:
-            rpc_connection = self.get_rpc_client()
-            rpc_connection.send({"destination_data": "used", "destination_hash": destination_hash})
-            response = rpc_connection.recv()
-            return response
+            try:
+                rpc_connection = self.get_rpc_client()
+                rpc_connection.send({"destination_data": "used", "destination_hash": destination_hash})
+                response = rpc_connection.recv()
+                return response
+
+            except Exception as e:
+                RNS.log(f"Shared instance RPC failed while setting destination data use: {e}", RNS.LOG_ERROR)
+                return False
         
         else: return RNS.Identity._used_destination_data(destination_hash)
 
     def _retain_destination_data(self, destination_hash):
         if self.is_connected_to_shared_instance:
-            rpc_connection = self.get_rpc_client()
-            rpc_connection.send({"destination_data": "retain", "destination_hash": destination_hash})
-            response = rpc_connection.recv()
-            return response
+            try:
+                rpc_connection = self.get_rpc_client()
+                rpc_connection.send({"destination_data": "retain", "destination_hash": destination_hash})
+                response = rpc_connection.recv()
+                return response
+
+            except Exception as e:
+                RNS.log(f"Shared instance RPC failed while retaining destination data: {e}", RNS.LOG_ERROR)
+                return False
         
         else: return RNS.Identity._retain_destination_data(destination_hash)
 
     def _unretain_destination_data(self, destination_hash):
         if self.is_connected_to_shared_instance:
-            rpc_connection = self.get_rpc_client()
-            rpc_connection.send({"destination_data": "unretain", "destination_hash": destination_hash})
-            response = rpc_connection.recv()
-            return response
+            try:
+                rpc_connection = self.get_rpc_client()
+                rpc_connection.send({"destination_data": "unretain", "destination_hash": destination_hash})
+                response = rpc_connection.recv()
+                return response
+
+            except Exception as e:
+                RNS.log(f"Shared instance RPC failed while unretaining destination data: {e}", RNS.LOG_ERROR)
+                return False
         
         else: return RNS.Identity._unretain_destination_data(destination_hash)
 
@@ -1264,10 +1279,15 @@ class Reticulum:
             raise TypeError("Cannot retain identity, not a valid identity hash")
 
         if self.is_connected_to_shared_instance:
-            rpc_connection = self.get_rpc_client()
-            rpc_connection.send({"identity_data": "retain", "identity_hash": identity_hash})
-            response = rpc_connection.recv()
-            return response
+            try:
+                rpc_connection = self.get_rpc_client()
+                rpc_connection.send({"identity_data": "retain", "identity_hash": identity_hash})
+                response = rpc_connection.recv()
+                return response
+
+            except Exception as e:
+                RNS.log(f"Shared instance RPC failed while retaining identity: {e}", RNS.LOG_ERROR)
+                return False
         
         else: return RNS.Identity._retain_identity(identity_hash)
 
