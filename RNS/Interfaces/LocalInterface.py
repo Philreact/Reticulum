@@ -207,8 +207,9 @@ class LocalClientInterface(Interface):
 
                 else:
                     self.writing = True
-                    data = bytes([HDLC.FLAG])+HDLC.escape(data)+bytes([HDLC.FLAG])
-                    self.socket.sendall(data)
+                    data = bytes([HDLC.FLAG])+bytes([HDLC.FLAG])
+                    with self.send_lock:
+                        self.socket.sendall(data)
                     self.writing = False
 
             except Exception as e: RNS.log(f"Exception occurred while sending keepalive on {self}: {e}", RNS.LOG_ERROR)

@@ -382,7 +382,7 @@ class InterfaceDiscovery():
     STATUS_AVAILABLE   = 1000
     STATUS_CODE_MAP    = {"available": STATUS_AVAILABLE, "unknown": STATUS_UNKNOWN, "stale": STATUS_STALE}
     AUTOCONNECT_TYPES  = ["BackboneInterface", "TCPServerInterface", "TCPClientInterface"]
-    DISCOVERABLE_TYPES = ["BackboneInterface", "TCPServerInterface", "I2PInterface", "RNodeInterface", "WeaveInterface", "KISSInterface"]
+    DISCOVERABLE_TYPES = ["BackboneInterface", "TCPServerInterface", "TCPClientInterface", "I2PInterface", "RNodeInterface", "WeaveInterface", "KISSInterface"]
 
     discovery_lock     = Lock()
 
