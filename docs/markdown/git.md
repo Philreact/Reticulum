@@ -797,9 +797,26 @@ $ rngit release rns://remote_node/public/myrepo fetch "1.2.0:source_*.tgz"
 
 If your pattern contains no wildcard characters, it must match an artifact name exactly, which is useful for fetching single, specific artifacts. When a pattern matches multiple artifacts, all matched files are fetched and verified. If no artifacts match the pattern, the fetch aborts with an error indicating no matches were found.
 
-**Offline Verification**
+### Offline Verification
 
 Because the release manifest contains embedded signatures, you can verify the integrity of release artifacts offline, without connecting to the repository node. The `rnid` and `rngit` utilities can validate artifact signatures against `.rsg` and manifest files.
+
+**Using a release manifest:**
+
+Ensure the release manifest is located in the same directory as the release artifacts, then run:
+
+```text
+# Verify all artifacts in the manifest
+$ rngit release myapp-1.2.0.rsm verify
+
+# Or, verify only specific artifacts
+$ rngit release myapp-1.2.0.rsm verify "latest:*.whl"
+```
+
+This will load the manifest, and verify all files currently on-disk, but will not attempt to fetch the latest release manifest from the origin, or update local files to match it.
+
+#### NOTE
+The `verify` operation is functionally equivalent to using the `fetch` operation with the `--offline` flag, and they can be used interchangably.
 
 **For individual files:**
 
@@ -811,23 +828,13 @@ $ rnid -V myapp-1.2.0.tar.gz
 
 This validates that the artifact file matches the signature created during the release process. Combined with the manifest’s own signature, this provides end-to-end verification from the original release creation to the final installation.
 
-**For a complete release:**
-
-Ensure the release manifest is located in the same directory as the release artifacts, then run:
-
-```text
-$ rngit release myapp-1.2.0.rsm fetch --offline
-```
-
-This will load the manifest, and verify all files currently on-disk, but will not attempt to fetch the latest release manifest from the origin, or update local files to match it.
-
 ### Creating Signed Releases
 
 Reticulum and the `rngit` system makes it easy to create signed releases that your users can verify and update securely. When you create a release using `rngit`, the program automatically:
 
 1. Generates an Ed25519 signature for each artifact file using your identity’s signing key
 2. Creates `.rsg` signature files alongside each artifact in your distribution directory
-3. Constructs a signed release manifest (`manifest.rsm`) containing metadata, an artifact list, and embedded signatures
+3. Constructs a signed `manifest.rsm` release manifest containing metadata, an artifact list, and embedded signatures
 4. Transmits both artifacts, signatures and manifest to the remote node specified as release origin
 
 As an example, to create and publish a release from all files in the folder named `dist`, simply run:
@@ -1243,7 +1250,7 @@ Each document is a numbered directory containing:
 
 **Nomad Network Interface**
 
-When the Nomad Network page node is enabled, work documents are viewable through the web interface. The work page lists all documents with their status, and clicking a document shows its full content and updates.
+When the Nomad Network page node is enabled, work documents are viewable through the nomadnet interface. The work page lists all documents with their status, and clicking a document shows its full content and updates.
 
 ### Cryptographic Attribution
 
@@ -1298,3 +1305,103 @@ options:
   -q, --quiet
   --version             show program's version number and exit
 ```
+
+## Commit Signing
+
+The `rngit` system includes `rngcs`, a Git commit signing and validation shim that enables commit signing and validation using Reticulum identities. By hooking into Git’s SSH-based signing format, commits can be signed and verified using Reticulum identity keys directly.
+
+Unlike traditional GPG and SSH-based commit signing, which relies on centralized keyservers, cumbersome co-signing procedures or manual per-signer setup, Reticulum commit signing uses self-contained RSG signatures, that can be deterministically resolved to Reticulum identity hashes.
+
+This enables offline verification with no external infrastructure. The signature itself contains everything needed to cryptographically verify the signer’s Reticulum identity and that the commit was signed correctly by the claimed identity.
+
+### Prerequisites
+
+Before you can sign commits, you need a Reticulum identity with a private key. If you don’t already have one, you can generate it using `rnid`:
+
+```text
+$ rnid -g ~/.rngit/client_identity
+
+New identity <1a54d64db7e8beca6f2c6cd17b0cb479> written to /home/user/.rngit/client_identity
+```
+
+The identity file must contain the private key to be usable for signing. The corresponding Reticulum identity hash will be used as the commit author identity.
+
+### Configuration
+
+Git must be configured to use SSH-format signatures with the `rngcs` signing shim, which is included in RNS. You can configure this either globally or per-repository.
+
+**Global Configuration**
+
+Enabling Reticulum commit signing for all repositories is as simple as:
+
+```text
+$ git config --global gpg.format ssh
+$ git config --global gpg.ssh.program rngcs
+$ git config --global gpg.ssh.allowedsignersfile none
+$ git config --global user.signingKey ~/.rngit/client_identity
+```
+
+With this configuration, all commits you sign with `git commit -S` will use your Reticulum identity.
+
+#### NOTE
+The `gpg.ssh.allowedsignersfile` configuration key **must** be *set* for `git` to allow invoking the signing and verification shim. It is not actually used by `rngcs`, and can be set to an arbitrary value. All validation operations happen exclusively based on the information in the embedded RSG data.
+
+**Per-Repository Configuration**
+
+To enable signing only for a specific repository:
+
+```text
+$ cd /path/to/repository
+$ git config --local gpg.format ssh
+$ git config --local gpg.ssh.program rngcs
+$ git config --local gpg.ssh.allowedsignersfile none
+$ git config --local user.signingKey ~/.rngit/client_identity
+```
+
+This is useful when you want to use different identities for different projects, or when only specific repositories require signed commits.
+
+### Author Identity Binding
+
+For the signature to be valid, the Git author email **must** match the Reticulum identity hash of the signing key. You can configure this using a command like the following:
+
+```text
+$ git config --global user.email "1a54d64db7e8beca6f2c6cd17b0cb479"
+```
+
+When `rngcs` verifies a commit, it extracts both the Git author field of the signed commit message and the signer identity from the RSG signature, ensuring they match. This binding is necessary to prevent identity spoofing. If someone crafts a commit with your identity hash in the author field but signs with a different key, verification will fail.
+
+### Signing Commits
+
+Once configured, sign commits using the standard Git `-S` flag:
+
+```text
+$ git commit -S -m "Refactored module"
+
+[master 8f7e6d5] Refactored module
+```
+
+This will create a self-contained RSG-formatted signature, encode the RSG payload using base64, and wrap it in an ASCII-armored SSH-formatted signature block. The signature is then stored in the commit object’s signature header and includes:
+
+- The SHA256 hash of the commit content
+- The signer’s Reticulum identity hash
+- The signer’s public key
+- The actual signature of the complete envelope
+
+### Validating Commit Signatures
+
+Commits are automatically validated when using `git log --show-signature` or `git show --show-signature`. The `rngcs` shim handles all verification operations. If any step fails, verification fails and Git displays an error.
+
+To view signature information for commits, use Git’s standard `--show-signature` option:
+
+```text
+$ git log --show-signature
+
+commit 8f7e6d5c8f7e6d5c8f7e6d5c8f7e6d5c8f7e6d5
+Good "git" signature for commit, signed with Reticulum Identity key <1a54d64db7e8beca6f2c6cd17b0cb479>
+Author: Developer <1a54d64db7e8beca6f2c6cd17b0cb479>
+Date:   Mon Jan 15 09:30:00 2026 +0100
+
+    Refactored module
+```
+
+The output shows whether the commit signature is valid, and whether the author field matches the signing identity.

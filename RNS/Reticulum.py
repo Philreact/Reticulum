@@ -48,6 +48,7 @@ else:
 
 from RNS.vendor.configobj import ConfigObj
 from threading import Lock
+import RNS.vendor.umsgpack as mp
 import configparser
 import multiprocessing.connection
 import importlib.util
@@ -260,6 +261,7 @@ class Reticulum:
         Reticulum.__autoconnect_discovered_interfaces = False
         Reticulum.__required_discovery_value          = None
         Reticulum.__publish_blackhole                 = False
+        Reticulum.__blackhole_update_interval         = RNS.Discovery.BlackholeUpdater.UPDATE_INTERVAL
         Reticulum.__blackhole_sources                 = []
         Reticulum.__interface_sources                 = []
         Reticulum.__default_ar_target                 = None
@@ -452,12 +454,12 @@ class Reticulum:
                 value = self.config["logging"][option]
                 if option == "loglevel" and self.requested_loglevel == None:
                     RNS.loglevel = int(value)
-                    if self.requested_verbosity != None:
-                        RNS.loglevel += self.requested_verbosity
-                    if RNS.loglevel < 0:
-                        RNS.loglevel = 0
-                    if RNS.loglevel > 7:
-                        RNS.loglevel = 7
+                    if self.requested_verbosity != None: RNS.loglevel += self.requested_verbosity
+                    if RNS.loglevel < 0:                 RNS.loglevel = 0
+                    if RNS.loglevel > 7:                 RNS.loglevel = 7
+                elif option == "logtimestamps":
+                    value = self.config["logging"].as_bool(option)
+                    RNS.logtimestamps = bool(value)
 
         if "reticulum" in self.config:
             for option in self.config["reticulum"]:
@@ -581,6 +583,11 @@ class Reticulum:
                         except Exception as e: raise ValueError(f"Invalid identity hash for remote blackhole source: {hexhash}")
                         if not source_identity_hash in Reticulum.__blackhole_sources: Reticulum.__blackhole_sources.append(source_identity_hash)
                 
+                if option == "blackhole_update_interval":
+                    v = self.config["reticulum"].as_float(option)
+                    if v < 2: v = 2
+                    Reticulum.__blackhole_update_interval = v*60
+
                 if option == "interface_discovery_sources":
                     v = self.config["reticulum"].as_list(option)
                     for hexhash in v:
@@ -661,6 +668,9 @@ class Reticulum:
         else:
             self.shared_instance_type = "tcp"
             self.use_af_unix          = False
+
+        if self.shared_instance_type == "tcp":
+            self.local_socket_path = None
 
         if self.local_socket_path == None and self.use_af_unix:
             self.local_socket_path = "default"
@@ -1173,59 +1183,63 @@ class Reticulum:
             os.makedirs(Reticulum.configdir)
         self.config.write()
 
+    def rpc_return(self, connection, response):
+        connection.send_bytes(mp.packb(response))
+
     def rpc_loop(self):
         while RNS.Transport._should_run:
             try:
-                rpc_connection = self.rpc_listener.accept()
-                call = rpc_connection.recv()
+                conn = self.rpc_listener.accept()
+                call = mp.unpackb(conn.recv_bytes())
 
                 if "get" in call:
                     path = call["get"]
 
                     if path == "path_table":
                         mh = call["max_hops"]
-                        rpc_connection.send(self.get_path_table(max_hops=mh))
+                        self.rpc_return(conn, self.get_path_table(max_hops=mh))
 
-                    if path == "interface_stats":       rpc_connection.send(self.get_interface_stats())
-                    if path == "rate_table":            rpc_connection.send(self.get_rate_table())
-                    if path == "next_hop_if_name":      rpc_connection.send(self.get_next_hop_if_name(call["destination_hash"]))
-                    if path == "next_hop":              rpc_connection.send(self.get_next_hop(call["destination_hash"]))
-                    if path == "first_hop_timeout":     rpc_connection.send(self.get_first_hop_timeout(call["destination_hash"]))
-                    if path == "link_count":            rpc_connection.send(self.get_link_count())
-                    if path == "packet_rssi":           rpc_connection.send(self.get_packet_rssi(call["packet_hash"]))
-                    if path == "packet_snr":            rpc_connection.send(self.get_packet_snr(call["packet_hash"]))
-                    if path == "packet_q":              rpc_connection.send(self.get_packet_q(call["packet_hash"]))
-                    if path == "blackholed_identities": rpc_connection.send(self.get_blackholed_identities())
+                    if path == "interface_stats":       self.rpc_return(conn, self.get_interface_stats())
+                    if path == "rate_table":            self.rpc_return(conn, self.get_rate_table())
+                    if path == "next_hop_if_name":      self.rpc_return(conn, self.get_next_hop_if_name(call["destination_hash"]))
+                    if path == "next_hop":              self.rpc_return(conn, self.get_next_hop(call["destination_hash"]))
+                    if path == "first_hop_timeout":     self.rpc_return(conn, self.get_first_hop_timeout(call["destination_hash"]))
+                    if path == "link_count":            self.rpc_return(conn, self.get_link_count())
+                    if path == "packet_rssi":           self.rpc_return(conn, self.get_packet_rssi(call["packet_hash"]))
+                    if path == "packet_snr":            self.rpc_return(conn, self.get_packet_snr(call["packet_hash"]))
+                    if path == "packet_q":              self.rpc_return(conn, self.get_packet_q(call["packet_hash"]))
+                    if path == "blackholed_identities": self.rpc_return(conn, self.get_blackholed_identities())
+                    if path == "is_blackholed":         self.rpc_return(conn, self.is_blackholed(call["identity_hash"]))
 
                 if "drop" in call:
                     path = call["drop"]
-                    if path == "path":            rpc_connection.send(self.drop_path(call["destination_hash"]))
-                    if path == "all_via":         rpc_connection.send(self.drop_all_via(call["destination_hash"]))
-                    if path == "announce_queues": rpc_connection.send(self.drop_announce_queues())
+                    if path == "path":            self.rpc_return(conn, self.drop_path(call["destination_hash"]))
+                    if path == "all_via":         self.rpc_return(conn, self.drop_all_via(call["destination_hash"]))
+                    if path == "announce_queues": self.rpc_return(conn, self.drop_announce_queues())
 
                 if "blackhole_identity" in call:
                     identity_hash = call["blackhole_identity"]
                     until = call["until"]
                     reason = call["reason"]
-                    rpc_connection.send(self.blackhole_identity(identity_hash, until=until, reason=reason))
+                    self.rpc_return(conn, self.blackhole_identity(identity_hash, until=until, reason=reason))
 
                 if "unblackhole_identity" in call:
                     identity_hash = call["unblackhole_identity"]
-                    rpc_connection.send(self.unblackhole_identity(identity_hash))
+                    self.rpc_return(conn, self.unblackhole_identity(identity_hash))
 
                 if "destination_data" in call:
                     operation = call["destination_data"]
                     destination_hash = call["destination_hash"]
-                    if   operation == "used":     rpc_connection.send(self._used_destination_data(destination_hash))
-                    elif operation == "retain":   rpc_connection.send(self._retain_destination_data(destination_hash))
-                    elif operation == "unretain": rpc_connection.send(self._unretain_destination_data(destination_hash))
+                    if   operation == "used":     self.rpc_return(conn, self._used_destination_data(destination_hash))
+                    elif operation == "retain":   self.rpc_return(conn, self._retain_destination_data(destination_hash))
+                    elif operation == "unretain": self.rpc_return(conn, self._unretain_destination_data(destination_hash))
 
                 if "identity_data" in call:
                     operation = call["identity_data"]
                     identity_hash = call["identity_hash"]
-                    if operation == "retain": rpc_connection.send(self._retain_identity(identity_hash))
+                    if operation == "retain": self.rpc_return(conn, self._retain_identity(identity_hash))
 
-                rpc_connection.close()
+                conn.close()
 
             except Exception as e:
                 RNS.log("An error ocurred while handling RPC call from local client: "+str(e), RNS.LOG_ERROR)
@@ -1236,8 +1250,8 @@ class Reticulum:
         if self.is_connected_to_shared_instance:
             try:
                 rpc_connection = self.get_rpc_client()
-                rpc_connection.send({"destination_data": "used", "destination_hash": destination_hash})
-                response = rpc_connection.recv()
+                rpc_connection.send_bytes(mp.packb({"destination_data": "used", "destination_hash": destination_hash}))
+                response = mp.unpackb(rpc_connection.recv_bytes())
                 return response
 
             except Exception as e:
@@ -1250,8 +1264,8 @@ class Reticulum:
         if self.is_connected_to_shared_instance:
             try:
                 rpc_connection = self.get_rpc_client()
-                rpc_connection.send({"destination_data": "retain", "destination_hash": destination_hash})
-                response = rpc_connection.recv()
+                rpc_connection.send_bytes(mp.packb({"destination_data": "retain", "destination_hash": destination_hash}))
+                response = mp.unpackb(rpc_connection.recv_bytes())
                 return response
 
             except Exception as e:
@@ -1264,8 +1278,8 @@ class Reticulum:
         if self.is_connected_to_shared_instance:
             try:
                 rpc_connection = self.get_rpc_client()
-                rpc_connection.send({"destination_data": "unretain", "destination_hash": destination_hash})
-                response = rpc_connection.recv()
+                rpc_connection.send_bytes(mp.packb({"destination_data": "unretain", "destination_hash": destination_hash}))
+                response = mp.unpackb(rpc_connection.recv_bytes())
                 return response
 
             except Exception as e:
@@ -1281,8 +1295,8 @@ class Reticulum:
         if self.is_connected_to_shared_instance:
             try:
                 rpc_connection = self.get_rpc_client()
-                rpc_connection.send({"identity_data": "retain", "identity_hash": identity_hash})
-                response = rpc_connection.recv()
+                rpc_connection.send_bytes(mp.packb({"identity_data": "retain", "identity_hash": identity_hash}))
+                response = mp.unpackb(rpc_connection.recv_bytes())
                 return response
 
             except Exception as e:
@@ -1294,8 +1308,8 @@ class Reticulum:
     def get_interface_stats(self):
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
-            rpc_connection.send({"get": "interface_stats"})
-            response = rpc_connection.recv()
+            rpc_connection.send_bytes(mp.packb({"get": "interface_stats"}))
+            response = mp.unpackb(rpc_connection.recv_bytes())
             return response
         else:
             interfaces = []
@@ -1484,8 +1498,8 @@ class Reticulum:
     def get_path_table(self, max_hops=None):
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
-            rpc_connection.send({"get": "path_table", "max_hops": max_hops})
-            response = rpc_connection.recv()
+            rpc_connection.send_bytes(mp.packb({"get": "path_table", "max_hops": max_hops}))
+            response = mp.unpackb(rpc_connection.recv_bytes())
             return response
 
         else:
@@ -1508,8 +1522,8 @@ class Reticulum:
     def get_rate_table(self):
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
-            rpc_connection.send({"get": "rate_table"})
-            response = rpc_connection.recv()
+            rpc_connection.send_bytes(mp.packb({"get": "rate_table"}))
+            response = mp.unpackb(rpc_connection.recv_bytes())
             return response
 
         else:
@@ -1529,8 +1543,8 @@ class Reticulum:
     def drop_path(self, destination):
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
-            rpc_connection.send({"drop": "path", "destination_hash": destination})
-            response = rpc_connection.recv()
+            rpc_connection.send_bytes(mp.packb({"drop": "path", "destination_hash": destination}))
+            response = mp.unpackb(rpc_connection.recv_bytes())
             return response
 
         else:
@@ -1539,8 +1553,8 @@ class Reticulum:
     def drop_all_via(self, transport_hash):
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
-            rpc_connection.send({"drop": "all_via", "destination_hash": transport_hash})
-            response = rpc_connection.recv()
+            rpc_connection.send_bytes(mp.packb({"drop": "all_via", "destination_hash": transport_hash}))
+            response = mp.unpackb(rpc_connection.recv_bytes())
             return response
 
         else:
@@ -1555,8 +1569,8 @@ class Reticulum:
     def drop_announce_queues(self):
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
-            rpc_connection.send({"drop": "announce_queues"})
-            response = rpc_connection.recv()
+            rpc_connection.send_bytes(mp.packb({"drop": "announce_queues"}))
+            response = mp.unpackb(rpc_connection.recv_bytes())
             return response
 
         else:
@@ -1565,8 +1579,8 @@ class Reticulum:
     def get_next_hop_if_name(self, destination):
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
-            rpc_connection.send({"get": "next_hop_if_name", "destination_hash": destination})
-            response = rpc_connection.recv()
+            rpc_connection.send_bytes(mp.packb({"get": "next_hop_if_name", "destination_hash": destination}))
+            response = mp.unpackb(rpc_connection.recv_bytes())
             return response
 
         else:
@@ -1576,8 +1590,8 @@ class Reticulum:
         if self.is_connected_to_shared_instance:
             try:
                 rpc_connection = self.get_rpc_client()
-                rpc_connection.send({"get": "first_hop_timeout", "destination_hash": destination})
-                response = rpc_connection.recv()
+                rpc_connection.send_bytes(mp.packb({"get": "first_hop_timeout", "destination_hash": destination}))
+                response = mp.unpackb(rpc_connection.recv_bytes())
 
                 if self.is_connected_to_shared_instance and hasattr(self, "_force_shared_instance_bitrate") and self._force_shared_instance_bitrate:
                     simulated_latency = ((1/self._force_shared_instance_bitrate)*8)*RNS.Reticulum.MTU
@@ -1595,8 +1609,8 @@ class Reticulum:
     def get_next_hop(self, destination):
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
-            rpc_connection.send({"get": "next_hop", "destination_hash": destination})
-            response = rpc_connection.recv()
+            rpc_connection.send_bytes(mp.packb({"get": "next_hop", "destination_hash": destination}))
+            response = mp.unpackb(rpc_connection.recv_bytes())
 
             return response
 
@@ -1606,8 +1620,8 @@ class Reticulum:
     def get_link_count(self):
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
-            rpc_connection.send({"get": "link_count"})
-            response = rpc_connection.recv()
+            rpc_connection.send_bytes(mp.packb({"get": "link_count"}))
+            response = mp.unpackb(rpc_connection.recv_bytes())
             return response
 
         else:
@@ -1616,8 +1630,8 @@ class Reticulum:
     def get_packet_rssi(self, packet_hash):
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
-            rpc_connection.send({"get": "packet_rssi", "packet_hash": packet_hash})
-            response = rpc_connection.recv()
+            rpc_connection.send_bytes(mp.packb({"get": "packet_rssi", "packet_hash": packet_hash}))
+            response = mp.unpackb(rpc_connection.recv_bytes())
             return response
 
         else:
@@ -1630,8 +1644,8 @@ class Reticulum:
     def get_packet_snr(self, packet_hash):
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
-            rpc_connection.send({"get": "packet_snr", "packet_hash": packet_hash})
-            response = rpc_connection.recv()
+            rpc_connection.send_bytes(mp.packb({"get": "packet_snr", "packet_hash": packet_hash}))
+            response = mp.unpackb(rpc_connection.recv_bytes())
             return response
 
         else:
@@ -1644,8 +1658,8 @@ class Reticulum:
     def get_packet_q(self, packet_hash):
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
-            rpc_connection.send({"get": "packet_q", "packet_hash": packet_hash})
-            response = rpc_connection.recv()
+            rpc_connection.send_bytes(mp.packb({"get": "packet_q", "packet_hash": packet_hash}))
+            response = mp.unpackb(rpc_connection.recv_bytes())
             return response
 
         else:
@@ -1667,19 +1681,33 @@ class Reticulum:
     def get_blackholed_identities(self):
         if self.is_connected_to_shared_instance:
                 rpc_connection = self.get_rpc_client()
-                rpc_connection.send({"get": "blackholed_identities"})
-                response = rpc_connection.recv()
+                rpc_connection.send_bytes(mp.packb({"get": "blackholed_identities"}))
+                response = mp.unpackb(rpc_connection.recv_bytes())
                 return response
             
         else: return RNS.Transport.blackholed_identities
+
+    def is_blackholed(self, identity):
+        if   type(identity) == RNS.Identity: identity_hash = identity.hash
+        elif type(identity) == bytes: identity_hash = identity
+        else: raise TypeError("Invalid identity for blackhole check, must be hash as bytes or RNS.Identity")
+        if len(identity_hash) != RNS.Reticulum.TRUNCATED_HASHLENGTH//8: raise ValueError("Invalid identity hash length for blackhole check")
+
+        if self.is_connected_to_shared_instance:
+                rpc_connection = self.get_rpc_client()
+                rpc_connection.send_bytes(mp.packb({"get": "is_blackholed", "identity_hash": identity_hash}))
+                response = mp.unpackb(rpc_connection.recv_bytes())
+                return response
+
+        else: return identity_hash in RNS.Transport.blackholed_identities
 
     def blackhole_identity(self, identity_hash, until=None, reason=None):
         if len(identity_hash) != RNS.Reticulum.TRUNCATED_HASHLENGTH//8: return False
         else:
             if self.is_connected_to_shared_instance:
                 rpc_connection = self.get_rpc_client()
-                rpc_connection.send({"blackhole_identity": identity_hash, "until": until, "reason": reason})
-                response = rpc_connection.recv()
+                rpc_connection.send_bytes(mp.packb({"blackhole_identity": identity_hash, "until": until, "reason": reason}))
+                response = mp.unpackb(rpc_connection.recv_bytes())
                 return response
             
             else: return RNS.Transport.blackhole_identity(identity_hash, until=until, reason=reason)
@@ -1689,8 +1717,8 @@ class Reticulum:
         else:
             if self.is_connected_to_shared_instance:
                 rpc_connection = self.get_rpc_client()
-                rpc_connection.send({"unblackhole_identity": identity_hash})
-                response = rpc_connection.recv()
+                rpc_connection.send_bytes(mp.packb({"unblackhole_identity": identity_hash}))
+                response = mp.unpackb(rpc_connection.recv_bytes())
                 return response
             
             else: return RNS.Transport.unblackhole_identity(identity_hash)
@@ -1778,6 +1806,10 @@ class Reticulum:
         :returns: A list of identity hashes.
         """
         return Reticulum.__blackhole_sources
+
+    @staticmethod
+    def blackhole_update_interval():
+        return Reticulum.__blackhole_update_interval
 
     @staticmethod
     def discovered_interfaces():

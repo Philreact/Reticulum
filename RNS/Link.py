@@ -903,21 +903,21 @@ class Link:
                     identity_string = str(self.get_remote_identity()) if self.get_remote_identity() != None else "<Unknown>"
                     RNS.log("Request "+RNS.prettyhexrep(request_id)+" from "+identity_string+" not allowed for: "+str(path), RNS.LOG_DEBUG)
 
-    def handle_response(self, request_id, response_data, response_size, response_transfer_size, metadata=None):
+    def handle_response(self, request_id, response_data, response_size, response_transfer_size, metadata=None, update_sizes=False):
         if self.status == Link.ACTIVE:
             remove = None
             for pending_request in self.pending_requests:
                 if pending_request.request_id == request_id:
                     remove = pending_request
                     try:
-                        pending_request.response_size = response_size
-                        if pending_request.response_transfer_size == None:
-                            pending_request.response_transfer_size = 0
-                        pending_request.response_transfer_size += response_transfer_size
-                        pending_request.response_received(response_data, metadata)
-                    except Exception as e:
-                        RNS.log("Error occurred while handling response. The contained exception was: "+str(e), RNS.LOG_ERROR)
+                        if update_sizes:
+                            pending_request.response_size = response_size
+                            if pending_request.response_transfer_size == None: pending_request.response_transfer_size = 0
+                            pending_request.response_transfer_size += response_transfer_size
 
+                        pending_request.response_received(response_data, metadata)
+
+                    except Exception as e: RNS.log("Error occurred while handling response. The contained exception was: "+str(e), RNS.LOG_ERROR)
                     break
 
             if remove != None:
@@ -1018,12 +1018,15 @@ class Link:
                                 identity.load_public_key(public_key)
 
                                 if identity.validate(signature, signed_data):
-                                    self.__remote_identity = identity
-                                    if self.callbacks.remote_identified != None:
-                                        try:
-                                            self.callbacks.remote_identified(self, self.__remote_identity)
-                                        except Exception as e:
-                                            RNS.log("Error while executing remote identified callback from "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
+                                    if RNS.Reticulum.get_instance().is_blackholed(identity.hash):
+                                        RNS.log(f"Terminating incoming link from blackholed identity {RNS.prettyhexrep(identity.hash)}", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+                                        self.teardown()
+
+                                    else:
+                                        self.__remote_identity = identity
+                                        if self.callbacks.remote_identified != None:
+                                            try: self.callbacks.remote_identified(self, self.__remote_identity)
+                                            except Exception as e: RNS.log(f"Error while executing remote identified callback from {self}. The contained exception was: "+str(e), RNS.LOG_ERROR)
                                 
                                     self.__update_phy_stats(packet, query_shared=True)
 
@@ -1047,7 +1050,7 @@ class Link:
                                 request_id = unpacked_response[0]
                                 response_data = unpacked_response[1]
                                 transfer_size = len(umsgpack.packb(response_data))-2
-                                def job(): self.handle_response(request_id, response_data, transfer_size, transfer_size)
+                                def job(): self.handle_response(request_id, response_data, transfer_size, transfer_size, update_sizes=True)
                                 threading.Thread(target=job, daemon=True).start()
                                 self.__update_phy_stats(packet, query_shared=True)
                         except Exception as e:

@@ -248,6 +248,11 @@ instance_name = default
 
 # blackhole_sources = 521c87a83afb8f29e4455e77930b973b
 
+# You can set the interval in minutes at which remote
+# blackhole sources are updated. Defaults to one hour.
+
+# blackhole_update_interval = 60
+
 
 [logging]
 # Valid log levels are 0 through 7:
@@ -261,6 +266,12 @@ instance_name = default
 #   7: Extreme logging
 
 loglevel = 4
+
+# You can disable timestamp inclusion in logs. Useful if
+# you want to use an external logging tool that provides
+# its own timestamps or custom formatting.
+
+# logtimestamps = no
 
 
 # The interfaces section defines the physical and virtual
