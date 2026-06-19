@@ -30,6 +30,7 @@
 
 from RNS.Interfaces.Interface import Interface
 from RNS.Interfaces.BackboneInterface import BackboneInterface
+from collections import deque
 import socketserver
 import threading
 import socket
@@ -37,9 +38,13 @@ import time
 import sys
 import os
 import RNS
-from threading import Lock
+from threading import Lock, Condition
 
 QORTAL_RNS_DEDICATED_LOCAL_IO = os.environ.get("QORTAL_RNS_DEDICATED_LOCAL_IO", "1") != "0"
+try:
+    QORTAL_RNS_DEDICATED_TX_QUEUE_MAX_BYTES = int(os.environ.get("QORTAL_RNS_DEDICATED_TX_QUEUE_MAX_BYTES", str(64*1024*1024)))
+except Exception:
+    QORTAL_RNS_DEDICATED_TX_QUEUE_MAX_BYTES = 64*1024*1024
 
 class HDLC():
     FLAG              = 0x7E
@@ -87,6 +92,14 @@ class LocalClientInterface(Interface):
         self.mode             = RNS.Interfaces.Interface.Interface.MODE_FULL
         self.frame_buffer     = b""
         self.transmit_buffer  = b""
+        self.writing          = False
+        self._force_bitrate   = False
+        self.send_lock        = Lock()
+        self.tx_queue         = deque()
+        self.tx_queue_bytes   = 0
+        self.tx_queue_cv      = Condition()
+        self.tx_worker_started = False
+        self.tx_shutdown      = False
 
         if RNS.vendor.platformutils.use_epoll() and not QORTAL_RNS_DEDICATED_LOCAL_IO: self.epoll_backend = True
 
@@ -122,14 +135,13 @@ class LocalClientInterface(Interface):
         self.owner   = owner
         self.bitrate = 1_000_000_000
         self.online  = True
-        self.writing = False
-
-        self._force_bitrate = False
-        self.send_lock = Lock()
 
         self.announce_rate_target  = None
         self.announce_rate_grace   = None
         self.announce_rate_penalty = None
+
+        if not self.epoll_backend and QORTAL_RNS_DEDICATED_LOCAL_IO:
+            self.start_dedicated_write_loop()
 
         if connected_socket == None:
             if not self.epoll_backend:
@@ -141,6 +153,72 @@ class LocalClientInterface(Interface):
 
     def should_ingress_limit(self):
         return False
+
+    def start_dedicated_write_loop(self):
+        with self.tx_queue_cv:
+            if self.tx_worker_started:
+                return
+            self.tx_worker_started = True
+        thread = threading.Thread(target=self.write_loop)
+        thread.daemon = True
+        thread.start()
+
+    def enqueue_outgoing(self, data):
+        with self.tx_queue_cv:
+            if self.tx_shutdown or not self.online or self.detached:
+                return False
+
+            queued_bytes = self.tx_queue_bytes + len(data)
+            if queued_bytes > QORTAL_RNS_DEDICATED_TX_QUEUE_MAX_BYTES:
+                RNS.log(
+                    f"TX queue for {self} is full, dropping outbound packet "
+                    f"queued={self.tx_queue_bytes} packet={len(data)} "
+                    f"limit={QORTAL_RNS_DEDICATED_TX_QUEUE_MAX_BYTES}",
+                    RNS.LOG_WARNING,
+                )
+                return False
+
+            self.tx_queue.append(data)
+            self.tx_queue_bytes = queued_bytes
+            self.tx_queue_cv.notify()
+            return True
+
+    def write_loop(self):
+        while True:
+            with self.tx_queue_cv:
+                while not self.tx_shutdown and not self.detached and (not self.online or len(self.tx_queue) == 0):
+                    self.tx_queue_cv.wait(1.0)
+
+                if self.tx_shutdown or self.detached:
+                    self.tx_queue.clear()
+                    self.tx_queue_bytes = 0
+                    self.tx_worker_started = False
+                    return
+
+                data = self.tx_queue.popleft()
+                self.tx_queue_bytes -= len(data)
+
+            try:
+                if self._force_bitrate:
+                    s = len(data) / self.bitrate * 8
+                    time.sleep(s)
+
+                self.writing = True
+                with self.send_lock:
+                    self.socket.sendall(data)
+                self.writing = False
+                self.txb += len(data)
+                if hasattr(self, "parent_interface") and self.parent_interface != None:
+                    self.parent_interface.txb += len(data)
+
+            except Exception as e:
+                self.writing = False
+                RNS.log("Exception occurred while transmitting via "+str(self)+", tearing down interface", RNS.LOG_ERROR)
+                RNS.log("The contained exception was: "+str(e), RNS.LOG_ERROR)
+                RNS.trace_exception(e)
+                self.teardown()
+                self.tx_worker_started = False
+                return
 
     def connect(self):
         if self.socket_path != None:
@@ -155,9 +233,13 @@ class LocalClientInterface(Interface):
         self.online = True
         self.is_connected_to_shared_instance = True
         self.never_connected = False
+        with self.tx_queue_cv:
+            self.tx_shutdown = False
+            self.tx_queue_cv.notify_all()
 
         if RNS.vendor.platformutils.is_android(): self.phy_keepalive = True
         if self.epoll_backend: BackboneInterface.add_client_socket(self.socket, self)
+        elif QORTAL_RNS_DEDICATED_LOCAL_IO: self.start_dedicated_write_loop()
 
         return True
 
@@ -205,6 +287,9 @@ class LocalClientInterface(Interface):
                     self.transmit_buffer += bytes([HDLC.FLAG])+bytes([HDLC.FLAG])
                     BackboneInterface.tx_ready(self)
 
+                elif QORTAL_RNS_DEDICATED_LOCAL_IO:
+                    self.enqueue_outgoing(bytes([HDLC.FLAG])+bytes([HDLC.FLAG]))
+
                 else:
                     self.writing = True
                     data = bytes([HDLC.FLAG])+bytes([HDLC.FLAG])
@@ -233,6 +318,10 @@ class LocalClientInterface(Interface):
                 if self.epoll_backend:
                     self.transmit_buffer += bytes([HDLC.FLAG])+HDLC.escape(data)+bytes([HDLC.FLAG])
                     BackboneInterface.tx_ready(self)
+
+                elif QORTAL_RNS_DEDICATED_LOCAL_IO:
+                    framed_data = bytes([HDLC.FLAG])+HDLC.escape(data)+bytes([HDLC.FLAG])
+                    self.enqueue_outgoing(framed_data)
 
                 else:
                     self.writing = True
@@ -334,6 +423,9 @@ class LocalClientInterface(Interface):
                 if callable(self.socket.close):
                     RNS.log("Detaching "+str(self), RNS.LOG_DEBUG)
                     self.detached = True
+                    with self.tx_queue_cv:
+                        self.tx_shutdown = True
+                        self.tx_queue_cv.notify_all()
                     
                     try:
                         if self.socket != None:
@@ -353,6 +445,9 @@ class LocalClientInterface(Interface):
         self.online = False
         self.OUT = False
         self.IN = False
+        with self.tx_queue_cv:
+            self.tx_shutdown = True
+            self.tx_queue_cv.notify_all()
 
         RNS.Transport.remove_interface(self)
 
