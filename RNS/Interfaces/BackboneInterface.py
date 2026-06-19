@@ -32,9 +32,26 @@ from RNS.Interfaces.Interface import Interface
 import threading
 import socket
 import select
+import selectors
 import time
 import sys
+import os
 import RNS
+
+def env_int(name, default, minimum=None):
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except Exception:
+        value = default
+
+    if minimum != None and value < minimum:
+        value = minimum
+
+    return value
+
+QORTAL_RNS_EPOLL_READ_BUDGET_BYTES = env_int("QORTAL_RNS_EPOLL_READ_BUDGET_BYTES", 262144, 1024)
+QORTAL_RNS_EPOLL_WRITE_BUDGET_BYTES = env_int("QORTAL_RNS_EPOLL_WRITE_BUDGET_BYTES", 262144, 1024)
+QORTAL_RNS_LOCAL_IO_STATS = os.environ.get("QORTAL_RNS_LOCAL_IO_STATS", "0") == "1"
 
 class HDLC():
     FLAG              = 0x7E
@@ -54,11 +71,107 @@ class BackboneInterface(Interface):
     AUTOCONFIGURE_MTU = True
 
     epoll = None
+    selector = None
+    event_backend = None
     listener_filenos = {}
     spawned_interface_filenos = {}
-    epoll = None
     _job_active = False
     _job_lock = threading.Lock()
+    _epoll_stats_lock = threading.Lock()
+    _epoll_last_stats_log = 0
+    epoll_read_events = 0
+    epoll_write_events = 0
+    epoll_read_bytes = 0
+    epoll_write_bytes = 0
+    epoll_write_budget_hits = 0
+    epoll_read_budget_hits = 0
+    epoll_tx_buffer_max = 0
+    epoll_socket_close_count = 0
+    epoll_socket_error_count = 0
+
+    @staticmethod
+    def _epoll_hup_mask():
+        if BackboneInterface.event_backend != "epoll":
+            return 0
+        mask = select.EPOLLHUP | select.EPOLLERR
+        if hasattr(select, "EPOLLRDHUP"):
+            mask |= select.EPOLLRDHUP
+        return mask
+
+    @staticmethod
+    def _read_mask():
+        if BackboneInterface.event_backend == "epoll":
+            return select.EPOLLIN
+        else:
+            return selectors.EVENT_READ
+
+    @staticmethod
+    def _write_mask():
+        if BackboneInterface.event_backend == "epoll":
+            return select.EPOLLOUT
+        else:
+            return selectors.EVENT_WRITE
+
+    @staticmethod
+    def _read_write_mask():
+        return BackboneInterface._read_mask() | BackboneInterface._write_mask()
+
+    @staticmethod
+    def _is_read_event(event):
+        return bool(event & BackboneInterface._read_mask())
+
+    @staticmethod
+    def _is_write_event(event):
+        return bool(event & BackboneInterface._write_mask())
+
+    @staticmethod
+    def _note_epoll_stat(name, value=1):
+        if not QORTAL_RNS_LOCAL_IO_STATS:
+            return
+
+        with BackboneInterface._epoll_stats_lock:
+            setattr(BackboneInterface, name, getattr(BackboneInterface, name) + value)
+
+    @staticmethod
+    def _note_epoll_tx_buffer(length):
+        if not QORTAL_RNS_LOCAL_IO_STATS:
+            return
+
+        with BackboneInterface._epoll_stats_lock:
+            if length > BackboneInterface.epoll_tx_buffer_max:
+                BackboneInterface.epoll_tx_buffer_max = length
+
+    @staticmethod
+    def _maybe_log_epoll_stats():
+        if not QORTAL_RNS_LOCAL_IO_STATS:
+            return
+
+        now = time.time()
+        with BackboneInterface._epoll_stats_lock:
+            if now < BackboneInterface._epoll_last_stats_log + 10:
+                return
+
+            BackboneInterface._epoll_last_stats_log = now
+            stats = (
+                BackboneInterface.epoll_read_events,
+                BackboneInterface.epoll_write_events,
+                BackboneInterface.epoll_read_bytes,
+                BackboneInterface.epoll_write_bytes,
+                BackboneInterface.epoll_read_budget_hits,
+                BackboneInterface.epoll_write_budget_hits,
+                BackboneInterface.epoll_tx_buffer_max,
+                BackboneInterface.epoll_socket_close_count,
+                BackboneInterface.epoll_socket_error_count,
+            )
+
+        RNS.log(
+            f"local event I/O stats backend={BackboneInterface.event_backend} "
+            f"read_events={stats[0]} write_events={stats[1]} "
+            f"read_bytes={stats[2]} write_bytes={stats[3]} "
+            f"read_budget_hits={stats[4]} write_budget_hits={stats[5]} "
+            f"tx_buffer_max={stats[6]} socket_closes={stats[7]} socket_errors={stats[8]}",
+            RNS.LOG_NOTICE,
+        )
 
     @staticmethod
     def get_address_for_if(name, bind_port, prefer_ipv6=False):
@@ -213,7 +326,43 @@ class BackboneInterface(Interface):
 
     @staticmethod
     def ensure_epoll():
-        if not BackboneInterface.epoll: BackboneInterface.epoll = select.epoll()
+        if BackboneInterface.event_backend:
+            return
+
+        if RNS.vendor.platformutils.use_epoll():
+            BackboneInterface.epoll = select.epoll()
+            BackboneInterface.event_backend = "epoll"
+        else:
+            BackboneInterface.selector = selectors.DefaultSelector()
+            BackboneInterface.event_backend = BackboneInterface.selector.__class__.__name__
+
+    @staticmethod
+    def _register_fileno(fileno, mask):
+        if BackboneInterface.event_backend == "epoll":
+            BackboneInterface.epoll.register(fileno, mask)
+        else:
+            BackboneInterface.selector.register(fileno, mask)
+
+    @staticmethod
+    def _modify_fileno(fileno, mask):
+        if BackboneInterface.event_backend == "epoll":
+            BackboneInterface.epoll.modify(fileno, mask)
+        else:
+            BackboneInterface.selector.modify(fileno, mask)
+
+    @staticmethod
+    def _unregister_fileno(fileno):
+        if BackboneInterface.event_backend == "epoll":
+            BackboneInterface.epoll.unregister(fileno)
+        else:
+            BackboneInterface.selector.unregister(fileno)
+
+    @staticmethod
+    def _poll(timeout):
+        if BackboneInterface.event_backend == "epoll":
+            return BackboneInterface.epoll.poll(timeout)
+
+        return [(key.fd, event) for key, event in BackboneInterface.selector.select(timeout)]
 
     @staticmethod
     def add_listener(interface, bind_address, socket_type=socket.AF_INET):
@@ -234,12 +383,13 @@ class BackboneInterface(Interface):
         server_socket.listen(1)
         server_socket.setblocking(0)
         BackboneInterface.listener_filenos[server_socket.fileno()] = (interface, server_socket)
-        BackboneInterface.epoll.register(server_socket.fileno(), select.EPOLLIN)
+        BackboneInterface._register_fileno(server_socket.fileno(), BackboneInterface._read_mask())
         BackboneInterface.start()
 
     @staticmethod
     def add_client_socket(client_socket, interface):
         BackboneInterface.ensure_epoll()
+        client_socket.setblocking(0)
         BackboneInterface.spawned_interface_filenos[client_socket.fileno()] = interface
         BackboneInterface.register_in(client_socket.fileno())
         BackboneInterface.start()
@@ -250,9 +400,9 @@ class BackboneInterface(Interface):
             RNS.log(f"Attempt to register invalid file descriptor {fileno}", RNS.LOG_WARNING)
             return
 
-        try: BackboneInterface.epoll.register(fileno, select.EPOLLIN)
+        try: BackboneInterface._register_fileno(fileno, BackboneInterface._read_mask())
         except Exception as e:
-            RNS.log(f"An error occurred while registering EPOLL_IN for file descriptor {fileno}: {e}", RNS.LOG_WARNING)
+            RNS.log(f"An error occurred while registering local I/O read interest for file descriptor {fileno}: {e}", RNS.LOG_WARNING)
 
     @staticmethod
     def deregister_fileno(fileno):
@@ -260,7 +410,7 @@ class BackboneInterface(Interface):
             RNS.log(f"Attempt to deregister invalid file descriptor {fileno}", RNS.LOG_DEBUG)
             return
 
-        try: BackboneInterface.epoll.unregister(fileno)
+        try: BackboneInterface._unregister_fileno(fileno)
         except Exception as e:
             RNS.log(f"An error occurred while deregistering file descriptor {fileno}: {e}", RNS.LOG_DEBUG)
 
@@ -279,10 +429,138 @@ class BackboneInterface(Interface):
         if interface.socket:
             fileno = interface.socket.fileno()
             if fileno in BackboneInterface.spawned_interface_filenos:
-                try: BackboneInterface.epoll.modify(fileno, select.EPOLLIN | select.EPOLLOUT)
+                BackboneInterface._note_epoll_tx_buffer(len(interface.transmit_buffer))
+                try: BackboneInterface._modify_fileno(fileno, BackboneInterface._read_write_mask())
                 except Exception as e:
-                    RNS.log(f"Error occurred on {interface} while modifying socket EPOLL state: {e}", RNS.LOG_WARNING)
+                    RNS.log(f"Error occurred on {interface} while modifying local I/O state: {e}", RNS.LOG_WARNING)
                     raise e
+
+    @staticmethod
+    def _set_client_epoll_interest(fileno, interface):
+        if len(interface.transmit_buffer) > 0:
+            mask = BackboneInterface._read_write_mask()
+        else:
+            mask = BackboneInterface._read_mask()
+
+        BackboneInterface._modify_fileno(fileno, mask)
+
+    @staticmethod
+    def _remove_spawned_interface(fileno, spawned_interface):
+        try:
+            if fileno in BackboneInterface.spawned_interface_filenos:
+                BackboneInterface.spawned_interface_filenos.pop(fileno)
+        except Exception as e:
+            RNS.log(f"Error while removing spawned interface file descriptor from BackboneInterface I/O handler: {e}", RNS.LOG_ERROR)
+
+        pif = None
+        try:
+            if spawned_interface.parent_interface:
+                pif = spawned_interface.parent_interface
+                if pif.spawned_interfaces != None:
+                    while spawned_interface in pif.spawned_interfaces: pif.spawned_interfaces.remove(spawned_interface)
+        except Exception as e:
+            RNS.log(f"Error while removing spawned interface from {pif}: {e}", RNS.LOG_ERROR)
+
+    @staticmethod
+    def _close_client_socket(fileno, spawned_interface, client_socket, error=False):
+        if error:
+            BackboneInterface._note_epoll_stat("epoll_socket_error_count")
+        else:
+            BackboneInterface._note_epoll_stat("epoll_socket_close_count")
+
+        BackboneInterface.deregister_fileno(fileno)
+        BackboneInterface._remove_spawned_interface(fileno, spawned_interface)
+
+        try:
+            client_socket.close()
+        except Exception as e:
+            RNS.log(f"Error while closing socket for {spawned_interface}: {e}", RNS.LOG_WARNING)
+
+        try:
+            spawned_interface.receive(b"")
+        except Exception as e:
+            RNS.log(f"Error while notifying {spawned_interface} of socket close: {e}", RNS.LOG_DEBUG)
+
+    @staticmethod
+    def _read_client_socket(fileno, spawned_interface, client_socket):
+        read_total = 0
+        closed = False
+
+        BackboneInterface._note_epoll_stat("epoll_read_events")
+        while read_total < QORTAL_RNS_EPOLL_READ_BUDGET_BYTES:
+            read_size = min(spawned_interface.HW_MTU, QORTAL_RNS_EPOLL_READ_BUDGET_BYTES - read_total)
+            try:
+                received_bytes = client_socket.recv(read_size)
+            except (BlockingIOError, InterruptedError):
+                break
+            except Exception as e:
+                RNS.log(f"Error while reading from {spawned_interface}: {e}", RNS.LOG_DEBUG)
+                BackboneInterface._close_client_socket(fileno, spawned_interface, client_socket, error=True)
+                closed = True
+                break
+
+            if len(received_bytes) == 0:
+                BackboneInterface._close_client_socket(fileno, spawned_interface, client_socket)
+                closed = True
+                break
+
+            read_total += len(received_bytes)
+            spawned_interface.receive(received_bytes)
+
+        if read_total > 0:
+            BackboneInterface._note_epoll_stat("epoll_read_bytes", read_total)
+
+        if not closed and read_total >= QORTAL_RNS_EPOLL_READ_BUDGET_BYTES:
+            BackboneInterface._note_epoll_stat("epoll_read_budget_hits")
+
+        return closed
+
+    @staticmethod
+    def _write_client_socket(fileno, spawned_interface, client_socket):
+        written_total = 0
+        closed = False
+
+        BackboneInterface._note_epoll_stat("epoll_write_events")
+        while len(spawned_interface.transmit_buffer) > 0 and written_total < QORTAL_RNS_EPOLL_WRITE_BUDGET_BYTES:
+            remaining_budget = QORTAL_RNS_EPOLL_WRITE_BUDGET_BYTES - written_total
+            chunk = spawned_interface.transmit_buffer[:remaining_budget]
+            try:
+                written = client_socket.send(chunk)
+            except (BlockingIOError, InterruptedError):
+                break
+            except Exception as e:
+                if not spawned_interface.detached:
+                    RNS.log(f"Error while writing to {spawned_interface}: {e}", RNS.LOG_DEBUG)
+                BackboneInterface._close_client_socket(fileno, spawned_interface, client_socket, error=True)
+                closed = True
+                break
+
+            if written <= 0:
+                BackboneInterface._close_client_socket(fileno, spawned_interface, client_socket, error=True)
+                closed = True
+                break
+
+            written_total += written
+            spawned_interface.transmit_buffer = spawned_interface.transmit_buffer[written:]
+            spawned_interface.txb += written
+            if spawned_interface.parent_interface:
+                spawned_interface.parent_interface.txb += written
+
+        if written_total > 0:
+            BackboneInterface._note_epoll_stat("epoll_write_bytes", written_total)
+
+        if not closed and len(spawned_interface.transmit_buffer) > 0:
+            BackboneInterface._note_epoll_tx_buffer(len(spawned_interface.transmit_buffer))
+            if written_total >= QORTAL_RNS_EPOLL_WRITE_BUDGET_BYTES:
+                BackboneInterface._note_epoll_stat("epoll_write_budget_hits")
+
+        if not closed:
+            try:
+                BackboneInterface._set_client_epoll_interest(fileno, spawned_interface)
+            except Exception as e:
+                RNS.log(f"Error while setting epoll interest on {spawned_interface}: {e}", RNS.LOG_ERROR)
+
+        return closed
 
     @staticmethod
     def __job():
@@ -293,87 +571,27 @@ class BackboneInterface(Interface):
                 BackboneInterface.ensure_epoll()
                 try:
                     while True:
-                        events = BackboneInterface.epoll.poll(1)
+                        events = BackboneInterface._poll(1)
+                        BackboneInterface._maybe_log_epoll_stats()
                         for fileno, event in events:
                             if fileno in BackboneInterface.spawned_interface_filenos:
                                 spawned_interface = BackboneInterface.spawned_interface_filenos[fileno]
                                 client_socket = spawned_interface.socket
                                 socket_closed = False
-                                if client_socket and fileno == client_socket.fileno() and (event & select.EPOLLIN):
-                                    try: received_bytes = client_socket.recv(spawned_interface.HW_MTU)
-                                    except Exception as e:
-                                        RNS.log(f"Error while reading from {spawned_interface}: {e}", RNS.LOG_DEBUG)
-                                        received_bytes = b""
 
-                                    if len(received_bytes):
-                                        spawned_interface.receive(received_bytes)
-                                    else:
-                                        BackboneInterface.deregister_fileno(fileno); client_socket.close()
-                                        try:
-                                            if fileno in BackboneInterface.spawned_interface_filenos: BackboneInterface.spawned_interface_filenos.pop(fileno)
-                                        except Exception as e: RNS.log(f"Error while removing spawned interface file descriptor from BackboneInterface I/O handler: {e}", RNS.LOG_ERROR)
-
-                                        try:
-                                            if spawned_interface.parent_interface:
-                                                pif = spawned_interface.parent_interface
-                                                if pif.spawned_interfaces != None:
-                                                    while spawned_interface in pif.spawned_interfaces: pif.spawned_interfaces.remove(spawned_interface)
-                                        except Exception as e: RNS.log(f"Error while removing spawned interface from {pif}: {e}", RNS.LOG_ERROR)
-
-                                        spawned_interface.receive(received_bytes)
-                                        socket_closed = True
+                                if not socket_closed and client_socket and fileno == client_socket.fileno() and BackboneInterface._is_read_event(event):
+                                    socket_closed = BackboneInterface._read_client_socket(fileno, spawned_interface, client_socket)
                                 
-                                if not socket_closed and client_socket and fileno == client_socket.fileno() and (event & select.EPOLLOUT):
-                                    try: written = client_socket.send(spawned_interface.transmit_buffer)
-                                    except Exception as e:
-                                        written = 0
-                                        if not spawned_interface.detached: RNS.log(f"Error while writing to {spawned_interface}: {e}", RNS.LOG_DEBUG)
-                                        BackboneInterface.deregister_fileno(fileno)
+                                if not socket_closed and client_socket and fileno == client_socket.fileno() and BackboneInterface._is_write_event(event):
+                                    socket_closed = BackboneInterface._write_client_socket(fileno, spawned_interface, client_socket)
 
-                                        try:
-                                            if fileno in BackboneInterface.spawned_interface_filenos: BackboneInterface.spawned_interface_filenos.pop(fileno)
-                                        except Exception as e: RNS.log(f"Error while removing spawned interface file descriptor from BackboneInterface I/O handler: {e}", RNS.LOG_ERROR)
-                                        
-                                        try:
-                                            if spawned_interface.parent_interface:
-                                                pif = spawned_interface.parent_interface
-                                                if pif.spawned_interfaces != None:
-                                                    while spawned_interface in pif.spawned_interfaces: pif.spawned_interfaces.remove(spawned_interface)
-                                        except Exception as e: RNS.log(f"Error while removing spawned interface from {pif}: {e}", RNS.LOG_ERROR)
-
-                                        try: client_socket.close()
-                                        except Exception as e: RNS.log(f"Error while closing socket for {spawned_interface}: {e}", RNS.LOG_WARNING)
-                                        spawned_interface.receive(b"")
-
-                                    spawned_interface.transmit_buffer = spawned_interface.transmit_buffer[written:]
-                                    try:
-                                        if len(spawned_interface.transmit_buffer) == 0: BackboneInterface.epoll.modify(fileno, select.EPOLLIN)
-                                    except Exception as e:
-                                        RNS.log(f"Error while setting EPOLLIN on {spawned_interface}: {e}", RNS.LOG_ERROR)
-
-                                    spawned_interface.txb += written
-                                    if spawned_interface.parent_interface: spawned_interface.parent_interface.txb += written
-                                
-                                if not socket_closed and client_socket and fileno == client_socket.fileno() and event & (select.EPOLLHUP):
-                                    BackboneInterface.deregister_fileno(fileno)
-                                    try:
-                                        if fileno in BackboneInterface.spawned_interface_filenos: BackboneInterface.spawned_interface_filenos.pop(fileno)
-                                    except Exception as e: RNS.log(f"Error while removing spawned interface file descriptor from BackboneInterface I/O handler: {e}", RNS.LOG_ERROR)
-
-                                    try:
-                                        if spawned_interface.parent_interface:
-                                            pif = spawned_interface.parent_interface
-                                            if pif.spawned_interfaces != None:
-                                                while spawned_interface in pif.spawned_interfaces: pif.spawned_interfaces.remove(spawned_interface)
-                                    except Exception as e: RNS.log(f"Error while removing spawned interface from {pif}: {e}", RNS.LOG_ERROR)
-
-                                    try: client_socket.close()
-                                    except Exception as e: RNS.log(f"Error while closing socket for {spawned_interface}: {e}", RNS.LOG_ERROR)
-                                    spawned_interface.receive(b"")
+                                if not socket_closed and client_socket and fileno == client_socket.fileno() and (event & BackboneInterface._epoll_hup_mask()):
+                                    BackboneInterface._close_client_socket(fileno, spawned_interface, client_socket, error=bool(event & select.EPOLLERR))
 
                             elif fileno in BackboneInterface.listener_filenos:
                                 owner_interface, server_socket = BackboneInterface.listener_filenos[fileno]
-                                if fileno == server_socket.fileno() and (event & select.EPOLLIN):
+                                if fileno == server_socket.fileno() and BackboneInterface._is_read_event(event):
+                                    client_socket = None
                                     try:
                                         client_socket, address = server_socket.accept()
                                         client_socket.setblocking(0)
@@ -381,12 +599,13 @@ class BackboneInterface(Interface):
                                             try: client_socket.close()
                                             except Exception as e: RNS.log(f"Error while closing socket for failed incoming connection: {e}", RNS.LOG_WARNING)
 
-                                    except:
+                                    except Exception as e:
                                         RNS.log(f"Accepting socket failed for incoming connection: {e}", RNS.LOG_WARNING)
-                                        try: client_socket.close()
-                                        except Exception as e: RNS.log(f"Error while closing socket for failed incoming socket accept: {e}", RNS.LOG_WARNING)
+                                        if client_socket != None:
+                                            try: client_socket.close()
+                                            except Exception as e: RNS.log(f"Error while closing socket for failed incoming socket accept: {e}", RNS.LOG_WARNING)
                                 
-                                elif fileno == server_socket.fileno() and (event & select.EPOLLHUP):
+                                if fileno == server_socket.fileno() and (event & BackboneInterface._epoll_hup_mask()):
                                     try: BackboneInterface.deregister_fileno(fileno)
                                     except Exception as e: RNS.log(f"Error while deregistering listener file descriptor {fileno}: {e}", RNS.LOG_ERROR)
 

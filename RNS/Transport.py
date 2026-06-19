@@ -42,6 +42,16 @@ from collections import deque
 from .vendor import umsgpack as umsgpack
 from RNS.Interfaces.BackboneInterface import BackboneInterface
 
+QORTAL_RNS_RX_TRACE = os.environ.get("QORTAL_RNS_RX_TRACE", "0") == "1"
+try:
+    QORTAL_RNS_RX_TRACE_GAP_MS = int(os.environ.get("QORTAL_RNS_RX_TRACE_GAP_MS", "200"))
+except Exception:
+    QORTAL_RNS_RX_TRACE_GAP_MS = 200
+try:
+    QORTAL_RNS_RX_TRACE_PACKET_MAX = int(os.environ.get("QORTAL_RNS_RX_TRACE_PACKET_MAX", "8192"))
+except Exception:
+    QORTAL_RNS_RX_TRACE_PACKET_MAX = 8192
+
 class Transport:
     """
     Through static methods of this class you can interact with the
@@ -169,6 +179,18 @@ class Transport:
     LOCAL_CLIENT_CACHE_MAXSIZE  = 512
 
     pending_local_path_requests = {}
+    qortal_rx_trace_packet_times = {}
+    qortal_rx_trace_packet_fallback_times = {}
+    qortal_rx_trace_packet_order = deque()
+    qortal_rx_trace_packet_lock  = Lock()
+    qortal_rx_trace_network_seen = 0
+    qortal_rx_trace_shared_checked = 0
+    qortal_rx_trace_shared_matched = 0
+    qortal_rx_trace_shared_unmatched = 0
+    qortal_rx_trace_shared_max_elapsed_ms = 0
+    qortal_rx_trace_last_stats = 0
+    qortal_rx_trace_transmit_counts = {}
+    qortal_rx_trace_last_transmit_stats = 0
 
     ready                       = False
     start_time                  = None
@@ -1024,6 +1046,191 @@ class Transport:
     discovery_pr_handle_lock = Lock()
     pending_discovery_prs    = deque(maxlen=max_queued_discovery_prs)
     @staticmethod
+    def qortal_rx_trace_record_network_packet(packet, interface):
+        if not QORTAL_RNS_RX_TRACE:
+            return
+
+        try:
+            now = time.time()
+            fallback_key = (
+                packet.destination_hash,
+                packet.packet_type,
+                packet.context,
+                len(packet.data),
+            )
+            entry = (now, str(interface), len(packet.raw), packet.context, fallback_key, packet.packet_hash)
+            with Transport.qortal_rx_trace_packet_lock:
+                Transport.qortal_rx_trace_network_seen += 1
+                Transport.qortal_rx_trace_packet_times[packet.packet_hash] = entry
+
+                fallback_entries = Transport.qortal_rx_trace_packet_fallback_times.get(fallback_key)
+                if fallback_entries == None:
+                    fallback_entries = deque()
+                    Transport.qortal_rx_trace_packet_fallback_times[fallback_key] = fallback_entries
+                fallback_entries.append(entry)
+
+                Transport.qortal_rx_trace_packet_order.append(packet.packet_hash)
+
+                while len(Transport.qortal_rx_trace_packet_order) > QORTAL_RNS_RX_TRACE_PACKET_MAX:
+                    old_hash = Transport.qortal_rx_trace_packet_order.popleft()
+                    old_entry = Transport.qortal_rx_trace_packet_times.pop(old_hash, None)
+                    if old_entry != None:
+                        old_fallback_key = old_entry[4]
+                        old_fallback_entries = Transport.qortal_rx_trace_packet_fallback_times.get(old_fallback_key)
+                        if old_fallback_entries != None:
+                            while old_fallback_entries and old_fallback_entries[0][5] not in Transport.qortal_rx_trace_packet_times:
+                                old_fallback_entries.popleft()
+                            if not old_fallback_entries:
+                                Transport.qortal_rx_trace_packet_fallback_times.pop(old_fallback_key, None)
+        except Exception as e:
+            RNS.log(f"[qortal_rx_trace] network_packet_record_failed error={e}", RNS.LOG_WARNING)
+
+    @staticmethod
+    def qortal_rx_trace_maybe_log_shared_stats(now=None):
+        if not QORTAL_RNS_RX_TRACE:
+            return None
+
+        try:
+            if now == None:
+                now = time.time()
+
+            if now - Transport.qortal_rx_trace_last_stats < 10:
+                return None
+
+            Transport.qortal_rx_trace_last_stats = now
+            pending = len(Transport.qortal_rx_trace_packet_times)
+            pending_fallback_keys = len(Transport.qortal_rx_trace_packet_fallback_times)
+            log_line = (
+                f"[qortal_rx_trace] network_to_shared_trace_stats "
+                f"network_seen={Transport.qortal_rx_trace_network_seen} "
+                f"shared_checked={Transport.qortal_rx_trace_shared_checked} "
+                f"matched={Transport.qortal_rx_trace_shared_matched} "
+                f"unmatched={Transport.qortal_rx_trace_shared_unmatched} "
+                f"max_elapsed_ms={Transport.qortal_rx_trace_shared_max_elapsed_ms} "
+                f"pending={pending} "
+                f"pending_fallback_keys={pending_fallback_keys}"
+            )
+
+            Transport.qortal_rx_trace_network_seen = 0
+            Transport.qortal_rx_trace_shared_checked = 0
+            Transport.qortal_rx_trace_shared_matched = 0
+            Transport.qortal_rx_trace_shared_unmatched = 0
+            Transport.qortal_rx_trace_shared_max_elapsed_ms = 0
+            return log_line
+        except Exception as e:
+            RNS.log(f"[qortal_rx_trace] shared_stats_trace_failed error={e}", RNS.LOG_WARNING)
+            return None
+
+    @staticmethod
+    def qortal_rx_trace_note_shared_write(interface, raw):
+        if not QORTAL_RNS_RX_TRACE:
+            return
+
+        try:
+            now = time.time()
+            packet = RNS.Packet(None, raw)
+            if not packet.unpack():
+                return
+            fallback_key = (
+                packet.destination_hash,
+                packet.packet_type,
+                packet.context,
+                len(packet.data),
+            )
+
+            with Transport.qortal_rx_trace_packet_lock:
+                Transport.qortal_rx_trace_shared_checked += 1
+                entry = Transport.qortal_rx_trace_packet_times.pop(packet.packet_hash, None)
+                if entry == None:
+                    fallback_entries = Transport.qortal_rx_trace_packet_fallback_times.get(fallback_key)
+                    if fallback_entries != None:
+                        while fallback_entries and fallback_entries[0][5] not in Transport.qortal_rx_trace_packet_times:
+                            fallback_entries.popleft()
+
+                        if fallback_entries:
+                            entry = fallback_entries.popleft()
+                            Transport.qortal_rx_trace_packet_times.pop(entry[5], None)
+
+                        if not fallback_entries:
+                            Transport.qortal_rx_trace_packet_fallback_times.pop(fallback_key, None)
+
+            if entry == None:
+                with Transport.qortal_rx_trace_packet_lock:
+                    Transport.qortal_rx_trace_shared_unmatched += 1
+                    stats_log_line = Transport.qortal_rx_trace_maybe_log_shared_stats(now)
+                if stats_log_line != None:
+                    RNS.log(stats_log_line, RNS.LOG_NOTICE)
+                return
+
+            received_ts, received_interface, received_bytes, received_context = entry[:4]
+            elapsed_ms = int((now - received_ts) * 1000)
+            with Transport.qortal_rx_trace_packet_lock:
+                Transport.qortal_rx_trace_shared_matched += 1
+                if elapsed_ms > Transport.qortal_rx_trace_shared_max_elapsed_ms:
+                    Transport.qortal_rx_trace_shared_max_elapsed_ms = elapsed_ms
+                stats_log_line = Transport.qortal_rx_trace_maybe_log_shared_stats(now)
+
+            if stats_log_line != None:
+                RNS.log(stats_log_line, RNS.LOG_NOTICE)
+
+            if elapsed_ms >= QORTAL_RNS_RX_TRACE_GAP_MS:
+                RNS.log(
+                    f"[qortal_rx_trace] network_to_shared_write_slow elapsed_ms={elapsed_ms} "
+                    f"bytes={len(raw)} received_bytes={received_bytes} context={packet.context} "
+                    f"received_context={received_context} packet={packet.packet_hash.hex()[:16]} "
+                    f"from_interface={received_interface} to_interface={interface}",
+                    RNS.LOG_NOTICE,
+                )
+        except Exception as e:
+            RNS.log(f"[qortal_rx_trace] shared_write_trace_failed error={e}", RNS.LOG_WARNING)
+
+    @staticmethod
+    def qortal_rx_trace_note_transmit(interface, raw):
+        if not QORTAL_RNS_RX_TRACE:
+            return
+
+        try:
+            now = time.time()
+            is_local_client = Transport.is_local_client_interface(interface)
+            is_shared_instance = Transport.interface_to_shared_instance(interface)
+            has_parent = hasattr(interface, "parent_interface")
+            has_shared_parent = has_parent and hasattr(interface.parent_interface, "is_local_shared_instance")
+            has_shared_flag = hasattr(interface, "is_local_shared_instance")
+            has_connected_shared = hasattr(interface, "is_connected_to_shared_instance")
+            key = (
+                f"{type(interface).__name__}|"
+                f"local_client={int(is_local_client)}|"
+                f"shared_instance={int(is_shared_instance)}|"
+                f"parent={int(has_parent)}|"
+                f"shared_parent={int(has_shared_parent)}|"
+                f"shared_flag={int(has_shared_flag)}|"
+                f"connected_shared={int(has_connected_shared)}"
+            )
+
+            with Transport.qortal_rx_trace_packet_lock:
+                stats = Transport.qortal_rx_trace_transmit_counts.get(key)
+                if stats == None:
+                    stats = [0, 0]
+                    Transport.qortal_rx_trace_transmit_counts[key] = stats
+                stats[0] += 1
+                stats[1] += len(raw)
+
+                if now - Transport.qortal_rx_trace_last_transmit_stats < 10:
+                    return
+
+                Transport.qortal_rx_trace_last_transmit_stats = now
+                counts = Transport.qortal_rx_trace_transmit_counts
+                Transport.qortal_rx_trace_transmit_counts = {}
+
+            parts = []
+            for count_key, count_stats in sorted(counts.items()):
+                parts.append(f"{count_key}:packets={count_stats[0]},bytes={count_stats[1]}")
+
+            RNS.log(f"[qortal_rx_trace] transmit_interface_stats {'; '.join(parts)}", RNS.LOG_NOTICE)
+        except Exception as e:
+            RNS.log(f"[qortal_rx_trace] transmit_interface_trace_failed error={e}", RNS.LOG_WARNING)
+
+    @staticmethod
     def handle_disovery_path_requests():
         if Transport.discovery_pr_handle_lock.locked(): return
         with Transport.discovery_pr_handle_lock:
@@ -1051,6 +1258,18 @@ class Transport:
     @staticmethod
     def transmit(interface, raw):
         try:
+            if QORTAL_RNS_RX_TRACE:
+                Transport.qortal_rx_trace_note_transmit(interface, raw)
+
+            if (
+                QORTAL_RNS_RX_TRACE and
+                (
+                    Transport.is_local_client_interface(interface) or
+                    Transport.interface_to_shared_instance(interface)
+                )
+            ):
+                Transport.qortal_rx_trace_note_shared_write(interface, raw)
+
             if hasattr(interface, "ifac_identity") and interface.ifac_identity != None:
                 # Calculate packet access code
                 ifac = interface.ifac_identity.sign(raw)[-interface.ifac_size:]
@@ -1455,6 +1674,8 @@ class Transport:
             
         packet.receiving_interface = interface
         packet.hops += 1
+        if QORTAL_RNS_RX_TRACE and interface != None:
+            Transport.qortal_rx_trace_record_network_packet(packet, interface)
 
         if interface != None:
             if hasattr(interface, "r_stat_rssi"):
@@ -2135,7 +2356,24 @@ class Transport:
                                             RNS.Packet(destination=link, data=cached_packet.data,
                                                        packet_type=cached_packet.packet_type, context=cached_packet.context).send()
                                     
-                                    else: link.receive(packet)
+                                    else:
+                                        if QORTAL_RNS_RX_TRACE:
+                                            now = time.time()
+                                            last_receive = getattr(link, "_qortal_transport_last_delivery_ts", None)
+                                            link._qortal_transport_last_delivery_ts = now
+                                            if last_receive != None:
+                                                gap_ms = int((now - last_receive) * 1000)
+                                                if gap_ms >= QORTAL_RNS_RX_TRACE_GAP_MS:
+                                                    RNS.log(f"[qortal_rx_trace] transport_link_delivery_gap gap_ms={gap_ms} bytes={len(packet.data)} context={packet.context} link={RNS.prettyhexrep(link.link_id)} interface={packet.receiving_interface}", RNS.LOG_NOTICE)
+
+                                            delivery_start = now
+
+                                        link.receive(packet)
+
+                                        if QORTAL_RNS_RX_TRACE:
+                                            elapsed_ms = int((time.time() - delivery_start) * 1000)
+                                            if elapsed_ms >= QORTAL_RNS_RX_TRACE_GAP_MS:
+                                                RNS.log(f"[qortal_rx_trace] transport_link_delivery_slow elapsed_ms={elapsed_ms} bytes={len(packet.data)} context={packet.context} link={RNS.prettyhexrep(link.link_id)} interface={packet.receiving_interface}", RNS.LOG_NOTICE)
                                     break
                                 
                                 else:

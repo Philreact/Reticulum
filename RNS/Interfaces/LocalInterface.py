@@ -34,17 +34,39 @@ from collections import deque
 import socketserver
 import threading
 import socket
+import select
 import time
 import sys
 import os
 import RNS
 from threading import Lock, Condition
 
-QORTAL_RNS_DEDICATED_LOCAL_IO = os.environ.get("QORTAL_RNS_DEDICATED_LOCAL_IO", "1") != "0"
+_qortal_dedicated_local_io_env = os.environ.get("QORTAL_RNS_DEDICATED_LOCAL_IO")
+if _qortal_dedicated_local_io_env == None:
+    QORTAL_RNS_DEDICATED_LOCAL_IO = False
+else:
+    QORTAL_RNS_DEDICATED_LOCAL_IO = _qortal_dedicated_local_io_env != "0"
+QORTAL_RNS_RX_TRACE = os.environ.get("QORTAL_RNS_RX_TRACE", "0") == "1"
+try:
+    QORTAL_RNS_RX_TRACE_GAP_MS = int(os.environ.get("QORTAL_RNS_RX_TRACE_GAP_MS", "200"))
+except Exception:
+    QORTAL_RNS_RX_TRACE_GAP_MS = 200
 try:
     QORTAL_RNS_DEDICATED_TX_QUEUE_MAX_BYTES = int(os.environ.get("QORTAL_RNS_DEDICATED_TX_QUEUE_MAX_BYTES", str(64*1024*1024)))
 except Exception:
     QORTAL_RNS_DEDICATED_TX_QUEUE_MAX_BYTES = 64*1024*1024
+try:
+    QORTAL_RNS_LOCAL_SEND_TIMEOUT_MS = int(os.environ.get("QORTAL_RNS_LOCAL_SEND_TIMEOUT_MS", "1500"))
+except Exception:
+    QORTAL_RNS_LOCAL_SEND_TIMEOUT_MS = 1500
+if QORTAL_RNS_LOCAL_SEND_TIMEOUT_MS < 100:
+    QORTAL_RNS_LOCAL_SEND_TIMEOUT_MS = 100
+try:
+    QORTAL_RNS_LOCAL_SEND_CHUNK_SIZE = int(os.environ.get("QORTAL_RNS_LOCAL_SEND_CHUNK_SIZE", str(16*1024)))
+except Exception:
+    QORTAL_RNS_LOCAL_SEND_CHUNK_SIZE = 16*1024
+if QORTAL_RNS_LOCAL_SEND_CHUNK_SIZE < 1024:
+    QORTAL_RNS_LOCAL_SEND_CHUNK_SIZE = 1024
 
 class HDLC():
     FLAG              = 0x7E
@@ -101,7 +123,7 @@ class LocalClientInterface(Interface):
         self.tx_worker_started = False
         self.tx_shutdown      = False
 
-        if RNS.vendor.platformutils.use_epoll() and not QORTAL_RNS_DEDICATED_LOCAL_IO: self.epoll_backend = True
+        if not QORTAL_RNS_DEDICATED_LOCAL_IO: self.epoll_backend = True
 
         self.pause_on_client_sleep = False
 
@@ -183,6 +205,46 @@ class LocalClientInterface(Interface):
             self.tx_queue_cv.notify()
             return True
 
+    def send_bounded(self, data):
+        if self.socket == None:
+            raise IOError("Cannot transmit on closed local interface socket")
+
+        if not hasattr(socket, "MSG_DONTWAIT"):
+            timeout_s = QORTAL_RNS_LOCAL_SEND_TIMEOUT_MS / 1000.0
+            previous_timeout = self.socket.gettimeout()
+            try:
+                self.socket.settimeout(timeout_s)
+                self.socket.sendall(data)
+            finally:
+                self.socket.settimeout(previous_timeout)
+            return
+
+        total_sent = 0
+        deadline = time.time() + (QORTAL_RNS_LOCAL_SEND_TIMEOUT_MS / 1000.0)
+        while total_sent < len(data):
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError(f"Timed out sending {len(data)} bytes on {self}")
+
+            try:
+                _, writable, _ = select.select([], [self.socket], [], min(remaining, 0.05))
+            except (OSError, ValueError):
+                raise
+
+            if not writable:
+                continue
+
+            chunk_end = min(total_sent + QORTAL_RNS_LOCAL_SEND_CHUNK_SIZE, len(data))
+            try:
+                sent = self.socket.send(data[total_sent:chunk_end], socket.MSG_DONTWAIT)
+            except (BlockingIOError, InterruptedError):
+                continue
+
+            if sent == 0:
+                raise IOError(f"Socket closed while sending on {self}")
+
+            total_sent += sent
+
     def write_loop(self):
         while True:
             with self.tx_queue_cv:
@@ -204,12 +266,16 @@ class LocalClientInterface(Interface):
                     time.sleep(s)
 
                 self.writing = True
+                send_started = time.time()
                 with self.send_lock:
-                    self.socket.sendall(data)
+                    self.send_bounded(data)
                 self.writing = False
                 self.txb += len(data)
                 if hasattr(self, "parent_interface") and self.parent_interface != None:
                     self.parent_interface.txb += len(data)
+                send_ms = int((time.time() - send_started) * 1000)
+                if send_ms >= QORTAL_RNS_LOCAL_SEND_TIMEOUT_MS // 2:
+                    RNS.log(f"LocalInterface send was slow on {self}: elapsed_ms={send_ms} bytes={len(data)}", RNS.LOG_WARNING)
 
             except Exception as e:
                 self.writing = False
@@ -294,12 +360,23 @@ class LocalClientInterface(Interface):
                     self.writing = True
                     data = bytes([HDLC.FLAG])+bytes([HDLC.FLAG])
                     with self.send_lock:
-                        self.socket.sendall(data)
+                        self.send_bounded(data)
                     self.writing = False
 
             except Exception as e: RNS.log(f"Exception occurred while sending keepalive on {self}: {e}", RNS.LOG_ERROR)
 
     def process_incoming(self, data):
+        if QORTAL_RNS_RX_TRACE:
+            now = time.time()
+            last_incoming = getattr(self, "_qortal_last_incoming_frame_ts", None)
+            self._qortal_last_incoming_frame_ts = now
+            if last_incoming != None:
+                gap_ms = int((now - last_incoming) * 1000)
+                if gap_ms >= QORTAL_RNS_RX_TRACE_GAP_MS:
+                    RNS.log(f"[qortal_rx_trace] local_frame_gap gap_ms={gap_ms} bytes={len(data)} interface={self}", RNS.LOG_NOTICE)
+
+            process_start = now
+
         self.rxb += len(data)
         if self.parent_interface != None: self.parent_interface.rxb += len(data)
         
@@ -307,6 +384,11 @@ class LocalClientInterface(Interface):
         except Exception as e:
             RNS.log(f"An error occurred in the processing of an incoming frame for {self}: {e}", RNS.LOG_ERROR)
             RNS.trace_exception(e)
+        finally:
+            if QORTAL_RNS_RX_TRACE:
+                process_ms = int((time.time() - process_start) * 1000)
+                if process_ms >= QORTAL_RNS_RX_TRACE_GAP_MS:
+                    RNS.log(f"[qortal_rx_trace] local_frame_process_slow elapsed_ms={process_ms} bytes={len(data)} interface={self}", RNS.LOG_NOTICE)
 
     def process_outgoing(self, data):
         if self.pause_on_client_sleep and time.time() > self.pause_timeout:
@@ -337,13 +419,14 @@ class LocalClientInterface(Interface):
 
                     data = bytes([HDLC.FLAG])+HDLC.escape(data)+bytes([HDLC.FLAG])
                     with self.send_lock:
-                        self.socket.sendall(data)
+                        self.send_bounded(data)
                     self.writing = False
                     self.txb += len(data)
                     if hasattr(self, "parent_interface") and self.parent_interface != None:
                         self.parent_interface.txb += len(data)
 
             except Exception as e:
+                self.writing = False
                 RNS.log("Exception occurred while transmitting via "+str(self)+", tearing down interface", RNS.LOG_ERROR)
                 RNS.log("The contained exception was: "+str(e), RNS.LOG_ERROR)
                 RNS.trace_exception(e)
@@ -493,7 +576,7 @@ class LocalServerInterface(Interface):
         self.name = "Reticulum"
         self.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
 
-        if RNS.vendor.platformutils.use_epoll():
+        if not QORTAL_RNS_DEDICATED_LOCAL_IO:
             self.epoll_backend = True
 
         if socket_path != None and self.epoll_backend:

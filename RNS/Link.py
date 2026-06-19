@@ -39,8 +39,15 @@ import inspect
 import struct
 import math
 import time
+import os
 import RNS
 import io
+
+QORTAL_RNS_RX_TRACE = os.environ.get("QORTAL_RNS_RX_TRACE", "0") == "1"
+try:
+    QORTAL_RNS_RX_TRACE_GAP_MS = int(os.environ.get("QORTAL_RNS_RX_TRACE_GAP_MS", "200"))
+except Exception:
+    QORTAL_RNS_RX_TRACE_GAP_MS = 200
 
 class LinkCallbacks:
     def __init__(self):
@@ -970,11 +977,20 @@ class Link:
         return self._channel
 
     def receive(self, packet):
+        receive_started = time.time() if QORTAL_RNS_RX_TRACE else None
         self.watchdog_lock = True
         if not self.status == Link.CLOSED and not (self.initiator and packet.context == RNS.Packet.KEEPALIVE and packet.data == bytes([0xFF])):
             if packet.receiving_interface != self.attached_interface:
                 RNS.log(f"Link-associated packet received on unexpected interface {packet.receiving_interface} instead of {self.attached_interface}! Someone might be trying to manipulate your communication!", RNS.LOG_ERROR)
             else:
+                if QORTAL_RNS_RX_TRACE and packet.packet_type == RNS.Packet.DATA and packet.context != RNS.Packet.KEEPALIVE:
+                    last_receive = getattr(self, "_qortal_last_receive_ts", None)
+                    self._qortal_last_receive_ts = receive_started
+                    if last_receive != None:
+                        gap_ms = int((receive_started - last_receive) * 1000)
+                        if gap_ms >= QORTAL_RNS_RX_TRACE_GAP_MS:
+                            RNS.log(f"[qortal_rx_trace] link_receive_gap gap_ms={gap_ms} bytes={len(packet.data)} context={packet.context} link={RNS.prettyhexrep(self.link_id)} interface={packet.receiving_interface}", RNS.LOG_NOTICE)
+
                 self.last_inbound = time.time()
                 if packet.context != RNS.Packet.KEEPALIVE:
                     self.last_data = self.last_inbound
@@ -992,9 +1008,32 @@ class Link:
                             self.__update_phy_stats(packet, query_shared=True)
 
                             if self.callbacks.packet != None:
-                                thread = threading.Thread(target=self.callbacks.packet, args=(plaintext, packet))
+                                packet_callback = self.callbacks.packet
+                                callback_started = time.time() if QORTAL_RNS_RX_TRACE else None
+
+                                def qortal_rx_callback():
+                                    callback_entered = time.time() if QORTAL_RNS_RX_TRACE else None
+                                    if QORTAL_RNS_RX_TRACE:
+                                        dispatch_ms = int((callback_entered - callback_started) * 1000)
+                                        if dispatch_ms >= QORTAL_RNS_RX_TRACE_GAP_MS:
+                                            RNS.log(f"[qortal_rx_trace] link_callback_thread_start_slow elapsed_ms={dispatch_ms} bytes={len(plaintext)} link={RNS.prettyhexrep(self.link_id)}", RNS.LOG_NOTICE)
+
+                                    packet_callback(plaintext, packet)
+
+                                    if QORTAL_RNS_RX_TRACE:
+                                        callback_ms = int((time.time() - callback_entered) * 1000)
+                                        if callback_ms >= QORTAL_RNS_RX_TRACE_GAP_MS:
+                                            RNS.log(f"[qortal_rx_trace] link_callback_slow elapsed_ms={callback_ms} bytes={len(plaintext)} link={RNS.prettyhexrep(self.link_id)}", RNS.LOG_NOTICE)
+
+                                thread = threading.Thread(target=qortal_rx_callback)
                                 thread.daemon = True
                                 thread.start()
+
+                                if QORTAL_RNS_RX_TRACE:
+                                    dispatch_ms = int((time.time() - callback_started) * 1000)
+                                    inbound_to_dispatch_ms = int((time.time() - receive_started) * 1000)
+                                    if dispatch_ms >= QORTAL_RNS_RX_TRACE_GAP_MS or inbound_to_dispatch_ms >= QORTAL_RNS_RX_TRACE_GAP_MS:
+                                        RNS.log(f"[qortal_rx_trace] link_callback_dispatch_slow dispatch_ms={dispatch_ms} inbound_to_dispatch_ms={inbound_to_dispatch_ms} bytes={len(plaintext)} link={RNS.prettyhexrep(self.link_id)}", RNS.LOG_NOTICE)
                             
                             if self.destination.proof_strategy == RNS.Destination.PROVE_ALL:
                                 packet.prove()
