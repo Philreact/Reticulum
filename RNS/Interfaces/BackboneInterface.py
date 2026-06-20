@@ -52,6 +52,7 @@ def env_int(name, default, minimum=None):
 QORTAL_RNS_EPOLL_READ_BUDGET_BYTES = env_int("QORTAL_RNS_EPOLL_READ_BUDGET_BYTES", 262144, 1024)
 QORTAL_RNS_EPOLL_WRITE_BUDGET_BYTES = env_int("QORTAL_RNS_EPOLL_WRITE_BUDGET_BYTES", 262144, 1024)
 QORTAL_RNS_LOCAL_IO_STATS = os.environ.get("QORTAL_RNS_LOCAL_IO_STATS", "0") == "1"
+QORTAL_RNS_LOCAL_IO_BACKEND = os.environ.get("QORTAL_RNS_LOCAL_IO_BACKEND", "auto").strip().lower()
 
 class HDLC():
     FLAG              = 0x7E
@@ -329,7 +330,10 @@ class BackboneInterface(Interface):
         if BackboneInterface.event_backend:
             return
 
-        if RNS.vendor.platformutils.use_epoll():
+        if QORTAL_RNS_LOCAL_IO_BACKEND == "selector":
+            BackboneInterface.selector = selectors.DefaultSelector()
+            BackboneInterface.event_backend = BackboneInterface.selector.__class__.__name__
+        elif RNS.vendor.platformutils.use_epoll():
             BackboneInterface.epoll = select.epoll()
             BackboneInterface.event_backend = "epoll"
         else:

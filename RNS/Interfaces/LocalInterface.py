@@ -31,6 +31,7 @@
 from RNS.Interfaces.Interface import Interface
 from RNS.Interfaces.BackboneInterface import BackboneInterface
 from collections import deque
+import asyncio
 import socketserver
 import threading
 import socket
@@ -41,11 +42,59 @@ import os
 import RNS
 from threading import Lock, Condition
 
+def env_int(name, default, minimum=None):
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except Exception:
+        value = default
+
+    if minimum != None and value < minimum:
+        value = minimum
+
+    return value
+
 _qortal_dedicated_local_io_env = os.environ.get("QORTAL_RNS_DEDICATED_LOCAL_IO")
-if _qortal_dedicated_local_io_env == None:
-    QORTAL_RNS_DEDICATED_LOCAL_IO = False
+_qortal_local_io_backend_env = os.environ.get("QORTAL_RNS_LOCAL_IO_BACKEND", "auto").strip().lower()
+if _qortal_local_io_backend_env not in ("auto", "dedicated", "selector", "epoll", "iocp"):
+    _qortal_local_io_backend_env = "auto"
+
+def _qortal_windows_iocp_available():
+    return RNS.vendor.platformutils.is_windows() and (
+        hasattr(asyncio, "ProactorEventLoop") or hasattr(asyncio, "WindowsProactorEventLoopPolicy")
+    )
+
+def _qortal_select_local_io_backend():
+    if _qortal_dedicated_local_io_env != None and _qortal_dedicated_local_io_env != "0":
+        return "dedicated"
+
+    if _qortal_local_io_backend_env == "dedicated":
+        return "dedicated"
+
+    if _qortal_local_io_backend_env == "iocp":
+        if _qortal_windows_iocp_available():
+            return "iocp"
+        return "dedicated"
+
+    if _qortal_local_io_backend_env in ("selector", "epoll"):
+        return "evented"
+
+    if _qortal_dedicated_local_io_env == "0":
+        return "evented"
+
+    if RNS.vendor.platformutils.is_windows():
+        if _qortal_windows_iocp_available():
+            return "iocp"
+        return "dedicated"
+
+    return "evented"
+
+QORTAL_RNS_LOCAL_IO_BACKEND = _qortal_select_local_io_backend()
+if QORTAL_RNS_LOCAL_IO_BACKEND == "dedicated":
+    QORTAL_RNS_DEDICATED_LOCAL_IO = True
 else:
-    QORTAL_RNS_DEDICATED_LOCAL_IO = _qortal_dedicated_local_io_env != "0"
+    QORTAL_RNS_DEDICATED_LOCAL_IO = False
+QORTAL_RNS_IOCP_LOCAL_IO = QORTAL_RNS_LOCAL_IO_BACKEND == "iocp"
+QORTAL_RNS_EVENTED_LOCAL_IO = QORTAL_RNS_LOCAL_IO_BACKEND == "evented"
 QORTAL_RNS_RX_TRACE = os.environ.get("QORTAL_RNS_RX_TRACE", "0") == "1"
 try:
     QORTAL_RNS_RX_TRACE_GAP_MS = int(os.environ.get("QORTAL_RNS_RX_TRACE_GAP_MS", "200"))
@@ -55,6 +104,10 @@ try:
     QORTAL_RNS_DEDICATED_TX_QUEUE_MAX_BYTES = int(os.environ.get("QORTAL_RNS_DEDICATED_TX_QUEUE_MAX_BYTES", str(64*1024*1024)))
 except Exception:
     QORTAL_RNS_DEDICATED_TX_QUEUE_MAX_BYTES = 64*1024*1024
+QORTAL_RNS_IOCP_READ_BUDGET_BYTES = env_int("QORTAL_RNS_IOCP_READ_BUDGET_BYTES", 262144, 1024)
+QORTAL_RNS_IOCP_WRITE_BUDGET_BYTES = env_int("QORTAL_RNS_IOCP_WRITE_BUDGET_BYTES", 262144, 1024)
+QORTAL_RNS_IOCP_TX_QUEUE_MAX_BYTES = env_int("QORTAL_RNS_IOCP_TX_QUEUE_MAX_BYTES", 64*1024*1024, 1024)
+QORTAL_RNS_LOCAL_IO_STATS = os.environ.get("QORTAL_RNS_LOCAL_IO_STATS", "0") == "1"
 try:
     QORTAL_RNS_LOCAL_SEND_TIMEOUT_MS = int(os.environ.get("QORTAL_RNS_LOCAL_SEND_TIMEOUT_MS", "1500"))
 except Exception:
@@ -88,6 +141,387 @@ class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self.socket.bind(self.server_address)
         self.server_address = self.socket.getsockname()
 
+class _IOCPClientState:
+    def __init__(self, interface, client_socket):
+        self.interface = interface
+        self.socket = client_socket
+        self.lock = Lock()
+        self.queue = deque()
+        self.queue_bytes = 0
+        self.write_event = None
+        self.closed = False
+        self.read_task = None
+        self.write_task = None
+
+class WindowsIOCPSharedIO:
+    loop = None
+    thread = None
+    started = threading.Event()
+    start_lock = Lock()
+    states_lock = Lock()
+    listener_sockets = {}
+    client_states_by_fileno = {}
+    client_states_by_interface = {}
+    stats_lock = Lock()
+    last_stats_log = 0
+    read_events = 0
+    write_events = 0
+    read_bytes = 0
+    write_bytes = 0
+    read_budget_hits = 0
+    write_budget_hits = 0
+    tx_queue_max = 0
+    socket_close_count = 0
+    socket_error_count = 0
+    fallback_count = 0
+    loop_slow_ticks = 0
+
+    @staticmethod
+    def available():
+        return _qortal_windows_iocp_available()
+
+    @staticmethod
+    def start():
+        if WindowsIOCPSharedIO.loop != None:
+            return True
+
+        with WindowsIOCPSharedIO.start_lock:
+            if WindowsIOCPSharedIO.loop != None:
+                return True
+
+            WindowsIOCPSharedIO.started.clear()
+
+            def run_loop():
+                try:
+                    if hasattr(asyncio, "WindowsProactorEventLoopPolicy"):
+                        loop = asyncio.WindowsProactorEventLoopPolicy().new_event_loop()
+                    elif hasattr(asyncio, "ProactorEventLoop"):
+                        loop = asyncio.ProactorEventLoop()
+                    else:
+                        loop = asyncio.new_event_loop()
+
+                    WindowsIOCPSharedIO.loop = loop
+                    asyncio.set_event_loop(loop)
+                    loop.create_task(WindowsIOCPSharedIO._stats_loop())
+                    WindowsIOCPSharedIO.started.set()
+                    loop.run_forever()
+
+                except Exception as e:
+                    WindowsIOCPSharedIO._note_stat("fallback_count")
+                    RNS.log(f"Windows IOCP local shared I/O loop failed to start: {e}", RNS.LOG_ERROR)
+                    RNS.trace_exception(e)
+                    WindowsIOCPSharedIO.started.set()
+
+            WindowsIOCPSharedIO.thread = threading.Thread(target=run_loop, daemon=True)
+            WindowsIOCPSharedIO.thread.start()
+            WindowsIOCPSharedIO.started.wait(3.0)
+
+            if WindowsIOCPSharedIO.loop == None:
+                WindowsIOCPSharedIO._note_stat("fallback_count")
+                return False
+
+            RNS.log("Using Windows IOCP local shared I/O backend", RNS.LOG_INFO)
+            return True
+
+    @staticmethod
+    def _note_stat(name, value=1):
+        if not QORTAL_RNS_LOCAL_IO_STATS and name != "fallback_count":
+            return
+
+        with WindowsIOCPSharedIO.stats_lock:
+            setattr(WindowsIOCPSharedIO, name, getattr(WindowsIOCPSharedIO, name) + value)
+
+    @staticmethod
+    def _note_tx_queue(length):
+        if not QORTAL_RNS_LOCAL_IO_STATS:
+            return
+
+        with WindowsIOCPSharedIO.stats_lock:
+            if length > WindowsIOCPSharedIO.tx_queue_max:
+                WindowsIOCPSharedIO.tx_queue_max = length
+
+    @staticmethod
+    async def _stats_loop():
+        while True:
+            started = time.time()
+            await asyncio.sleep(10)
+            if time.time() - started > 11:
+                WindowsIOCPSharedIO._note_stat("loop_slow_ticks")
+            WindowsIOCPSharedIO._maybe_log_stats()
+
+    @staticmethod
+    def _maybe_log_stats():
+        if not QORTAL_RNS_LOCAL_IO_STATS:
+            return
+
+        now = time.time()
+        with WindowsIOCPSharedIO.stats_lock:
+            if now < WindowsIOCPSharedIO.last_stats_log + 10:
+                return
+
+            WindowsIOCPSharedIO.last_stats_log = now
+            stats = (
+                WindowsIOCPSharedIO.read_events,
+                WindowsIOCPSharedIO.write_events,
+                WindowsIOCPSharedIO.read_bytes,
+                WindowsIOCPSharedIO.write_bytes,
+                WindowsIOCPSharedIO.read_budget_hits,
+                WindowsIOCPSharedIO.write_budget_hits,
+                WindowsIOCPSharedIO.tx_queue_max,
+                WindowsIOCPSharedIO.socket_close_count,
+                WindowsIOCPSharedIO.socket_error_count,
+                WindowsIOCPSharedIO.fallback_count,
+                WindowsIOCPSharedIO.loop_slow_ticks,
+            )
+
+        RNS.log(
+            f"local event I/O stats backend=iocp "
+            f"read_events={stats[0]} write_events={stats[1]} "
+            f"read_bytes={stats[2]} write_bytes={stats[3]} "
+            f"read_budget_hits={stats[4]} write_budget_hits={stats[5]} "
+            f"tx_queue_max={stats[6]} socket_closes={stats[7]} "
+            f"socket_errors={stats[8]} fallback_count={stats[9]} "
+            f"loop_slow_ticks={stats[10]}",
+            RNS.LOG_NOTICE,
+        )
+
+    @staticmethod
+    def add_listener(interface, bind_address, socket_type=socket.AF_INET):
+        if not WindowsIOCPSharedIO.start():
+            raise OSError("Windows IOCP local shared I/O backend is unavailable")
+
+        if socket_type == socket.AF_INET:
+            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        elif socket_type == socket.AF_INET6:
+            server_socket = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            raise TypeError(f"Invalid socket type {socket_type} for Windows IOCP local shared I/O")
+
+        server_socket.bind(bind_address)
+        server_socket.listen(64)
+        server_socket.setblocking(False)
+        WindowsIOCPSharedIO.listener_sockets[server_socket.fileno()] = (interface, server_socket)
+        WindowsIOCPSharedIO.loop.call_soon_threadsafe(
+            lambda: WindowsIOCPSharedIO.loop.create_task(WindowsIOCPSharedIO._accept_loop(interface, server_socket))
+        )
+        return server_socket
+
+    @staticmethod
+    async def _accept_loop(interface, server_socket):
+        while True:
+            try:
+                client_socket, address = await WindowsIOCPSharedIO.loop.sock_accept(server_socket)
+                client_socket.setblocking(False)
+                if client_socket.family == socket.AF_INET:
+                    client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+                if not interface.incoming_connection(client_socket):
+                    try: client_socket.close()
+                    except Exception as e: RNS.log(f"Error while closing failed IOCP incoming socket: {e}", RNS.LOG_WARNING)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                WindowsIOCPSharedIO._note_stat("socket_error_count")
+                RNS.log(f"Accepting Windows IOCP local socket failed for {interface}: {e}", RNS.LOG_WARNING)
+                await asyncio.sleep(0.25)
+
+    @staticmethod
+    def add_client_socket(client_socket, interface):
+        if not WindowsIOCPSharedIO.start():
+            return False
+
+        try:
+            client_socket.setblocking(False)
+        except Exception as e:
+            RNS.log(f"Could not set IOCP local shared socket to nonblocking mode: {e}", RNS.LOG_WARNING)
+            return False
+
+        state = _IOCPClientState(interface, client_socket)
+        fileno = client_socket.fileno()
+        with WindowsIOCPSharedIO.states_lock:
+            WindowsIOCPSharedIO.client_states_by_fileno[fileno] = state
+            WindowsIOCPSharedIO.client_states_by_interface[interface] = state
+        WindowsIOCPSharedIO.loop.call_soon_threadsafe(WindowsIOCPSharedIO._start_client_state, state)
+        return True
+
+    @staticmethod
+    def _start_client_state(state):
+        if state.closed:
+            return
+
+        state.write_event = asyncio.Event()
+        state.read_task = WindowsIOCPSharedIO.loop.create_task(WindowsIOCPSharedIO._read_loop(state))
+        state.write_task = WindowsIOCPSharedIO.loop.create_task(WindowsIOCPSharedIO._write_loop(state))
+        with state.lock:
+            if len(state.queue) > 0:
+                state.write_event.set()
+
+    @staticmethod
+    def queue_outgoing(interface, data):
+        with WindowsIOCPSharedIO.states_lock:
+            state = WindowsIOCPSharedIO.client_states_by_interface.get(interface)
+        if state == None:
+            return False
+
+        with state.lock:
+            if state.closed or not interface.online or interface.detached:
+                return False
+
+            queued_bytes = state.queue_bytes + len(data)
+            if queued_bytes > QORTAL_RNS_IOCP_TX_QUEUE_MAX_BYTES:
+                WindowsIOCPSharedIO._note_stat("write_budget_hits")
+                RNS.log(
+                    f"IOCP TX queue for {interface} is full, dropping outbound packet "
+                    f"queued={state.queue_bytes} packet={len(data)} "
+                    f"limit={QORTAL_RNS_IOCP_TX_QUEUE_MAX_BYTES}",
+                    RNS.LOG_WARNING,
+                )
+                return False
+
+            state.queue.append(data)
+            state.queue_bytes = queued_bytes
+            WindowsIOCPSharedIO._note_tx_queue(state.queue_bytes)
+            write_event = state.write_event
+
+        if write_event != None and WindowsIOCPSharedIO.loop != None:
+            WindowsIOCPSharedIO.loop.call_soon_threadsafe(write_event.set)
+
+        return True
+
+    @staticmethod
+    async def _read_loop(state):
+        while not state.closed:
+            read_total = 0
+            try:
+                while not state.closed and read_total < QORTAL_RNS_IOCP_READ_BUDGET_BYTES:
+                    read_size = min(state.interface.HW_MTU, QORTAL_RNS_IOCP_READ_BUDGET_BYTES - read_total)
+                    received = await WindowsIOCPSharedIO.loop.sock_recv(state.socket, read_size)
+                    WindowsIOCPSharedIO._note_stat("read_events")
+                    if len(received) == 0:
+                        WindowsIOCPSharedIO.close_state(state, error=False)
+                        return
+
+                    read_total += len(received)
+                    WindowsIOCPSharedIO._note_stat("read_bytes", len(received))
+                    state.interface.receive(received)
+
+                    if len(received) < read_size:
+                        break
+
+                if read_total >= QORTAL_RNS_IOCP_READ_BUDGET_BYTES:
+                    WindowsIOCPSharedIO._note_stat("read_budget_hits")
+                    await asyncio.sleep(0)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if not state.interface.detached:
+                    RNS.log(f"Error while reading Windows IOCP local socket for {state.interface}: {e}", RNS.LOG_DEBUG)
+                WindowsIOCPSharedIO.close_state(state, error=True)
+                return
+
+    @staticmethod
+    async def _write_loop(state):
+        while not state.closed:
+            try:
+                if state.write_event == None:
+                    await asyncio.sleep(0)
+                    continue
+
+                await state.write_event.wait()
+                state.write_event.clear()
+
+                while not state.closed:
+                    with state.lock:
+                        if len(state.queue) == 0:
+                            break
+
+                        data = state.queue.popleft()
+                        state.queue_bytes -= len(data)
+
+                    offset = 0
+                    while offset < len(data) and not state.closed:
+                        chunk_end = min(offset + QORTAL_RNS_IOCP_WRITE_BUDGET_BYTES, len(data))
+                        chunk = data[offset:chunk_end]
+                        await WindowsIOCPSharedIO.loop.sock_sendall(state.socket, chunk)
+                        WindowsIOCPSharedIO._note_stat("write_events")
+                        WindowsIOCPSharedIO._note_stat("write_bytes", len(chunk))
+                        state.interface.txb += len(chunk)
+                        if state.interface.parent_interface != None:
+                            state.interface.parent_interface.txb += len(chunk)
+                        offset = chunk_end
+                        if offset < len(data):
+                            WindowsIOCPSharedIO._note_stat("write_budget_hits")
+                            await asyncio.sleep(0)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if not state.interface.detached:
+                    RNS.log(f"Error while writing Windows IOCP local socket for {state.interface}: {e}", RNS.LOG_DEBUG)
+                WindowsIOCPSharedIO.close_state(state, error=True)
+                return
+
+    @staticmethod
+    def close_state(state, error=False):
+        with state.lock:
+            if state.closed:
+                return
+
+            state.closed = True
+            state.queue.clear()
+            state.queue_bytes = 0
+            write_event = state.write_event
+
+        if write_event != None and WindowsIOCPSharedIO.loop != None:
+            try:
+                WindowsIOCPSharedIO.loop.call_soon_threadsafe(write_event.set)
+            except Exception:
+                pass
+
+        if error:
+            WindowsIOCPSharedIO._note_stat("socket_error_count")
+        else:
+            WindowsIOCPSharedIO._note_stat("socket_close_count")
+
+        with WindowsIOCPSharedIO.states_lock:
+            try:
+                fileno = state.socket.fileno()
+                WindowsIOCPSharedIO.client_states_by_fileno.pop(fileno, None)
+            except Exception:
+                pass
+
+            try:
+                WindowsIOCPSharedIO.client_states_by_interface.pop(state.interface, None)
+            except Exception:
+                pass
+
+        pif = None
+        try:
+            if state.interface.parent_interface:
+                pif = state.interface.parent_interface
+                if pif.spawned_interfaces != None:
+                    while state.interface in pif.spawned_interfaces:
+                        pif.spawned_interfaces.remove(state.interface)
+        except Exception as e:
+            RNS.log(f"Error while removing spawned interface from {pif}: {e}", RNS.LOG_ERROR)
+
+        try:
+            state.socket.close()
+        except Exception as e:
+            RNS.log(f"Error while closing Windows IOCP socket for {state.interface}: {e}", RNS.LOG_WARNING)
+
+        def notify_close():
+            try:
+                state.interface.receive(b"")
+            except Exception as e:
+                RNS.log(f"Error while notifying {state.interface} of Windows IOCP socket close: {e}", RNS.LOG_DEBUG)
+
+        threading.Thread(target=notify_close, daemon=True).start()
+
 class LocalClientInterface(Interface):
     RECONNECT_WAIT = 8
     AUTOCONFIGURE_MTU = True
@@ -97,6 +531,7 @@ class LocalClientInterface(Interface):
         super().__init__()
 
         self.epoll_backend    = False
+        self.iocp_backend     = False
         self.HW_MTU           = 262144
         self.online           = False
         
@@ -123,7 +558,8 @@ class LocalClientInterface(Interface):
         self.tx_worker_started = False
         self.tx_shutdown      = False
 
-        if not QORTAL_RNS_DEDICATED_LOCAL_IO: self.epoll_backend = True
+        if QORTAL_RNS_IOCP_LOCAL_IO: self.iocp_backend = True
+        elif QORTAL_RNS_EVENTED_LOCAL_IO: self.epoll_backend = True
 
         self.pause_on_client_sleep = False
 
@@ -162,11 +598,11 @@ class LocalClientInterface(Interface):
         self.announce_rate_grace   = None
         self.announce_rate_penalty = None
 
-        if not self.epoll_backend and QORTAL_RNS_DEDICATED_LOCAL_IO:
+        if not self.epoll_backend and not self.iocp_backend and QORTAL_RNS_DEDICATED_LOCAL_IO:
             self.start_dedicated_write_loop()
 
         if connected_socket == None:
-            if not self.epoll_backend:
+            if not self.epoll_backend and not self.iocp_backend:
                 if QORTAL_RNS_DEDICATED_LOCAL_IO:
                     RNS.log(f"Using dedicated local shared I/O thread for {self}", RNS.LOG_INFO)
                 thread = threading.Thread(target=self.read_loop)
@@ -304,7 +740,16 @@ class LocalClientInterface(Interface):
             self.tx_queue_cv.notify_all()
 
         if RNS.vendor.platformutils.is_android(): self.phy_keepalive = True
-        if self.epoll_backend: BackboneInterface.add_client_socket(self.socket, self)
+        if self.iocp_backend:
+            if not WindowsIOCPSharedIO.add_client_socket(self.socket, self):
+                RNS.log(f"Windows IOCP local shared I/O unavailable for {self}, falling back to dedicated local I/O", RNS.LOG_WARNING)
+                self.iocp_backend = False
+                self.epoll_backend = False
+                self.start_dedicated_write_loop()
+                thread = threading.Thread(target=self.read_loop)
+                thread.daemon = True
+                thread.start()
+        elif self.epoll_backend: BackboneInterface.add_client_socket(self.socket, self)
         elif QORTAL_RNS_DEDICATED_LOCAL_IO: self.start_dedicated_write_loop()
 
         return True
@@ -330,7 +775,7 @@ class LocalClientInterface(Interface):
                     RNS.log("Reconnected socket for "+str(self)+".", RNS.LOG_INFO)
 
                 self.reconnecting = False
-                if not self.epoll_backend:
+                if not self.epoll_backend and not self.iocp_backend:
                     thread = threading.Thread(target=self.read_loop)
                     thread.daemon = True
                     thread.start()
@@ -349,7 +794,10 @@ class LocalClientInterface(Interface):
         if self.online:
             RNS.log(f"Sending keepalive on {self}", RNS.LOG_DEBUG) # TODO: Remove
             try:
-                if self.epoll_backend:
+                if self.iocp_backend:
+                    WindowsIOCPSharedIO.queue_outgoing(self, bytes([HDLC.FLAG])+bytes([HDLC.FLAG]))
+
+                elif self.epoll_backend:
                     self.transmit_buffer += bytes([HDLC.FLAG])+bytes([HDLC.FLAG])
                     BackboneInterface.tx_ready(self)
 
@@ -397,7 +845,11 @@ class LocalClientInterface(Interface):
 
         if self.online:
             try:
-                if self.epoll_backend:
+                if self.iocp_backend:
+                    framed_data = bytes([HDLC.FLAG])+HDLC.escape(data)+bytes([HDLC.FLAG])
+                    WindowsIOCPSharedIO.queue_outgoing(self, framed_data)
+
+                elif self.epoll_backend:
                     self.transmit_buffer += bytes([HDLC.FLAG])+HDLC.escape(data)+bytes([HDLC.FLAG])
                     BackboneInterface.tx_ready(self)
 
@@ -565,6 +1017,7 @@ class LocalServerInterface(Interface):
     def __init__(self, owner, bindport=None, socket_path=None):
         super().__init__()
         self.epoll_backend = False
+        self.iocp_backend = False
         self.online = False
         self.clients = 0
         
@@ -576,7 +1029,9 @@ class LocalServerInterface(Interface):
         self.name = "Reticulum"
         self.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
 
-        if not QORTAL_RNS_DEDICATED_LOCAL_IO:
+        if QORTAL_RNS_IOCP_LOCAL_IO:
+            self.iocp_backend = True
+        elif QORTAL_RNS_EVENTED_LOCAL_IO:
             self.epoll_backend = True
 
         if socket_path != None and self.epoll_backend:
@@ -597,7 +1052,29 @@ class LocalServerInterface(Interface):
             self.is_local_shared_instance = True
 
             address = (self.bind_ip, self.bind_port)
-            if self.epoll_backend: BackboneInterface.add_listener(self, address)
+            if self.iocp_backend:
+                try:
+                    self.server_socket = WindowsIOCPSharedIO.add_listener(self, address)
+                except Exception as e:
+                    if WindowsIOCPSharedIO.loop != None:
+                        raise
+
+                    WindowsIOCPSharedIO._note_stat("fallback_count")
+                    RNS.log(f"Windows IOCP local shared listener unavailable, falling back to dedicated local I/O: {e}", RNS.LOG_WARNING)
+                    self.iocp_backend = False
+                    self.epoll_backend = False
+                    self.server_socket = None
+                    def handlerFactory(callback):
+                        def createHandler(*args, **keys):
+                            return LocalInterfaceHandler(callback, *args, **keys)
+                        return createHandler
+
+                    self.server = ThreadingTCPServer(address, handlerFactory(self.incoming_connection))
+                    self.server.daemon_threads = True
+                    thread = threading.Thread(target=self.server.serve_forever)
+                    thread.daemon = True
+                    thread.start()
+            elif self.epoll_backend: BackboneInterface.add_listener(self, address)
             else:
                 def handlerFactory(callback):
                     def createHandler(*args, **keys):
@@ -618,7 +1095,7 @@ class LocalServerInterface(Interface):
         self.online = True
 
     def incoming_connection(self, handler):
-        if self.epoll_backend:
+        if self.epoll_backend or self.iocp_backend:
             client_socket = handler
             if client_socket.family == socket.AF_INET:
                 interface_name = str(str(client_socket.getpeername()[1]))
@@ -644,7 +1121,17 @@ class LocalServerInterface(Interface):
             if hasattr(self, "_force_bitrate"): spawned_interface._force_bitrate = self._force_bitrate
             RNS.Transport.add_interface(spawned_interface)
             RNS.Transport.local_client_interfaces.append(spawned_interface)
-            if spawned_interface.epoll_backend:
+            if spawned_interface.iocp_backend:
+                if not WindowsIOCPSharedIO.add_client_socket(client_socket, spawned_interface):
+                    try: client_socket.setblocking(True)
+                    except Exception as e: RNS.log(f"Could not set local shared client socket to blocking mode: {e}", RNS.LOG_WARNING)
+                    spawned_interface.iocp_backend = False
+                    spawned_interface.epoll_backend = False
+                    spawned_interface.start_dedicated_write_loop()
+                    thread = threading.Thread(target=spawned_interface.read_loop)
+                    thread.daemon = True
+                    thread.start()
+            elif spawned_interface.epoll_backend:
                 BackboneInterface.add_client_socket(client_socket, spawned_interface)
             else:
                 try: client_socket.setblocking(True)
@@ -667,6 +1154,9 @@ class LocalServerInterface(Interface):
             spawned_interface.parent_interface = self
             spawned_interface.bitrate = self.bitrate
             if hasattr(self, "_force_bitrate"): spawned_interface._force_bitrate = self._force_bitrate
+            spawned_interface.iocp_backend = False
+            spawned_interface.epoll_backend = False
+            spawned_interface.start_dedicated_write_loop()
             RNS.Transport.add_interface(spawned_interface)
             RNS.Transport.local_client_interfaces.append(spawned_interface)
             self.clients += 1
