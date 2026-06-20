@@ -369,11 +369,17 @@ class BackboneInterface(Interface):
         BackboneInterface.ensure_epoll()
         if socket_type == socket.AF_INET:
             server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if RNS.vendor.platformutils.is_windows():
+                server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server_socket.bind(bind_address)
         elif socket_type == socket.AF_INET6:
             server_socket = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if RNS.vendor.platformutils.is_windows():
+                server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server_socket.bind(bind_address)
         elif socket_type == socket.AF_UNIX:
             server_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
