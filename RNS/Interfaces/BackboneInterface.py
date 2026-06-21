@@ -36,6 +36,7 @@ import selectors
 import time
 import sys
 import os
+import errno
 import RNS
 
 def env_int(name, default, minimum=None):
@@ -355,6 +356,33 @@ class BackboneInterface(Interface):
             BackboneInterface.selector.modify(fileno, mask)
 
     @staticmethod
+    def _fileno_not_registered_error(error):
+        if isinstance(error, KeyError):
+            return True
+
+        if isinstance(error, OSError):
+            return getattr(error, "errno", None) == errno.ENOENT
+
+        return False
+
+    @staticmethod
+    def _modify_or_recover_fileno(fileno, mask, owner=None):
+        try:
+            BackboneInterface._modify_fileno(fileno, mask)
+            return True
+        except Exception as e:
+            if not BackboneInterface._fileno_not_registered_error(e):
+                raise e
+
+            try:
+                BackboneInterface._register_fileno(fileno, mask)
+                RNS.log(f"Recovered unregistered local I/O file descriptor {fileno} for {owner}", RNS.LOG_DEBUG)
+                return True
+            except Exception as register_error:
+                RNS.log(f"Unable to recover unregistered local I/O file descriptor {fileno} for {owner}: {register_error}", RNS.LOG_DEBUG)
+                return False
+
+    @staticmethod
     def _unregister_fileno(fileno):
         if BackboneInterface.event_backend == "epoll":
             BackboneInterface.epoll.unregister(fileno)
@@ -438,12 +466,18 @@ class BackboneInterface(Interface):
     def tx_ready(interface):
         if interface.socket:
             fileno = interface.socket.fileno()
+            if fileno < 0:
+                BackboneInterface._remove_spawned_interface_by_object(interface)
+                return
             if fileno in BackboneInterface.spawned_interface_filenos:
                 BackboneInterface._note_epoll_tx_buffer(len(interface.transmit_buffer))
-                try: BackboneInterface._modify_fileno(fileno, BackboneInterface._read_write_mask())
+                try:
+                    recovered = BackboneInterface._modify_or_recover_fileno(fileno, BackboneInterface._read_write_mask(), interface)
+                    if not recovered:
+                        BackboneInterface._close_client_socket(fileno, interface, interface.socket, error=True)
                 except Exception as e:
                     RNS.log(f"Error occurred on {interface} while modifying local I/O state: {e}", RNS.LOG_WARNING)
-                    raise e
+                    BackboneInterface._close_client_socket(fileno, interface, interface.socket, error=True)
 
     @staticmethod
     def _set_client_epoll_interest(fileno, interface):
@@ -452,7 +486,7 @@ class BackboneInterface(Interface):
         else:
             mask = BackboneInterface._read_mask()
 
-        BackboneInterface._modify_fileno(fileno, mask)
+        return BackboneInterface._modify_or_recover_fileno(fileno, mask, interface)
 
     @staticmethod
     def _remove_spawned_interface(fileno, spawned_interface):
@@ -470,6 +504,13 @@ class BackboneInterface(Interface):
                     while spawned_interface in pif.spawned_interfaces: pif.spawned_interfaces.remove(spawned_interface)
         except Exception as e:
             RNS.log(f"Error while removing spawned interface from {pif}: {e}", RNS.LOG_ERROR)
+
+    @staticmethod
+    def _remove_spawned_interface_by_object(spawned_interface):
+        for fileno, mapped_interface in list(BackboneInterface.spawned_interface_filenos.items()):
+            if mapped_interface == spawned_interface:
+                BackboneInterface.deregister_fileno(fileno)
+                BackboneInterface._remove_spawned_interface(fileno, spawned_interface)
 
     @staticmethod
     def _close_client_socket(fileno, spawned_interface, client_socket, error=False):
@@ -566,9 +607,13 @@ class BackboneInterface(Interface):
 
         if not closed:
             try:
-                BackboneInterface._set_client_epoll_interest(fileno, spawned_interface)
+                if not BackboneInterface._set_client_epoll_interest(fileno, spawned_interface):
+                    BackboneInterface._close_client_socket(fileno, spawned_interface, client_socket, error=True)
+                    closed = True
             except Exception as e:
                 RNS.log(f"Error while setting epoll interest on {spawned_interface}: {e}", RNS.LOG_ERROR)
+                BackboneInterface._close_client_socket(fileno, spawned_interface, client_socket, error=True)
+                closed = True
 
         return closed
 
