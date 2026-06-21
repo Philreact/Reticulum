@@ -29,7 +29,7 @@
 # SOFTWARE.
 
 from RNS.Interfaces.Interface import Interface
-from RNS.Interfaces.BackboneInterface import BackboneInterface
+from RNS.Interfaces.EventedSocketIO import EventedSocketIO
 from collections import deque
 import asyncio
 import socketserver
@@ -749,7 +749,7 @@ class LocalClientInterface(Interface):
                 thread = threading.Thread(target=self.read_loop)
                 thread.daemon = True
                 thread.start()
-        elif self.epoll_backend: BackboneInterface.add_client_socket(self.socket, self)
+        elif self.epoll_backend: EventedSocketIO.add_client_socket(self.socket, self)
         elif QORTAL_RNS_DEDICATED_LOCAL_IO: self.start_dedicated_write_loop()
 
         return True
@@ -799,7 +799,7 @@ class LocalClientInterface(Interface):
 
                 elif self.epoll_backend:
                     self.transmit_buffer += bytes([HDLC.FLAG])+bytes([HDLC.FLAG])
-                    BackboneInterface.tx_ready(self)
+                    EventedSocketIO.tx_ready(self)
 
                 elif QORTAL_RNS_DEDICATED_LOCAL_IO:
                     self.enqueue_outgoing(bytes([HDLC.FLAG])+bytes([HDLC.FLAG]))
@@ -851,7 +851,7 @@ class LocalClientInterface(Interface):
 
                 elif self.epoll_backend:
                     self.transmit_buffer += bytes([HDLC.FLAG])+HDLC.escape(data)+bytes([HDLC.FLAG])
-                    BackboneInterface.tx_ready(self)
+                    EventedSocketIO.tx_ready(self)
 
                 elif QORTAL_RNS_DEDICATED_LOCAL_IO:
                     framed_data = bytes([HDLC.FLAG])+HDLC.escape(data)+bytes([HDLC.FLAG])
@@ -1041,7 +1041,7 @@ class LocalServerInterface(Interface):
 
             self.owner = owner
             self.is_local_shared_instance = True
-            BackboneInterface.add_listener(self, self.socket_path, socket_type=socket.AF_UNIX)
+            EventedSocketIO.add_listener(self, self.socket_path, socket_type=socket.AF_UNIX)
 
         elif bindport != None:
             self.receives = True
@@ -1074,7 +1074,7 @@ class LocalServerInterface(Interface):
                     thread = threading.Thread(target=self.server.serve_forever)
                     thread.daemon = True
                     thread.start()
-            elif self.epoll_backend: BackboneInterface.add_listener(self, address)
+            elif self.epoll_backend: EventedSocketIO.add_listener(self, address)
             else:
                 def handlerFactory(callback):
                     def createHandler(*args, **keys):
@@ -1132,7 +1132,7 @@ class LocalServerInterface(Interface):
                     thread.daemon = True
                     thread.start()
             elif spawned_interface.epoll_backend:
-                BackboneInterface.add_client_socket(client_socket, spawned_interface)
+                EventedSocketIO.add_client_socket(client_socket, spawned_interface)
             else:
                 try: client_socket.setblocking(True)
                 except Exception as e: RNS.log(f"Could not set local shared client socket to blocking mode: {e}", RNS.LOG_WARNING)
