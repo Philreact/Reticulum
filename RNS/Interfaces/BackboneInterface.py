@@ -366,6 +366,33 @@ class BackboneInterface(Interface):
         return False
 
     @staticmethod
+    def _fileno_already_registered_error(error):
+        if isinstance(error, KeyError):
+            return "already registered" in str(error)
+
+        if isinstance(error, OSError):
+            return getattr(error, "errno", None) == errno.EEXIST
+
+        return False
+
+    @staticmethod
+    def _register_or_recover_fileno(fileno, mask, owner=None):
+        try:
+            BackboneInterface._register_fileno(fileno, mask)
+            return True
+        except Exception as e:
+            if not BackboneInterface._fileno_already_registered_error(e):
+                raise e
+
+            try:
+                BackboneInterface._modify_fileno(fileno, mask)
+                RNS.log(f"Recovered already registered local I/O file descriptor {fileno} for {owner}", RNS.LOG_DEBUG)
+                return True
+            except Exception as modify_error:
+                RNS.log(f"Unable to recover already registered local I/O file descriptor {fileno} for {owner}: {modify_error}", RNS.LOG_DEBUG)
+                return False
+
+    @staticmethod
     def _modify_or_recover_fileno(fileno, mask, owner=None):
         try:
             BackboneInterface._modify_fileno(fileno, mask)
@@ -375,7 +402,8 @@ class BackboneInterface(Interface):
                 raise e
 
             try:
-                BackboneInterface._register_fileno(fileno, mask)
+                if not BackboneInterface._register_or_recover_fileno(fileno, mask, owner):
+                    return False
                 RNS.log(f"Recovered unregistered local I/O file descriptor {fileno} for {owner}", RNS.LOG_DEBUG)
                 return True
             except Exception as register_error:
@@ -438,7 +466,9 @@ class BackboneInterface(Interface):
             RNS.log(f"Attempt to register invalid file descriptor {fileno}", RNS.LOG_WARNING)
             return
 
-        try: BackboneInterface._register_fileno(fileno, BackboneInterface._read_mask())
+        try:
+            if not BackboneInterface._register_or_recover_fileno(fileno, BackboneInterface._read_mask()):
+                RNS.log(f"Unable to register local I/O read interest for file descriptor {fileno}", RNS.LOG_WARNING)
         except Exception as e:
             RNS.log(f"An error occurred while registering local I/O read interest for file descriptor {fileno}: {e}", RNS.LOG_WARNING)
 
