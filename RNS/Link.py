@@ -992,9 +992,22 @@ class Link:
                             self.__update_phy_stats(packet, query_shared=True)
 
                             if self.callbacks.packet != None:
+                                try:
+                                    qortal_probe = getattr(RNS, "_qortal_link_receive_probe", None)
+                                    if callable(qortal_probe):
+                                        qortal_probe("callback_dispatch", self, packet, time.monotonic(), time.time())
+                                except Exception:
+                                    pass
                                 thread = threading.Thread(target=self.callbacks.packet, args=(plaintext, packet))
                                 thread.daemon = True
                                 thread.start()
+                            else:
+                                try:
+                                    qortal_probe = getattr(RNS, "_qortal_link_receive_probe", None)
+                                    if callable(qortal_probe):
+                                        qortal_probe("callback_missing", self, packet, time.monotonic(), time.time())
+                                except Exception:
+                                    pass
                             
                             if self.destination.proof_strategy == RNS.Destination.PROVE_ALL:
                                 packet.prove()
@@ -1006,6 +1019,13 @@ class Link:
                                             packet.prove()
                                     except Exception as e:
                                         RNS.log("Error while executing proof request callback from "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
+                        else:
+                            try:
+                                qortal_probe = getattr(RNS, "_qortal_link_receive_probe", None)
+                                if callable(qortal_probe):
+                                    qortal_probe("decrypt_failed", self, packet, time.monotonic(), time.time())
+                            except Exception:
+                                pass
 
                     elif packet.context == RNS.Packet.LINKIDENTIFY:
                         plaintext = self.decrypt(packet.data)

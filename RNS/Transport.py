@@ -42,6 +42,31 @@ from collections import deque
 from .vendor import umsgpack as umsgpack
 from RNS.Interfaces.BackboneInterface import BackboneInterface
 
+# Broad per-packet logs are off by default because they can distort timing on busy networks.
+QORTAL_RNS_LINK_RX_TRACE = os.environ.get("QORTAL_RNS_LINK_RX_TRACE", "0") == "1"
+QORTAL_RNS_LINK_ROUTE_TRACE = os.environ.get("QORTAL_RNS_LINK_ROUTE_TRACE", "0") == "1"
+# Focused Reticulum link ingress summaries are on by default while diagnosing local I/O gaps.
+QORTAL_RNS_LINK_INGRESS_TRACE = os.environ.get(
+    "QORTAL_RNS_LINK_INGRESS_TRACE",
+    os.environ.get("QORTAL_RNS_AUDIO_INGRESS_TRACE", "1")
+) == "1"
+QORTAL_RNS_LINK_INGRESS_INTERVAL = float(os.environ.get(
+    "QORTAL_RNS_LINK_INGRESS_INTERVAL",
+    os.environ.get("QORTAL_RNS_AUDIO_INGRESS_INTERVAL", "5.0")
+))
+QORTAL_RNS_LINK_INGRESS_GAP_MS = float(os.environ.get(
+    "QORTAL_RNS_LINK_INGRESS_GAP_MS",
+    os.environ.get("QORTAL_RNS_AUDIO_INGRESS_GAP_MS", "250")
+))
+QORTAL_RNS_LINK_INGRESS_SLOW_MS = float(os.environ.get(
+    "QORTAL_RNS_LINK_INGRESS_SLOW_MS",
+    os.environ.get("QORTAL_RNS_AUDIO_INGRESS_SLOW_MS", "50")
+))
+QORTAL_RNS_LINK_INGRESS_HOT_DISPATCHES = int(os.environ.get(
+    "QORTAL_RNS_LINK_INGRESS_HOT_DISPATCHES",
+    os.environ.get("QORTAL_RNS_AUDIO_INGRESS_HOT_DISPATCHES", "20")
+))
+
 class Transport:
     """
     Through static methods of this class you can interact with the
@@ -178,6 +203,13 @@ class Transport:
     links_check_interval        = 1.0
     receipts_last_checked       = 0.0
     receipts_check_interval     = 1.0
+
+    qortal_link_route_log_last  = {}
+    qortal_link_route_log_interval = 2.0
+    qortal_link_rx_log_last     = {}
+    qortal_link_rx_log_interval = 2.0
+    qortal_link_ingress_stats  = {}
+    qortal_link_ingress_lock   = Lock()
     announces_last_checked      = 0.0
     announces_check_interval    = 1.0
     pending_prs_last_checked    = 0.0
@@ -1386,6 +1418,207 @@ class Transport:
         return False
 
     @staticmethod
+    def qortal_log_link_route_issue(issue, packet, link=None):
+        if not QORTAL_RNS_LINK_ROUTE_TRACE:
+            return
+
+        now = time.time()
+        destination_hash = getattr(packet, "destination_hash", None)
+        packet_hash = getattr(packet, "packet_hash", None)
+        destination_key = destination_hash.hex() if isinstance(destination_hash, (bytes, bytearray)) else str(destination_hash)
+        receiving_interface = getattr(packet, "receiving_interface", None)
+        attached_interface = getattr(link, "attached_interface", None) if link != None else None
+        key = (issue, destination_key, str(receiving_interface), str(attached_interface))
+        last_logged_at = Transport.qortal_link_route_log_last.get(key, 0)
+        if now - last_logged_at < Transport.qortal_link_route_log_interval:
+            return
+
+        Transport.qortal_link_route_log_last[key] = now
+        while len(Transport.qortal_link_route_log_last) > 512:
+            try:
+                Transport.qortal_link_route_log_last.pop(next(iter(Transport.qortal_link_route_log_last)))
+            except Exception:
+                break
+
+        link_id = getattr(link, "link_id", None) if link != None else None
+        link_status = getattr(link, "status", "n/a") if link != None else "n/a"
+        RNS.log(
+            "[qortal-link-route] "
+            f"issue={issue} "
+            f"destination={RNS.hexrep(destination_hash, delimit=False) if isinstance(destination_hash, (bytes, bytearray)) else 'n/a'} "
+            f"packet={RNS.hexrep(packet_hash, delimit=False) if isinstance(packet_hash, (bytes, bytearray)) else 'n/a'} "
+            f"context={getattr(packet, 'context', 'n/a')} "
+            f"hops={getattr(packet, 'hops', 'n/a')} "
+            f"receiving_interface={receiving_interface} "
+            f"link={RNS.hexrep(link_id, delimit=False) if isinstance(link_id, (bytes, bytearray)) else 'n/a'} "
+            f"link_status={link_status} "
+            f"attached_interface={attached_interface} "
+            f"active_links={len(Transport.active_links)}",
+            RNS.LOG_NOTICE
+        )
+
+    @staticmethod
+    def qortal_log_link_rx(stage, packet=None, interface=None, raw_len=None, reason=None):
+        if not QORTAL_RNS_LINK_RX_TRACE:
+            return
+
+        now = time.time()
+        destination_hash = getattr(packet, "destination_hash", None) if packet != None else None
+        packet_hash = getattr(packet, "packet_hash", None) if packet != None else None
+        destination_key = destination_hash.hex() if isinstance(destination_hash, (bytes, bytearray)) else "n/a"
+        packet_key = packet_hash.hex() if isinstance(packet_hash, (bytes, bytearray)) else "n/a"
+        receiving_interface = getattr(packet, "receiving_interface", None) if packet != None else interface
+        key = (stage, destination_key, str(receiving_interface), str(reason or ""))
+        last_logged_at = Transport.qortal_link_rx_log_last.get(key, 0)
+        if now - last_logged_at < Transport.qortal_link_rx_log_interval:
+            return
+
+        Transport.qortal_link_rx_log_last[key] = now
+        while len(Transport.qortal_link_rx_log_last) > 512:
+            try:
+                Transport.qortal_link_rx_log_last.pop(next(iter(Transport.qortal_link_rx_log_last)))
+            except Exception:
+                break
+
+        RNS.log(
+            "[qortal-link-rx] "
+            f"stage={stage} "
+            f"destination={destination_key} "
+            f"packet={packet_key} "
+            f"context={getattr(packet, 'context', 'n/a') if packet != None else 'n/a'} "
+            f"type={getattr(packet, 'packet_type', 'n/a') if packet != None else 'n/a'} "
+            f"hops={getattr(packet, 'hops', 'n/a') if packet != None else 'n/a'} "
+            f"interface={receiving_interface} "
+            f"raw_len={raw_len if raw_len != None else 'n/a'} "
+            f"reason={reason or 'n/a'} "
+            f"hash_seen={str(packet_hash in Transport.packet_hashlist if isinstance(packet_hash, (bytes, bytearray)) else False).lower()} "
+            f"hash_seen_prev={str(packet_hash in Transport.packet_hashlist_prev if isinstance(packet_hash, (bytes, bytearray)) else False).lower()} "
+            f"active_links={len(Transport.active_links)}",
+            RNS.LOG_NOTICE
+        )
+
+    @staticmethod
+    def qortal_note_link_ingress(stage, packet=None, interface=None, raw_len=None, started_at=None, link=None, reason=None):
+        if not QORTAL_RNS_LINK_INGRESS_TRACE or packet == None:
+            return
+        if packet.packet_type != RNS.Packet.DATA or packet.destination_type != RNS.Destination.LINK:
+            return
+
+        now_mono = time.monotonic()
+        now = time.time()
+        destination_hash = getattr(packet, "destination_hash", None)
+        packet_hash = getattr(packet, "packet_hash", None)
+        if not isinstance(destination_hash, (bytes, bytearray)):
+            return
+
+        destination_key = bytes(destination_hash).hex()
+        packet_key = bytes(packet_hash).hex()[:16] if isinstance(packet_hash, (bytes, bytearray)) else "n/a"
+        process_ms = (now_mono - started_at) * 1000.0 if started_at != None else 0.0
+        with Transport.qortal_link_ingress_lock:
+            stats = Transport.qortal_link_ingress_stats.get(destination_key)
+            if stats == None:
+                stats = {
+                    "created_at": now,
+                    "last_log_at": now,
+                    "last_unpacked_at": 0.0,
+                    "last_dispatch_at": 0.0,
+                    "interval_unpacked": 0,
+                    "interval_filtered": 0,
+                    "interval_dispatch": 0,
+                    "interval_no_active": 0,
+                    "interval_wrong_interface": 0,
+                    "max_unpack_gap_ms": 0.0,
+                    "max_dispatch_gap_ms": 0.0,
+                    "max_process_ms": 0.0,
+                    "last_stage": "none",
+                    "last_packet": "n/a",
+                    "last_reason": "n/a",
+                    "last_interface": "n/a",
+                    "last_link_status": "n/a",
+                }
+                Transport.qortal_link_ingress_stats[destination_key] = stats
+
+            if stage == "unpacked":
+                stats["interval_unpacked"] += 1
+                previous = stats["last_unpacked_at"]
+                if previous:
+                    stats["max_unpack_gap_ms"] = max(stats["max_unpack_gap_ms"], (now_mono - previous) * 1000.0)
+                stats["last_unpacked_at"] = now_mono
+            elif stage == "filtered":
+                stats["interval_filtered"] += 1
+            elif stage == "dispatch":
+                stats["interval_dispatch"] += 1
+                previous = stats["last_dispatch_at"]
+                if previous:
+                    stats["max_dispatch_gap_ms"] = max(stats["max_dispatch_gap_ms"], (now_mono - previous) * 1000.0)
+                stats["last_dispatch_at"] = now_mono
+            elif stage == "no_active_link":
+                stats["interval_no_active"] += 1
+            elif stage == "wrong_interface":
+                stats["interval_wrong_interface"] += 1
+
+            stats["max_process_ms"] = max(stats["max_process_ms"], process_ms)
+            stats["last_stage"] = stage
+            stats["last_packet"] = packet_key
+            stats["last_reason"] = reason or "n/a"
+            stats["last_interface"] = str(getattr(packet, "receiving_interface", interface))
+            stats["last_link_status"] = str(getattr(link, "status", "n/a")) if link != None else "n/a"
+
+            interval_age = now - stats["last_log_at"]
+            hot = stats["interval_dispatch"] >= QORTAL_RNS_LINK_INGRESS_HOT_DISPATCHES
+            gappy = stats["max_unpack_gap_ms"] >= QORTAL_RNS_LINK_INGRESS_GAP_MS or stats["max_dispatch_gap_ms"] >= QORTAL_RNS_LINK_INGRESS_GAP_MS
+            slow = stats["max_process_ms"] >= QORTAL_RNS_LINK_INGRESS_SLOW_MS
+            issue = stats["interval_filtered"] or stats["interval_no_active"] or stats["interval_wrong_interface"]
+            if interval_age < QORTAL_RNS_LINK_INGRESS_INTERVAL or not (hot or gappy or slow or issue):
+                return
+
+            RNS.log(
+                "[qortal-link-ingress] "
+                f"destination={destination_key} "
+                f"interval_ms={interval_age * 1000.0:.0f} "
+                f"unpacked={stats['interval_unpacked']} "
+                f"filtered={stats['interval_filtered']} "
+                f"dispatch={stats['interval_dispatch']} "
+                f"no_active={stats['interval_no_active']} "
+                f"wrong_interface={stats['interval_wrong_interface']} "
+                f"max_unpack_gap_ms={stats['max_unpack_gap_ms']:.1f} "
+                f"max_dispatch_gap_ms={stats['max_dispatch_gap_ms']:.1f} "
+                f"max_process_ms={stats['max_process_ms']:.1f} "
+                f"raw_len={raw_len if raw_len != None else 'n/a'} "
+                f"hops={getattr(packet, 'hops', 'n/a')} "
+                f"interface={stats['last_interface']} "
+                f"link_status={stats['last_link_status']} "
+                f"last_stage={stats['last_stage']} "
+                f"last_reason={stats['last_reason']} "
+                f"last_packet={stats['last_packet']} "
+                f"active_links={len(Transport.active_links)} "
+                f"path_table={len(Transport.path_table)} "
+                f"packet_hashlist={len(Transport.packet_hashlist)}",
+                RNS.LOG_NOTICE
+            )
+
+            stats["last_log_at"] = now
+            stats["interval_unpacked"] = 0
+            stats["interval_filtered"] = 0
+            stats["interval_dispatch"] = 0
+            stats["interval_no_active"] = 0
+            stats["interval_wrong_interface"] = 0
+            stats["max_unpack_gap_ms"] = 0.0
+            stats["max_dispatch_gap_ms"] = 0.0
+            stats["max_process_ms"] = 0.0
+
+            while len(Transport.qortal_link_ingress_stats) > 256:
+                try:
+                    oldest_key = min(Transport.qortal_link_ingress_stats, key=lambda key: Transport.qortal_link_ingress_stats[key].get("last_log_at", 0))
+                    Transport.qortal_link_ingress_stats.pop(oldest_key, None)
+                except Exception:
+                    break
+
+    @staticmethod
+    def qortal_note_audio_ingress(stage, packet=None, interface=None, raw_len=None, started_at=None, link=None, reason=None):
+        Transport.qortal_note_link_ingress(stage, packet=packet, interface=interface, raw_len=raw_len, started_at=started_at, link=link, reason=reason)
+
+    @staticmethod
     def inbound(raw, interface=None):
         if not Transport.ready:
             wait_start = time.time()
@@ -1394,6 +1627,8 @@ class Transport:
                 if time.time() > wait_start + Transport.READY_WAIT:
                     RNS.log("Inbound packet timed out waiting for transport startup, dropping", RNS.LOG_WARNING)
                     return
+
+        qortal_inbound_started_at = time.monotonic()
 
         # If interface access codes are enabled,
         # we must authenticate each packet.
@@ -1432,26 +1667,40 @@ class Transport:
 
                         # Check it
                         if ifac == expected_ifac: raw = new_raw
-                        else:                     return
+                        else:
+                            Transport.qortal_log_link_rx("ifac_drop", interface=interface, raw_len=len(raw), reason="invalid_ifac")
+                            return
 
-                    else: return
+                    else:
+                        Transport.qortal_log_link_rx("ifac_drop", interface=interface, raw_len=len(raw), reason="short_ifac")
+                        return
 
                 # If the IFAC flag is not set, but should be,
                 # drop the packet.
-                else: return
+                else:
+                    Transport.qortal_log_link_rx("ifac_drop", interface=interface, raw_len=len(raw), reason="missing_ifac_flag")
+                    return
 
             else:
                 # If the interface does not have IFAC enabled,
                 # check the received packet IFAC flag.
                 # If the flag is set, drop the packet
-                if raw[0] & 0x80 == 0x80: return
+                if raw[0] & 0x80 == 0x80:
+                    Transport.qortal_log_link_rx("ifac_drop", interface=interface, raw_len=len(raw), reason="unexpected_ifac_flag")
+                    return
 
-        else: return
+        else:
+            Transport.qortal_log_link_rx("raw_drop", interface=interface, raw_len=len(raw), reason="too_short")
+            return
 
-        if Transport.identity == None: return
+        if Transport.identity == None:
+            Transport.qortal_log_link_rx("raw_drop", interface=interface, raw_len=len(raw), reason="no_identity")
+            return
             
         packet = RNS.Packet(None, raw)
-        if not packet.unpack(): return
+        if not packet.unpack():
+            Transport.qortal_log_link_rx("unpack_drop", interface=interface, raw_len=len(raw), reason="unpack_failed")
+            return
             
         packet.receiving_interface = interface
         packet.hops += 1
@@ -1483,7 +1732,16 @@ class Transport:
 
         elif Transport.interface_to_shared_instance(interface): packet.hops -= 1
 
-        if Transport.packet_filter(packet):
+        if packet.destination_type == RNS.Destination.LINK:
+            Transport.qortal_log_link_rx("link_unpacked", packet=packet, raw_len=len(raw))
+            Transport.qortal_note_link_ingress("unpacked", packet=packet, raw_len=len(raw), started_at=qortal_inbound_started_at)
+
+        packet_filter_result = Transport.packet_filter(packet)
+        if packet.destination_type == RNS.Destination.LINK and not packet_filter_result:
+            Transport.qortal_log_link_rx("packet_filter_drop", packet=packet, raw_len=len(raw), reason="duplicate_or_transport_filter")
+            Transport.qortal_note_link_ingress("filtered", packet=packet, raw_len=len(raw), started_at=qortal_inbound_started_at, reason="duplicate_or_transport_filter")
+
+        if packet_filter_result:
             # By default, remember packet hashes to avoid routing
             # loops in the network, using the packet filter.
             remember_packet_hash = True
@@ -2123,9 +2381,11 @@ class Transport:
             # Handling for local data packets
             elif packet.packet_type == RNS.Packet.DATA:
                 if packet.destination_type == RNS.Destination.LINK:
+                    matched_link = False
                     with Transport.active_links_lock:
                         for link in Transport.active_links:
                             if link.link_id == packet.destination_hash:
+                                matched_link = True
                                 if link.attached_interface == packet.receiving_interface:
                                     packet.link = link
                                     if packet.context == RNS.Packet.CACHE_REQUEST:
@@ -2135,10 +2395,15 @@ class Transport:
                                             RNS.Packet(destination=link, data=cached_packet.data,
                                                        packet_type=cached_packet.packet_type, context=cached_packet.context).send()
                                     
-                                    else: link.receive(packet)
+                                    else:
+                                        Transport.qortal_log_link_rx("dispatch_to_link", packet=packet, raw_len=len(raw))
+                                        Transport.qortal_note_link_ingress("dispatch", packet=packet, raw_len=len(raw), started_at=qortal_inbound_started_at, link=link)
+                                        link.receive(packet)
                                     break
                                 
                                 else:
+                                    Transport.qortal_log_link_route_issue("wrong_attached_interface", packet, link=link)
+                                    Transport.qortal_note_link_ingress("wrong_interface", packet=packet, raw_len=len(raw), started_at=qortal_inbound_started_at, link=link, reason="wrong_attached_interface")
                                     # In the strange and rare case that an interface
                                     # is partly malfunctioning, and a link-associated
                                     # packet is being received on an interface that
@@ -2148,6 +2413,9 @@ class Transport:
                                     # packet when it finally arrives over another path.
                                     while packet.packet_hash in Transport.packet_hashlist:
                                         Transport.packet_hashlist.remove(packet.packet_hash)
+                        if not matched_link:
+                            Transport.qortal_log_link_route_issue("no_active_link", packet)
+                            Transport.qortal_note_link_ingress("no_active_link", packet=packet, raw_len=len(raw), started_at=qortal_inbound_started_at, reason="no_active_link")
                 else:
                     destination = None
                     with Transport.destinations_map_lock:
