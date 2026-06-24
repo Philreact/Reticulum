@@ -68,6 +68,7 @@ QORTAL_RNS_LOCAL_TX_DRAIN_MAX_BYTES = 1024*1024
 QORTAL_RNS_LOCAL_TX_DRAIN_MAX_SECONDS = 0.006
 QORTAL_RNS_LOCAL_RX_READ_MAX_BYTES = 1024*1024
 QORTAL_RNS_LOCAL_RX_READ_MAX_SECONDS = 0.004
+_LOCAL_RX_CONTINUE = object()
 
 def qortal_local_trace_enabled(interface=None):
     if not QORTAL_RNS_LOCAL_TRACE:
@@ -176,7 +177,8 @@ class LocalSelectorManager:
             if not LocalSelectorManager.logged_backend:
                 LocalSelectorManager.logged_backend = True
                 if supported:
-                    RNS.log(f"LocalInterface selector backend={backend_name} default_on=True", RNS.LOG_NOTICE)
+                    if QORTAL_RNS_LOCAL_TRACE:
+                        RNS.log(f"LocalInterface selector backend={backend_name} default_on=True", RNS.LOG_NOTICE)
                 else:
                     RNS.log(f"LocalInterface selector backend={backend_name} default_on=False reason=not_kqueue", RNS.LOG_WARNING)
             return supported
@@ -506,7 +508,7 @@ class LocalClientInterface(Interface):
         self.detached         = False
         self.name             = name
         self.mode             = RNS.Interfaces.Interface.Interface.MODE_FULL
-        self.frame_buffer     = b""
+        self.frame_buffer     = bytearray()
         self.transmit_buffer  = b""
         self.transmit_buffer_lock = Lock()
         self.transmit_buffer_chunks = deque()
@@ -526,6 +528,7 @@ class LocalClientInterface(Interface):
         self.epoll_receive_queue_last_warned_at = 0.0
         self.epoll_receive_paused = False
         self.epoll_receive_hard_warned_at = 0.0
+        self.epoll_receive_continue_queued = False
 
         if RNS.vendor.platformutils.use_epoll():
             self.epoll_backend = True
@@ -846,22 +849,29 @@ class LocalClientInterface(Interface):
                 RNS.trace_exception(e)
                 self.teardown()
 
+    def _frame_buffer_has_complete_frame(self):
+        frame_start = self.frame_buffer.find(HDLC.FLAG)
+        if frame_start == -1:
+            return False
+        return self.frame_buffer.find(HDLC.FLAG, frame_start+1) != -1
+
     def handle_hdlc(self, data_in, max_frames=None, max_seconds=None):
         started_at = time.monotonic()
         processed_frames = 0
-        self.frame_buffer += data_in
+        if len(data_in) > 0:
+            self.frame_buffer.extend(data_in)
         flags_remaining = True
         while flags_remaining:
             if max_frames != None and processed_frames >= max_frames:
-                return processed_frames, True
+                return processed_frames, self._frame_buffer_has_complete_frame()
             if max_seconds != None and processed_frames > 0 and time.monotonic() - started_at >= max_seconds:
-                return processed_frames, True
+                return processed_frames, self._frame_buffer_has_complete_frame()
 
             frame_start = self.frame_buffer.find(HDLC.FLAG)
             if frame_start != -1:
                 frame_end = self.frame_buffer.find(HDLC.FLAG, frame_start+1)
                 if frame_end != -1:
-                    frame = self.frame_buffer[frame_start+1:frame_end]
+                    frame = bytes(self.frame_buffer[frame_start+1:frame_end])
                     frame = frame.replace(bytes([HDLC.ESC, HDLC.FLAG ^ HDLC.ESC_MASK]), bytes([HDLC.FLAG]))
                     frame = frame.replace(bytes([HDLC.ESC, HDLC.ESC  ^ HDLC.ESC_MASK]), bytes([HDLC.ESC]))
                     if len(frame) > RNS.Reticulum.HEADER_MINSIZE:
@@ -890,7 +900,7 @@ class LocalClientInterface(Interface):
                                     )
                         self.process_incoming(frame)
                         processed_frames += 1
-                    self.frame_buffer = self.frame_buffer[frame_end:]
+                    del self.frame_buffer[:frame_end]
 
                 else: flags_remaining = False
 
@@ -969,7 +979,8 @@ class LocalClientInterface(Interface):
     def _enqueue_epoll_receive_locked(self, data_in, now):
         self._ensure_epoll_receive_worker_locked()
         self.epoll_receive_queue.append((now, data_in))
-        self.epoll_receive_queue_bytes += len(data_in)
+        if data_in is not _LOCAL_RX_CONTINUE:
+            self.epoll_receive_queue_bytes += len(data_in)
         if self.epoll_receive_queue_bytes >= QORTAL_RNS_LOCAL_RX_QUEUE_HARD_BYTES:
             if now - self.epoll_receive_hard_warned_at >= QORTAL_RNS_LOCAL_RX_QUEUE_WARN_INTERVAL:
                 self.epoll_receive_hard_warned_at = now
@@ -997,7 +1008,8 @@ class LocalClientInterface(Interface):
 
     def _process_epoll_receive_chunk(self, data_in, queued_at=None):
         started_at = time.monotonic()
-        if queued_at != None and qortal_local_trace_enabled(self):
+        is_continue = data_in is _LOCAL_RX_CONTINUE
+        if queued_at != None and qortal_local_trace_enabled(self) and not is_continue:
             queue_age_ms = (started_at - queued_at) * 1000.0
             if QORTAL_RNS_LOCAL_TRACE_FRAMES or queue_age_ms >= QORTAL_RNS_LOCAL_RX_QUEUE_WARN_AGE_MS:
                 qortal_local_trace_log(
@@ -1018,33 +1030,34 @@ class LocalClientInterface(Interface):
                     qortal_local_trace_log(
                         "local-rx-process-delay",
                         f"role={qortal_local_trace_role(self)} interface={self} "
-                        f"duration_ms={duration_ms:.3f} len={len(data_in)}"
+                        f"duration_ms={duration_ms:.3f} len={0 if is_continue else len(data_in)}"
                     )
             self._finish_epoll_receive_processing()
 
     def _receive_inline_batched(self, data_in):
-        if len(data_in) == 0:
+        is_continue = data_in is _LOCAL_RX_CONTINUE
+        if not is_continue and len(data_in) == 0:
             self._receive_inline(data_in)
             return
 
         try:
-            more_frames = True
-            next_data = data_in
-            while more_frames:
-                processed_frames, more_frames = self.handle_hdlc(
-                    next_data,
-                    max_frames=QORTAL_RNS_LOCAL_RX_BATCH_FRAMES,
-                    max_seconds=QORTAL_RNS_LOCAL_RX_BATCH_SECONDS,
-                )
-                next_data = b""
-                if more_frames:
-                    if qortal_local_trace_enabled(self):
-                        qortal_local_trace_log(
-                            "local-rx-batch-yield",
-                            f"role={qortal_local_trace_role(self)} interface={self} "
-                            f"frames={processed_frames} frame_buffer={len(self.frame_buffer)}"
-                        )
-                    time.sleep(0)
+            processed_frames, more_frames = self.handle_hdlc(
+                b"" if is_continue else data_in,
+                max_frames=QORTAL_RNS_LOCAL_RX_BATCH_FRAMES,
+                max_seconds=QORTAL_RNS_LOCAL_RX_BATCH_SECONDS,
+            )
+            if more_frames:
+                if qortal_local_trace_enabled(self):
+                    qortal_local_trace_log(
+                        "local-rx-batch-yield",
+                        f"role={qortal_local_trace_role(self)} interface={self} "
+                        f"frames={processed_frames} frame_buffer={len(self.frame_buffer)}"
+                    )
+                with self.epoll_receive_queue_condition:
+                    if not self.epoll_receive_continue_queued:
+                        self.epoll_receive_continue_queued = True
+                        self.epoll_receive_queue.append((time.monotonic(), _LOCAL_RX_CONTINUE))
+                        self.epoll_receive_queue_condition.notify()
 
         except Exception as e:
             self.online = False
@@ -1060,7 +1073,10 @@ class LocalClientInterface(Interface):
 
                 self.epoll_receive_processing = True
                 queued_at, data_in = self.epoll_receive_queue.popleft()
-                self.epoll_receive_queue_bytes -= len(data_in)
+                if data_in is _LOCAL_RX_CONTINUE:
+                    self.epoll_receive_continue_queued = False
+                if data_in is not _LOCAL_RX_CONTINUE:
+                    self.epoll_receive_queue_bytes -= len(data_in)
 
             self._process_epoll_receive_chunk(data_in, queued_at)
 
@@ -1104,7 +1120,7 @@ class LocalClientInterface(Interface):
 
     def read_loop(self):
         try:
-            self.frame_buffer = b""
+            self.frame_buffer = bytearray()
             data_in = b""
             while True:
                 data_in = self.socket.recv(4096)

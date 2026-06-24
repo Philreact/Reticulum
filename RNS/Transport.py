@@ -45,10 +45,15 @@ from RNS.Interfaces.BackboneInterface import BackboneInterface
 # Broad per-packet logs are off by default because they can distort timing on busy networks.
 QORTAL_RNS_LINK_RX_TRACE = os.environ.get("QORTAL_RNS_LINK_RX_TRACE", "0") == "1"
 QORTAL_RNS_LINK_ROUTE_TRACE = os.environ.get("QORTAL_RNS_LINK_ROUTE_TRACE", "0") == "1"
-# Focused Reticulum link ingress summaries are on by default while diagnosing local I/O gaps.
+# Focused Reticulum link diagnostics are off by default because even bounded
+# summaries can distort timing on busy networks.
 QORTAL_RNS_LINK_INGRESS_TRACE = os.environ.get(
     "QORTAL_RNS_LINK_INGRESS_TRACE",
-    os.environ.get("QORTAL_RNS_AUDIO_INGRESS_TRACE", "1")
+    os.environ.get("QORTAL_RNS_AUDIO_INGRESS_TRACE", "0")
+) == "1"
+QORTAL_RNS_LINK_MIGRATION_TRACE = os.environ.get(
+    "QORTAL_RNS_LINK_MIGRATION_TRACE",
+    os.environ.get("QORTAL_RNS_LINK_ROUTE_TRACE", "0")
 ) == "1"
 QORTAL_RNS_LINK_INGRESS_INTERVAL = float(os.environ.get(
     "QORTAL_RNS_LINK_INGRESS_INTERVAL",
@@ -1635,6 +1640,9 @@ class Transport:
 
     @staticmethod
     def qortal_log_link_route_migration(event, link_id=None, packet_hash=None, old_interface=None, new_interface=None, old_hops=None, new_hops=None, reason=None, result=None):
+        if not QORTAL_RNS_LINK_MIGRATION_TRACE:
+            return
+
         now = time.time()
         link_key = link_id.hex() if isinstance(link_id, (bytes, bytearray)) else "n/a"
         packet_key = packet_hash.hex()[:16] if isinstance(packet_hash, (bytes, bytearray)) else "n/a"
