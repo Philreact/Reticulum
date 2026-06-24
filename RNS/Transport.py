@@ -66,6 +66,12 @@ QORTAL_RNS_LINK_INGRESS_HOT_DISPATCHES = int(os.environ.get(
     "QORTAL_RNS_LINK_INGRESS_HOT_DISPATCHES",
     os.environ.get("QORTAL_RNS_AUDIO_INGRESS_HOT_DISPATCHES", "20")
 ))
+RNS_LINK_ROUTE_MIGRATION = os.environ.get("RNS_LINK_ROUTE_MIGRATION", "1") != "0"
+RNS_LINK_ROUTE_MIGRATION_DEBOUNCE_SECONDS = float(os.environ.get("RNS_LINK_ROUTE_MIGRATION_DEBOUNCE_SECONDS", "2.0"))
+RNS_LINK_ROUTE_MIGRATION_CANDIDATE_DEBOUNCE_SECONDS = float(os.environ.get("RNS_LINK_ROUTE_MIGRATION_CANDIDATE_DEBOUNCE_SECONDS", "0.25"))
+RNS_LINK_ROUTE_MIGRATION_GRACE_SECONDS = float(os.environ.get("RNS_LINK_ROUTE_MIGRATION_GRACE_SECONDS", "5.0"))
+RNS_LINK_ROUTE_MIGRATION_MAX_CANDIDATES = int(os.environ.get("RNS_LINK_ROUTE_MIGRATION_MAX_CANDIDATES", "512"))
+RNS_LOCAL_LINK_OWNERSHIP_SYNC = os.environ.get("RNS_LOCAL_LINK_OWNERSHIP_SYNC", "1") != "0"
 
 class Transport:
     """
@@ -210,6 +216,14 @@ class Transport:
     qortal_link_rx_log_interval = 2.0
     qortal_link_ingress_stats  = {}
     qortal_link_ingress_lock   = Lock()
+    local_control_magic        = b"\x00RNS_LOCAL_CONTROL_V1\x00"
+    link_route_candidates      = {}
+    link_route_candidate_lock  = Lock()
+    link_route_grace_table     = {}
+    link_route_last_migrated_at = {}
+    link_route_migration_log_last = {}
+    link_route_migration_log_interval = 1.0
+    local_link_owners          = {}
     announces_last_checked      = 0.0
     announces_check_interval    = 1.0
     pending_prs_last_checked    = 0.0
@@ -907,6 +921,7 @@ class Transport:
                     with Transport.link_table_lock:
                         for link_id in stale_links:
                             Transport.link_table.pop(link_id)
+                            Transport.local_link_owners.pop(bytes(link_id), None)
                             i += 1
 
                     if i > 0:
@@ -1619,6 +1634,443 @@ class Transport:
         Transport.qortal_note_link_ingress(stage, packet=packet, interface=interface, raw_len=raw_len, started_at=started_at, link=link, reason=reason)
 
     @staticmethod
+    def qortal_log_link_route_migration(event, link_id=None, packet_hash=None, old_interface=None, new_interface=None, old_hops=None, new_hops=None, reason=None, result=None):
+        now = time.time()
+        link_key = link_id.hex() if isinstance(link_id, (bytes, bytearray)) else "n/a"
+        packet_key = packet_hash.hex()[:16] if isinstance(packet_hash, (bytes, bytearray)) else "n/a"
+        key = (event, link_key, str(new_interface), str(reason or ""))
+        last_logged_at = Transport.link_route_migration_log_last.get(key, 0)
+        if now - last_logged_at < Transport.link_route_migration_log_interval:
+            return
+
+        Transport.link_route_migration_log_last[key] = now
+        while len(Transport.link_route_migration_log_last) > 512:
+            try:
+                Transport.link_route_migration_log_last.pop(next(iter(Transport.link_route_migration_log_last)))
+            except Exception:
+                break
+
+        RNS.log(
+            "[link-route-migration] "
+            f"event={event} "
+            f"link_id={link_key} "
+            f"packet={packet_key} "
+            f"old_interface={old_interface} "
+            f"new_interface={new_interface} "
+            f"old_hops={old_hops if old_hops != None else 'n/a'} "
+            f"new_hops={new_hops if new_hops != None else 'n/a'} "
+            f"result={result or 'n/a'} "
+            f"reason={reason or 'n/a'}",
+            RNS.LOG_NOTICE
+        )
+
+    @staticmethod
+    def _link_route_candidate_key(link_id, packet_hash):
+        if not isinstance(link_id, (bytes, bytearray)) or not isinstance(packet_hash, (bytes, bytearray)):
+            return None
+        return (bytes(link_id), bytes(packet_hash))
+
+    @staticmethod
+    def _local_control_frame(payload):
+        return Transport.local_control_magic + umsgpack.packb(payload)
+
+    @staticmethod
+    def handle_local_control_frame(data, interface):
+        if not isinstance(data, (bytes, bytearray)) or not data.startswith(Transport.local_control_magic):
+            return False
+
+        try:
+            payload = umsgpack.unpackb(data[len(Transport.local_control_magic):])
+            action = payload.get("action")
+
+            if action == "local_link_validated":
+                if not RNS_LOCAL_LINK_OWNERSHIP_SYNC:
+                    return True
+
+                Transport._confirm_local_link_ownership(payload, interface)
+                return True
+
+            if action == "link_route_candidate":
+                if not RNS_LINK_ROUTE_MIGRATION:
+                    return True
+
+                link_id = payload.get("link_id")
+                packet_hash = payload.get("packet_hash")
+                key = Transport._link_route_candidate_key(link_id, packet_hash)
+                if key == None:
+                    return True
+
+                now = time.time()
+                with Transport.link_route_candidate_lock:
+                    Transport.link_route_candidates[key] = {
+                        "kind": "local_marker",
+                        "link_id": bytes(link_id),
+                        "packet_hash": bytes(packet_hash),
+                        "created_at": payload.get("created_at", now),
+                        "received_at": now,
+                        "interface": interface,
+                    }
+                    Transport._trim_link_route_candidates_locked()
+
+                Transport.qortal_log_link_route_migration("link_route_candidate", link_id=link_id, packet_hash=packet_hash, new_interface=interface, reason="local_marker")
+                return True
+
+            return True
+
+        except Exception as e:
+            RNS.log(f"Could not process local Reticulum control frame on {interface}: {e}", RNS.LOG_ERROR)
+            RNS.trace_exception(e)
+            return True
+
+    @staticmethod
+    def _confirm_local_link_ownership(payload, interface):
+        link_id = payload.get("link_id")
+        if not isinstance(link_id, (bytes, bytearray)):
+            Transport.qortal_log_link_route_migration("local_link_validated_missing_route", reason="invalid_link_id")
+            return False
+
+        link_id = bytes(link_id)
+        now = time.time()
+
+        if not Transport.is_local_client_interface(interface):
+            Transport.qortal_log_link_route_migration(
+                "local_link_validated_missing_route",
+                link_id=link_id,
+                new_interface=interface,
+                reason="non_local_interface",
+            )
+            return False
+
+        with Transport.link_table_lock:
+            link_entry = Transport.link_table.get(link_id)
+            if link_entry == None:
+                Transport.qortal_log_link_route_migration(
+                    "local_link_validated_missing_route",
+                    link_id=link_id,
+                    new_interface=interface,
+                    reason="missing_link_table",
+                )
+                return False
+
+            if link_entry[IDX_LT_RCVD_IF] != interface and link_entry[IDX_LT_NH_IF] != interface:
+                Transport.qortal_log_link_route_migration(
+                    "local_link_validated_missing_route",
+                    link_id=link_id,
+                    old_interface=link_entry[IDX_LT_RCVD_IF],
+                    new_interface=interface,
+                    reason="interface_mismatch",
+                )
+                return False
+
+            link_entry[IDX_LT_VALIDATED] = True
+            link_entry[IDX_LT_TIMESTAMP] = now
+            Transport.local_link_owners[link_id] = interface
+
+        Transport.qortal_log_link_route_migration(
+            "local_link_validated_confirmed",
+            link_id=link_id,
+            new_interface=interface,
+            reason="local_client_validated",
+        )
+        return True
+
+    @staticmethod
+    def notify_local_link_validated(link):
+        if not RNS_LOCAL_LINK_OWNERSHIP_SYNC or link == None:
+            return False
+
+        try:
+            reticulum = RNS.Reticulum.get_instance()
+            if reticulum == None or not reticulum.is_connected_to_shared_instance:
+                return False
+
+            control_frame = Transport._local_control_frame({
+                "action": "local_link_validated",
+                "link_id": bytes(link.link_id),
+                "created_at": time.time(),
+            })
+
+            sent = False
+            for interface in Transport.interfaces:
+                if Transport.interface_to_shared_instance(interface):
+                    Transport.transmit(interface, control_frame)
+                    sent = True
+
+            if sent:
+                Transport.qortal_log_link_route_migration(
+                    "local_link_validated_sent",
+                    link_id=link.link_id,
+                    new_interface=getattr(link, "attached_interface", None),
+                    reason="local_client_validated",
+                )
+            else:
+                Transport.qortal_log_link_route_migration(
+                    "local_link_validated_missing_route",
+                    link_id=link.link_id,
+                    new_interface=getattr(link, "attached_interface", None),
+                    reason="no_shared_interface",
+                )
+
+            return sent
+
+        except Exception as e:
+            Transport.qortal_log_link_route_migration(
+                "local_link_validated_missing_route",
+                link_id=getattr(link, "link_id", None),
+                new_interface=getattr(link, "attached_interface", None),
+                reason=f"notify_error:{e}",
+            )
+            return False
+
+    @staticmethod
+    def _trim_link_route_candidates_locked():
+        while len(Transport.link_route_candidates) > RNS_LINK_ROUTE_MIGRATION_MAX_CANDIDATES:
+            try:
+                oldest_key = min(Transport.link_route_candidates, key=lambda k: Transport.link_route_candidates[k].get("created_at", 0))
+                Transport.link_route_candidates.pop(oldest_key, None)
+            except Exception:
+                break
+
+    @staticmethod
+    def _mark_local_link_route_candidate(packet):
+        if not RNS_LINK_ROUTE_MIGRATION:
+            return False
+        key = Transport._link_route_candidate_key(packet.destination_hash, packet.packet_hash)
+        if key == None:
+            return False
+
+        with Transport.link_route_candidate_lock:
+            candidate = Transport.link_route_candidates.pop(key, None)
+
+        if candidate != None and candidate.get("kind") == "local_marker":
+            packet.route_migration_candidate = True
+            packet.route_migration_candidate_at = candidate.get("created_at", time.time())
+            Transport.qortal_log_link_route_migration(
+                "link_route_candidate",
+                link_id=packet.destination_hash,
+                packet_hash=packet.packet_hash,
+                new_interface=packet.receiving_interface,
+                reason="marked_local_packet",
+            )
+            return True
+
+        return False
+
+    @staticmethod
+    def _link_route_outbound_interface(packet, link_entry):
+        if link_entry[IDX_LT_NH_IF] == link_entry[IDX_LT_RCVD_IF]:
+            if packet.hops == link_entry[IDX_LT_REM_HOPS] or packet.hops == link_entry[IDX_LT_HOPS]:
+                return link_entry[IDX_LT_NH_IF]
+            return None
+
+        if packet.receiving_interface == link_entry[IDX_LT_NH_IF]:
+            if packet.hops == link_entry[IDX_LT_REM_HOPS]:
+                return link_entry[IDX_LT_RCVD_IF]
+        elif packet.receiving_interface == link_entry[IDX_LT_RCVD_IF]:
+            if packet.hops == link_entry[IDX_LT_HOPS]:
+                return link_entry[IDX_LT_NH_IF]
+
+        grace_routes = Transport.link_route_grace_table.get(packet.destination_hash, [])
+        now = time.time()
+        kept_grace_routes = []
+        outbound_interface = None
+        for grace in grace_routes:
+            if grace.get("expires_at", 0) > now:
+                kept_grace_routes.append(grace)
+                old_nh_if = grace.get("nh_if")
+                old_rcvd_if = grace.get("rcvd_if")
+                old_rem_hops = grace.get("rem_hops")
+                old_hops = grace.get("hops")
+                if old_nh_if == old_rcvd_if:
+                    if packet.hops == old_rem_hops or packet.hops == old_hops:
+                        outbound_interface = old_nh_if
+                elif packet.receiving_interface == old_nh_if and packet.hops == old_rem_hops:
+                    outbound_interface = old_rcvd_if
+                elif packet.receiving_interface == old_rcvd_if and packet.hops == old_hops:
+                    outbound_interface = old_nh_if
+
+        if len(kept_grace_routes) != len(grace_routes):
+            if kept_grace_routes:
+                Transport.link_route_grace_table[packet.destination_hash] = kept_grace_routes
+            else:
+                Transport.link_route_grace_table.pop(packet.destination_hash, None)
+
+        return outbound_interface
+
+    @staticmethod
+    def _link_route_local_client_side(link_entry):
+        rcvd_is_local = link_entry[IDX_LT_RCVD_IF] in Transport.local_client_interfaces
+        nh_is_local = link_entry[IDX_LT_NH_IF] in Transport.local_client_interfaces
+        if rcvd_is_local:
+            return "received", link_entry[IDX_LT_RCVD_IF]
+        if nh_is_local:
+            return "next_hop", link_entry[IDX_LT_NH_IF]
+        return None, None
+
+    @staticmethod
+    def _route_migration_context_allowed(packet):
+        if packet.packet_type != RNS.Packet.DATA or packet.destination_type != RNS.Destination.LINK:
+            return False
+        return packet.context == RNS.Packet.NONE
+
+    @staticmethod
+    def _maybe_forward_link_route_candidate(packet, link_entry):
+        if not RNS_LINK_ROUTE_MIGRATION:
+            return False
+        if not Transport._route_migration_context_allowed(packet):
+            return False
+        if not link_entry[IDX_LT_VALIDATED]:
+            return False
+
+        local_side, local_interface = Transport._link_route_local_client_side(link_entry)
+        if local_interface == None or packet.receiving_interface in Transport.local_client_interfaces:
+            return False
+
+        key = Transport._link_route_candidate_key(packet.destination_hash, packet.packet_hash)
+        if key == None:
+            return False
+
+        now = time.time()
+        with Transport.link_route_candidate_lock:
+            existing = Transport.link_route_candidates.get(key)
+            if existing != None and now - existing.get("last_seen_at", existing.get("created_at", 0)) < RNS_LINK_ROUTE_MIGRATION_CANDIDATE_DEBOUNCE_SECONDS:
+                Transport.qortal_log_link_route_migration("link_route_migration_debounced", link_id=packet.destination_hash, packet_hash=packet.packet_hash, old_interface=link_entry[IDX_LT_RCVD_IF], new_interface=packet.receiving_interface, old_hops=link_entry[IDX_LT_HOPS], new_hops=packet.hops, reason="candidate_debounce")
+                return True
+
+            Transport.link_route_candidates[key] = {
+                "kind": "daemon_candidate",
+                "link_id": bytes(packet.destination_hash),
+                "packet_hash": bytes(packet.packet_hash),
+                "created_at": now,
+                "last_seen_at": now,
+                "new_interface": packet.receiving_interface,
+                "new_hops": packet.hops,
+                "local_interface": local_interface,
+                "local_side": local_side,
+                "old_nh_if": link_entry[IDX_LT_NH_IF],
+                "old_rcvd_if": link_entry[IDX_LT_RCVD_IF],
+                "old_rem_hops": link_entry[IDX_LT_REM_HOPS],
+                "old_hops": link_entry[IDX_LT_HOPS],
+            }
+            Transport._trim_link_route_candidates_locked()
+
+        control_frame = Transport._local_control_frame({
+            "action": "link_route_candidate",
+            "link_id": bytes(packet.destination_hash),
+            "packet_hash": bytes(packet.packet_hash),
+            "created_at": now,
+        })
+        Transport.transmit(local_interface, control_frame)
+
+        new_raw = packet.raw[0:1]
+        new_raw += struct.pack("!B", packet.hops)
+        new_raw += packet.raw[2:]
+        Transport.transmit(local_interface, new_raw)
+        Transport.qortal_log_link_route_migration(
+            "link_route_candidate",
+            link_id=packet.destination_hash,
+            packet_hash=packet.packet_hash,
+            old_interface=link_entry[IDX_LT_RCVD_IF],
+            new_interface=packet.receiving_interface,
+            old_hops=link_entry[IDX_LT_HOPS],
+            new_hops=packet.hops,
+            reason=f"forwarded_to_local_{local_side}",
+        )
+        return True
+
+    @staticmethod
+    def confirm_link_route_migration(link, packet):
+        if not RNS_LINK_ROUTE_MIGRATION or link == None or packet == None:
+            return False
+        if link.status == RNS.Link.CLOSED or not getattr(packet, "route_migration_candidate", False):
+            return False
+
+        link_id = packet.destination_hash
+        packet_hash = packet.packet_hash
+        try:
+            reticulum = RNS.Reticulum.get_instance()
+            if reticulum != None and reticulum.is_connected_to_shared_instance:
+                confirmed = reticulum.confirm_link_route_migration(link_id, packet_hash)
+            else:
+                confirmed = Transport.confirm_link_route_migration_from_rpc(link_id, packet_hash)
+
+            if confirmed:
+                link.attached_interface = packet.receiving_interface
+                Transport.qortal_log_link_route_migration("link_route_migration_confirmed", link_id=link_id, packet_hash=packet_hash, new_interface=packet.receiving_interface, reason="app_validated", result="local_confirmed")
+            else:
+                Transport.qortal_log_link_route_migration("link_route_migration_rejected", link_id=link_id, packet_hash=packet_hash, new_interface=packet.receiving_interface, reason="daemon_rejected")
+            return confirmed
+
+        except Exception as e:
+            Transport.qortal_log_link_route_migration("link_route_migration_rejected", link_id=link_id, packet_hash=packet_hash, new_interface=packet.receiving_interface, reason=f"confirm_error:{e}")
+            return False
+
+    @staticmethod
+    def confirm_link_route_migration_from_rpc(link_id, packet_hash):
+        if not RNS_LINK_ROUTE_MIGRATION:
+            return False
+        key = Transport._link_route_candidate_key(link_id, packet_hash)
+        if key == None:
+            return False
+
+        now = time.time()
+        with Transport.link_route_candidate_lock:
+            candidate = Transport.link_route_candidates.pop(key, None)
+
+        if candidate == None or candidate.get("kind") != "daemon_candidate":
+            Transport.qortal_log_link_route_migration("link_route_migration_rejected", link_id=link_id, packet_hash=packet_hash, reason="missing_candidate")
+            return False
+
+        last_migrated_at = Transport.link_route_last_migrated_at.get(bytes(link_id), 0)
+        if now - last_migrated_at < RNS_LINK_ROUTE_MIGRATION_DEBOUNCE_SECONDS:
+            with Transport.link_route_candidate_lock:
+                Transport.link_route_candidates[key] = candidate
+            Transport.qortal_log_link_route_migration("link_route_migration_debounced", link_id=link_id, packet_hash=packet_hash, new_interface=candidate.get("new_interface"), reason="migration_debounce")
+            return False
+
+        with Transport.link_table_lock:
+            link_entry = Transport.link_table.get(link_id)
+            if link_entry == None or not link_entry[IDX_LT_VALIDATED]:
+                Transport.qortal_log_link_route_migration("link_route_migration_rejected", link_id=link_id, packet_hash=packet_hash, new_interface=candidate.get("new_interface"), reason="link_not_validated")
+                return False
+
+            grace = {
+                "expires_at": now + RNS_LINK_ROUTE_MIGRATION_GRACE_SECONDS,
+                "nh_if": link_entry[IDX_LT_NH_IF],
+                "rcvd_if": link_entry[IDX_LT_RCVD_IF],
+                "rem_hops": link_entry[IDX_LT_REM_HOPS],
+                "hops": link_entry[IDX_LT_HOPS],
+            }
+            Transport.link_route_grace_table.setdefault(bytes(link_id), []).append(grace)
+
+            local_side = candidate.get("local_side")
+            if local_side == "received":
+                link_entry[IDX_LT_NH_IF] = candidate.get("new_interface")
+                link_entry[IDX_LT_REM_HOPS] = candidate.get("new_hops")
+            elif local_side == "next_hop":
+                link_entry[IDX_LT_RCVD_IF] = candidate.get("new_interface")
+                link_entry[IDX_LT_HOPS] = candidate.get("new_hops")
+            else:
+                Transport.qortal_log_link_route_migration("link_route_migration_rejected", link_id=link_id, packet_hash=packet_hash, reason="invalid_local_side")
+                return False
+
+            link_entry[IDX_LT_TIMESTAMP] = now
+            Transport.link_route_last_migrated_at[bytes(link_id)] = now
+
+        Transport.qortal_log_link_route_migration(
+            "link_route_migration_confirmed",
+            link_id=link_id,
+            packet_hash=packet_hash,
+            old_interface=candidate.get("old_rcvd_if"),
+            new_interface=candidate.get("new_interface"),
+            old_hops=candidate.get("old_hops"),
+            new_hops=candidate.get("new_hops"),
+            reason="daemon_route_updated",
+            result=local_side,
+        )
+        return True
+
+    @staticmethod
     def inbound(raw, interface=None):
         if not Transport.ready:
             wait_start = time.time()
@@ -1735,6 +2187,7 @@ class Transport:
         if packet.destination_type == RNS.Destination.LINK:
             Transport.qortal_log_link_rx("link_unpacked", packet=packet, raw_len=len(raw))
             Transport.qortal_note_link_ingress("unpacked", packet=packet, raw_len=len(raw), started_at=qortal_inbound_started_at)
+            Transport._mark_local_link_route_candidate(packet)
 
         packet_filter_result = Transport.packet_filter(packet)
         if packet.destination_type == RNS.Destination.LINK and not packet_filter_result:
@@ -1904,27 +2357,7 @@ class Transport:
                 if packet.packet_type != RNS.Packet.ANNOUNCE and packet.packet_type != RNS.Packet.LINKREQUEST and packet.context != RNS.Packet.LRPROOF:
                     if packet.destination_hash in Transport.link_table:
                         link_entry = Transport.link_table[packet.destination_hash]
-                        # If receiving and outbound interface is
-                        # the same for this link, direction doesn't
-                        # matter, and we simply repeat the packet.
-                        outbound_interface = None
-                        if link_entry[IDX_LT_NH_IF] == link_entry[IDX_LT_RCVD_IF]:
-                            # But check that taken hops matches one
-                            # of the expectede values.
-                            if packet.hops == link_entry[IDX_LT_REM_HOPS] or packet.hops == link_entry[IDX_LT_HOPS]:
-                                outbound_interface = link_entry[IDX_LT_NH_IF]
-                        else:
-                            # If interfaces differ, we transmit on
-                            # the opposite interface of what the
-                            # packet was received on.
-                            if packet.receiving_interface == link_entry[IDX_LT_NH_IF]:
-                                # Also check that expected hop count matches
-                                if packet.hops == link_entry[IDX_LT_REM_HOPS]:
-                                    outbound_interface = link_entry[IDX_LT_RCVD_IF]
-                            elif packet.receiving_interface == link_entry[IDX_LT_RCVD_IF]:
-                                # Also check that expected hop count matches
-                                if packet.hops == link_entry[IDX_LT_HOPS]:
-                                    outbound_interface = link_entry[IDX_LT_NH_IF]
+                        outbound_interface = Transport._link_route_outbound_interface(packet, link_entry)
 
                         if outbound_interface != None:
                             # Add this packet to the filter hashlist if we
@@ -1937,6 +2370,9 @@ class Transport:
                             new_raw += packet.raw[2:]
                             Transport.transmit(outbound_interface, new_raw)
                             Transport.link_table[packet.destination_hash][IDX_LT_TIMESTAMP] = time.time()
+
+                        else:
+                            Transport._maybe_forward_link_route_candidate(packet, link_entry)
                         
                         # TODO: Can we return safely here? Test and possibly enable this at some point.
                         # return
@@ -2414,6 +2850,17 @@ class Transport:
                                     while packet.packet_hash in Transport.packet_hashlist:
                                         Transport.packet_hashlist.remove(packet.packet_hash)
                         if not matched_link:
+                            if Transport.from_local_client(packet):
+                                with Transport.link_table_lock:
+                                    has_link_route = packet.destination_hash in Transport.link_table
+                                if not has_link_route:
+                                    Transport.qortal_log_link_route_migration(
+                                        "missing_local_client_link_route",
+                                        link_id=packet.destination_hash,
+                                        packet_hash=packet.packet_hash,
+                                        new_interface=packet.receiving_interface,
+                                        reason="local_client_link_data_without_route",
+                                    )
                             Transport.qortal_log_link_route_issue("no_active_link", packet)
                             Transport.qortal_note_link_ingress("no_active_link", packet=packet, raw_len=len(raw), started_at=qortal_inbound_started_at, reason="no_active_link")
                 else:
@@ -3419,6 +3866,7 @@ class Transport:
         Transport.path_table        = {}
         Transport.reverse_table     = {}
         Transport.link_table        = {}
+        Transport.local_link_owners = {}
         Transport.held_announces    = {}
         Transport.tunnels           = {}
 

@@ -1239,6 +1239,11 @@ class Reticulum:
                     identity_hash = call["identity_hash"]
                     if operation == "retain": self.rpc_return(conn, self._retain_identity(identity_hash))
 
+                if "link_route_migration" in call:
+                    operation = call["link_route_migration"]
+                    if operation == "confirm":
+                        self.rpc_return(conn, RNS.Transport.confirm_link_route_migration_from_rpc(call["link_id"], call["packet_hash"]))
+
                 conn.close()
 
             except Exception as e:
@@ -1304,6 +1309,20 @@ class Reticulum:
                 return False
         
         else: return RNS.Identity._retain_identity(identity_hash)
+
+    def confirm_link_route_migration(self, link_id, packet_hash):
+        if self.is_connected_to_shared_instance:
+            try:
+                rpc_connection = self.get_rpc_client()
+                rpc_connection.send_bytes(mp.packb({"link_route_migration": "confirm", "link_id": link_id, "packet_hash": packet_hash}))
+                response = mp.unpackb(rpc_connection.recv_bytes())
+                return bool(response)
+
+            except Exception as e:
+                RNS.log(f"Shared instance RPC failed while confirming link route migration: {e}", RNS.LOG_ERROR)
+                return False
+
+        else: return RNS.Transport.confirm_link_route_migration_from_rpc(link_id, packet_hash)
 
     def get_interface_stats(self):
         if self.is_connected_to_shared_instance:

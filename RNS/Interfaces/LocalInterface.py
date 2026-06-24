@@ -664,7 +664,10 @@ class LocalClientInterface(Interface):
         self.rxb += len(data)
         if self.parent_interface != None: self.parent_interface.rxb += len(data)
 
-        try: self.owner.inbound(data, self)
+        try:
+            if hasattr(self.owner, "handle_local_control_frame") and self.owner.handle_local_control_frame(data, self):
+                return
+            self.owner.inbound(data, self)
         except Exception as e:
             RNS.log(f"An error occurred in the processing of an incoming frame for {self}: {e}", RNS.LOG_ERROR)
             RNS.trace_exception(e)

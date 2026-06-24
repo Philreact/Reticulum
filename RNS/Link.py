@@ -430,6 +430,7 @@ class Link:
                         self.activated_at = time.time()
                         self.last_proof = self.activated_at
                         RNS.Transport.activate_link(self)
+                        RNS.Transport.notify_local_link_validated(self)
                         RNS.log("Link "+str(self)+" established with "+str(self.destination)+", RTT is "+RNS.prettyshorttime(self.rtt), RNS.LOG_DEBUG)
                         
                         if self.rtt != None and self.establishment_cost != None and self.rtt > 0 and self.establishment_cost > 0:
@@ -972,16 +973,35 @@ class Link:
     def receive(self, packet):
         self.watchdog_lock = True
         if not self.status == Link.CLOSED and not (self.initiator and packet.context == RNS.Packet.KEEPALIVE and packet.data == bytes([0xFF])):
-            if packet.receiving_interface != self.attached_interface:
+            route_migration_candidate = bool(getattr(packet, "route_migration_candidate", False))
+            if route_migration_candidate and packet.context != RNS.Packet.NONE:
+                RNS.Transport.qortal_log_link_route_migration("link_route_migration_rejected", link_id=packet.destination_hash, packet_hash=packet.packet_hash, old_interface=self.attached_interface, new_interface=packet.receiving_interface, reason="unsupported_context")
+            elif packet.receiving_interface != self.attached_interface and not route_migration_candidate:
                 RNS.log(f"Link-associated packet received on unexpected interface {packet.receiving_interface} instead of {self.attached_interface}! Someone might be trying to manipulate your communication!", RNS.LOG_ERROR)
             else:
-                self.last_inbound = time.time()
-                if packet.context != RNS.Packet.KEEPALIVE:
-                    self.last_data = self.last_inbound
-                self.rx += 1
-                self.rxbytes += len(packet.data)
-                if self.status == Link.STALE:
-                    self.status = Link.ACTIVE
+                inbound_accounted = False
+
+                def account_valid_inbound():
+                    nonlocal inbound_accounted
+                    if inbound_accounted:
+                        return True
+
+                    if route_migration_candidate:
+                        if not RNS.Transport.confirm_link_route_migration(self, packet):
+                            return False
+
+                    self.last_inbound = time.time()
+                    if packet.context != RNS.Packet.KEEPALIVE:
+                        self.last_data = self.last_inbound
+                    self.rx += 1
+                    self.rxbytes += len(packet.data)
+                    if self.status == Link.STALE:
+                        self.status = Link.ACTIVE
+                    inbound_accounted = True
+                    return True
+
+                if not route_migration_candidate:
+                    account_valid_inbound()
 
                 if packet.packet_type == RNS.Packet.DATA:
                     should_query = False
@@ -989,6 +1009,10 @@ class Link:
                         plaintext = self.decrypt(packet.data)
                         packet.ratchet_id = self.link_id
                         if plaintext != None:
+                            if not account_valid_inbound():
+                                RNS.Transport.qortal_log_link_route_migration("link_route_migration_rejected", link_id=packet.destination_hash, packet_hash=packet.packet_hash, old_interface=self.attached_interface, new_interface=packet.receiving_interface, reason="confirm_failed")
+                                self.watchdog_lock = False
+                                return
                             self.__update_phy_stats(packet, query_shared=True)
 
                             if self.callbacks.packet != None:
@@ -1020,6 +1044,8 @@ class Link:
                                     except Exception as e:
                                         RNS.log("Error while executing proof request callback from "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
                         else:
+                            if route_migration_candidate:
+                                RNS.Transport.qortal_log_link_route_migration("link_route_migration_rejected", link_id=packet.destination_hash, packet_hash=packet.packet_hash, old_interface=self.attached_interface, new_interface=packet.receiving_interface, reason="decrypt_failed")
                             try:
                                 qortal_probe = getattr(RNS, "_qortal_link_receive_probe", None)
                                 if callable(qortal_probe):

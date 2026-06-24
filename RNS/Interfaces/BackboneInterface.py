@@ -63,8 +63,12 @@ class BackboneInterface(Interface):
     listener_filenos = {}
     spawned_interface_filenos = {}
     epoll = None
+    wakeup_reader = None
+    wakeup_writer = None
+    wakeup_fileno = None
     _job_active = False
     _job_lock = threading.Lock()
+    _wakeup_lock = threading.Lock()
 
     @staticmethod
     def get_address_for_if(name, bind_port, prefer_ipv6=False):
@@ -219,7 +223,64 @@ class BackboneInterface(Interface):
 
     @staticmethod
     def ensure_epoll():
-        if not BackboneInterface.epoll: BackboneInterface.epoll = select.epoll()
+        if not BackboneInterface.epoll:
+            BackboneInterface.epoll = select.epoll()
+        BackboneInterface.ensure_wakeup()
+
+    @staticmethod
+    def ensure_wakeup():
+        if BackboneInterface.wakeup_reader != None and BackboneInterface.wakeup_writer != None:
+            return
+
+        with BackboneInterface._wakeup_lock:
+            if BackboneInterface.wakeup_reader != None and BackboneInterface.wakeup_writer != None:
+                return
+
+            reader, writer = socket.socketpair()
+            reader.setblocking(False)
+            writer.setblocking(False)
+            BackboneInterface.wakeup_reader = reader
+            BackboneInterface.wakeup_writer = writer
+            BackboneInterface.wakeup_fileno = reader.fileno()
+            BackboneInterface.epoll.register(BackboneInterface.wakeup_fileno, select.EPOLLIN)
+
+    @staticmethod
+    def wake_epoll():
+        writer = BackboneInterface.wakeup_writer
+        if writer == None:
+            return
+
+        try:
+            writer.send(b"\x00")
+        except BlockingIOError:
+            pass
+        except OSError as e:
+            if e.errno not in (errno.EBADF, errno.EPIPE):
+                RNS.log(f"Error while waking BackboneInterface epoll loop: {e}", RNS.LOG_DEBUG)
+        except Exception as e:
+            RNS.log(f"Error while waking BackboneInterface epoll loop: {e}", RNS.LOG_DEBUG)
+
+    @staticmethod
+    def drain_wakeup():
+        reader = BackboneInterface.wakeup_reader
+        if reader == None:
+            return
+
+        while True:
+            try:
+                data = reader.recv(4096)
+                if len(data) == 0:
+                    break
+            except BlockingIOError:
+                break
+            except OSError as e:
+                if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    break
+                RNS.log(f"Error while draining BackboneInterface epoll wakeup: {e}", RNS.LOG_DEBUG)
+                break
+            except Exception as e:
+                RNS.log(f"Error while draining BackboneInterface epoll wakeup: {e}", RNS.LOG_DEBUG)
+                break
 
     @staticmethod
     def add_listener(interface, bind_address, socket_type=socket.AF_INET):
@@ -260,16 +321,20 @@ class BackboneInterface(Interface):
         try: BackboneInterface.epoll.register(fileno, select.EPOLLIN)
         except Exception as e:
             RNS.log(f"An error occurred while registering EPOLL_IN for file descriptor {fileno}: {e}", RNS.LOG_WARNING)
+        BackboneInterface.wake_epoll()
 
     @staticmethod
     def deregister_fileno(fileno):
         if fileno < 0:
             RNS.log(f"Attempt to deregister invalid file descriptor {fileno}", RNS.LOG_DEBUG)
             return
+        if fileno == BackboneInterface.wakeup_fileno:
+            return
 
         try: BackboneInterface.epoll.unregister(fileno)
         except Exception as e:
             RNS.log(f"An error occurred while deregistering file descriptor {fileno}: {e}", RNS.LOG_DEBUG)
+        BackboneInterface.wake_epoll()
 
     @staticmethod
     def deregister_listeners():
@@ -305,6 +370,7 @@ class BackboneInterface(Interface):
 
         try:
             BackboneInterface.epoll.modify(fileno, events)
+            BackboneInterface.wake_epoll()
             return True
 
         except OSError as e:
@@ -372,6 +438,10 @@ class BackboneInterface(Interface):
                 try:
                     while True:
                         for fileno, event in BackboneInterface.epoll.poll(1):
+                            if fileno == BackboneInterface.wakeup_fileno:
+                                BackboneInterface.drain_wakeup()
+                                continue
+
                             if fileno in BackboneInterface.spawned_interface_filenos:
                                 spawned_interface = BackboneInterface.spawned_interface_filenos[fileno]
                                 client_socket = spawned_interface.socket

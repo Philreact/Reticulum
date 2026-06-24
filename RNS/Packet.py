@@ -118,6 +118,7 @@ class Packet:
     __slots__ += "transport_id", "data", "flags", "raw", "packed", "sent", "create_receipt", "receipt", "fromPacked", "MTU"
     __slots__ += "sent_at", "packet_hash", "ratchet_id", "attached_interface", "receiving_interface", "rssi", "snr", "q"
     __slots__ += "ciphertext", "plaintext", "destination_hash", "destination_type", "link", "map_hash", "is_outbound_pr"
+    __slots__ += "route_migration_candidate", "route_migration_candidate_at"
 
     def __init__(self, destination, data, packet_type = DATA, context = NONE, transport_type = RNS.Transport.BROADCAST,
                  header_type = HEADER_1, transport_id = None, attached_interface = None, create_receipt = True, context_flag=FLAG_UNSET):
@@ -165,6 +166,8 @@ class Packet:
         self.rssi = None
         self.snr = None
         self.q = None
+        self.route_migration_candidate = False
+        self.route_migration_candidate_at = None
 
     def get_packed_flags(self):
         if self.context == Packet.LRPROOF:
