@@ -2579,13 +2579,11 @@ class Transport:
                             new_raw += packet.raw[2:]
                             Transport.transmit(outbound_interface, new_raw)
                             Transport.link_table[packet.destination_hash][IDX_LT_TIMESTAMP] = time.time()
+                            return
 
                         else:
                             if Transport._maybe_forward_link_route_candidate(packet, link_entry):
                                 return
-                        
-                        # TODO: Can we return safely here? Test and possibly enable this at some point.
-                        # return
 
 
             # Announce handling. Handles logic related to incoming
