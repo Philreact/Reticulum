@@ -453,6 +453,7 @@ class Link:
         
         except Exception as e:
             self.status = Link.CLOSED
+            RNS.Transport.qortal_note_link_lifecycle(self, event="close", reason="proof_validation_exception")
             RNS.log("An error ocurred while validating link request proof on "+str(self)+".", RNS.LOG_ERROR)
             RNS.log("The contained exception was: "+str(e), RNS.LOG_ERROR)
 
@@ -706,6 +707,7 @@ class Link:
         self.status = Link.CLOSED
         if self.initiator: self.teardown_reason = Link.INITIATOR_CLOSED
         else: self.teardown_reason = Link.DESTINATION_CLOSED
+        RNS.Transport.qortal_note_link_lifecycle(self, event="close", reason="local_teardown")
         self.link_closed()
 
     def teardown_packet(self, packet):
@@ -718,6 +720,7 @@ class Link:
                 else:
                     self.teardown_reason = Link.INITIATOR_CLOSED
                 self.__update_phy_stats(packet)
+                RNS.Transport.qortal_note_link_lifecycle(self, event="close", reason="remote_teardown", packet=packet)
                 self.link_closed()
         except Exception as e:
             pass
@@ -768,6 +771,7 @@ class Link:
                         RNS.log("Link establishment timed out", RNS.LOG_VERBOSE)
                         self.status = Link.CLOSED
                         self.teardown_reason = Link.TIMEOUT
+                        RNS.Transport.qortal_note_link_lifecycle(self, event="close", reason="pending_establishment_timeout")
                         self.link_closed()
                         sleep_time = 0.001
 
@@ -777,6 +781,7 @@ class Link:
                     if time.time() >= self.request_time + self.establishment_timeout:
                         self.status = Link.CLOSED
                         self.teardown_reason = Link.TIMEOUT
+                        RNS.Transport.qortal_note_link_lifecycle(self, event="close", reason="handshake_establishment_timeout")
                         self.link_closed()
                         sleep_time = 0.001
 
@@ -808,6 +813,7 @@ class Link:
                     self.__teardown_packet()
                     self.status = Link.CLOSED
                     self.teardown_reason = Link.TIMEOUT
+                    RNS.Transport.qortal_note_link_lifecycle(self, event="close", reason="stale_timeout")
                     self.link_closed()
 
 
@@ -974,7 +980,7 @@ class Link:
         self.watchdog_lock = True
         if not self.status == Link.CLOSED and not (self.initiator and packet.context == RNS.Packet.KEEPALIVE and packet.data == bytes([0xFF])):
             route_migration_candidate = bool(getattr(packet, "route_migration_candidate", False))
-            if route_migration_candidate and packet.context != RNS.Packet.NONE:
+            if route_migration_candidate and not RNS.Transport._route_migration_context_allowed(packet):
                 RNS.Transport.qortal_log_link_route_migration("link_route_migration_rejected", link_id=packet.destination_hash, packet_hash=packet.packet_hash, old_interface=self.attached_interface, new_interface=packet.receiving_interface, reason="unsupported_context")
             elif packet.receiving_interface != self.attached_interface and not route_migration_candidate:
                 RNS.log(f"Link-associated packet received on unexpected interface {packet.receiving_interface} instead of {self.attached_interface}! Someone might be trying to manipulate your communication!", RNS.LOG_ERROR)
@@ -988,7 +994,7 @@ class Link:
 
                     if route_migration_candidate:
                         if not RNS.Transport.confirm_link_route_migration(self, packet):
-                            return False
+                            RNS.Transport.qortal_log_link_route_migration("link_route_migration_rejected", link_id=packet.destination_hash, packet_hash=packet.packet_hash, old_interface=self.attached_interface, new_interface=packet.receiving_interface, reason="confirm_failed")
 
                     self.last_inbound = time.time()
                     if packet.context != RNS.Packet.KEEPALIVE:
@@ -1009,10 +1015,7 @@ class Link:
                         plaintext = self.decrypt(packet.data)
                         packet.ratchet_id = self.link_id
                         if plaintext != None:
-                            if not account_valid_inbound():
-                                RNS.Transport.qortal_log_link_route_migration("link_route_migration_rejected", link_id=packet.destination_hash, packet_hash=packet.packet_hash, old_interface=self.attached_interface, new_interface=packet.receiving_interface, reason="confirm_failed")
-                                self.watchdog_lock = False
-                                return
+                            account_valid_inbound()
                             self.__update_phy_stats(packet, query_shared=True)
 
                             if self.callbacks.packet != None:
@@ -1081,6 +1084,7 @@ class Link:
                             request_id = packet.getTruncatedHash()
                             packed_request = self.decrypt(packet.data)
                             if packed_request != None:
+                                account_valid_inbound()
                                 unpacked_request = umsgpack.unpackb(packed_request)
                                 def job(): self.handle_request(request_id, unpacked_request)
                                 threading.Thread(target=job, daemon=True).start()
@@ -1092,6 +1096,7 @@ class Link:
                         try:
                             packed_response = self.decrypt(packet.data)
                             if packed_response != None:
+                                account_valid_inbound()
                                 unpacked_response = umsgpack.unpackb(packed_response)
                                 request_id = unpacked_response[0]
                                 response_data = unpacked_response[1]
@@ -1114,6 +1119,7 @@ class Link:
                     elif packet.context == RNS.Packet.RESOURCE_ADV:
                         packet.plaintext = self.decrypt(packet.data)
                         if packet.plaintext != None:
+                            account_valid_inbound()
                             self.__update_phy_stats(packet, query_shared=True)
 
                             if RNS.ResourceAdvertisement.is_request(packet):
@@ -1149,6 +1155,7 @@ class Link:
                     elif packet.context == RNS.Packet.RESOURCE_REQ:
                         plaintext = self.decrypt(packet.data)
                         if plaintext != None:
+                            account_valid_inbound()
                             self.__update_phy_stats(packet, query_shared=True)
                             if ord(plaintext[:1]) == RNS.Resource.HASHMAP_IS_EXHAUSTED:
                                 resource_hash = plaintext[1+RNS.Resource.MAPHASH_LEN:RNS.Identity.HASHLENGTH//8+1+RNS.Resource.MAPHASH_LEN]
@@ -1171,6 +1178,7 @@ class Link:
                     elif packet.context == RNS.Packet.RESOURCE_HMU:
                         plaintext = self.decrypt(packet.data)
                         if plaintext != None:
+                            account_valid_inbound()
                             self.__update_phy_stats(packet, query_shared=True)
                             resource_hash = plaintext[:RNS.Identity.HASHLENGTH//8]
                             for resource in self.incoming_resources:
@@ -1180,6 +1188,7 @@ class Link:
                     elif packet.context == RNS.Packet.RESOURCE_ICL:
                         plaintext = self.decrypt(packet.data)
                         if plaintext != None:
+                            account_valid_inbound()
                             self.__update_phy_stats(packet)
                             resource_hash = plaintext[:RNS.Identity.HASHLENGTH//8]
                             for resource in self.incoming_resources:
@@ -1189,6 +1198,7 @@ class Link:
                     elif packet.context == RNS.Packet.RESOURCE_RCL:
                         plaintext = self.decrypt(packet.data)
                         if plaintext != None:
+                            account_valid_inbound()
                             self.__update_phy_stats(packet)
                             resource_hash = plaintext[:RNS.Identity.HASHLENGTH//8]
                             for resource in self.outgoing_resources:
@@ -1207,9 +1217,13 @@ class Link:
                     # each packet is a huge overhead. Probably some kind
                     # of hash -> sequence map
                     elif packet.context == RNS.Packet.RESOURCE:
+                        accepted_resource_part = False
                         for resource in self.incoming_resources:
-                            resource.receive_part(packet)
+                            if resource.receive_part(packet, accepted_callback=account_valid_inbound if route_migration_candidate else None):
+                                accepted_resource_part = True
                             self.__update_phy_stats(packet)
+                        if accepted_resource_part:
+                            account_valid_inbound()
 
                     elif packet.context == RNS.Packet.CHANNEL:
                         if not self._channel:
@@ -1218,6 +1232,7 @@ class Link:
                             packet.prove()
                             plaintext = self.decrypt(packet.data)
                             if plaintext != None:
+                                account_valid_inbound()
                                 self.__update_phy_stats(packet)
                                 self._channel._receive(plaintext)
 
@@ -1226,8 +1241,12 @@ class Link:
                         resource_hash = packet.data[0:RNS.Identity.HASHLENGTH//8]
                         for resource in self.outgoing_resources:
                             if resource_hash == resource.hash:
-                                def job(resource=resource): resource.validate_proof(packet.data)
-                                threading.Thread(target=job, daemon=True).start()
+                                if route_migration_candidate:
+                                    if resource.validate_proof(packet.data, validated_callback=account_valid_inbound):
+                                        account_valid_inbound()
+                                else:
+                                    def job(resource=resource): resource.validate_proof(packet.data)
+                                    threading.Thread(target=job, daemon=True).start()
                                 self.__update_phy_stats(packet, query_shared=True)
 
         self.watchdog_lock = False

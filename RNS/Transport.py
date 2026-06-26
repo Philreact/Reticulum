@@ -44,16 +44,15 @@ from RNS.Interfaces.BackboneInterface import BackboneInterface
 
 # Broad per-packet logs are off by default because they can distort timing on busy networks.
 QORTAL_RNS_LINK_RX_TRACE = os.environ.get("QORTAL_RNS_LINK_RX_TRACE", "0") == "1"
-QORTAL_RNS_LINK_ROUTE_TRACE = os.environ.get("QORTAL_RNS_LINK_ROUTE_TRACE", "0") == "1"
-# Focused Reticulum link diagnostics are off by default because even bounded
-# summaries can distort timing on busy networks.
+QORTAL_RNS_LINK_ROUTE_TRACE = os.environ.get("QORTAL_RNS_LINK_ROUTE_TRACE", "1") == "1"
+# Focused Reticulum link ingress summaries are on by default while diagnosing local I/O gaps.
 QORTAL_RNS_LINK_INGRESS_TRACE = os.environ.get(
     "QORTAL_RNS_LINK_INGRESS_TRACE",
-    os.environ.get("QORTAL_RNS_AUDIO_INGRESS_TRACE", "0")
+    os.environ.get("QORTAL_RNS_AUDIO_INGRESS_TRACE", "1")
 ) == "1"
 QORTAL_RNS_LINK_MIGRATION_TRACE = os.environ.get(
     "QORTAL_RNS_LINK_MIGRATION_TRACE",
-    os.environ.get("QORTAL_RNS_LINK_ROUTE_TRACE", "0")
+    os.environ.get("QORTAL_RNS_LINK_ROUTE_TRACE", "1")
 ) == "1"
 QORTAL_RNS_LINK_INGRESS_INTERVAL = float(os.environ.get(
     "QORTAL_RNS_LINK_INGRESS_INTERVAL",
@@ -175,6 +174,7 @@ class Transport:
     link_table_lock             = Lock()
     active_links_lock           = Lock()
     pending_links_lock          = Lock()
+    qortal_link_lifecycle_lock  = Lock()
     tunnels_lock                = Lock()
     receipts_lock               = Lock()
     discovery_pr_lock           = Lock()
@@ -189,6 +189,9 @@ class Transport:
     # Transport control destinations are used
     # for control purposes like path requests
     control_destinations        = []
+
+    qortal_link_lifecycle       = {}
+    qortal_link_lifecycle_max   = 2048
     control_hashes              = []
     mgmt_destinations           = []
     mgmt_hashes                 = []
@@ -225,6 +228,7 @@ class Transport:
     link_route_candidates      = {}
     link_route_candidate_lock  = Lock()
     link_route_grace_table     = {}
+    link_route_grace_lock      = Lock()
     link_route_last_migrated_at = {}
     link_route_migration_log_last = {}
     link_route_migration_log_interval = 1.0
@@ -571,6 +575,7 @@ class Transport:
                     with Transport.pending_links_lock:
                         for link in Transport.pending_links:
                             if link.status == RNS.Link.CLOSED:
+                                Transport.qortal_note_link_lifecycle(link, event="pending_cleanup", reason="closed_pending_removed")
                                 # If we are not a Transport Instance, finding a pending link
                                 # that was never activated will trigger an expiry of the path
                                 # to the destination, and an attempt to rediscover the path.
@@ -599,7 +604,9 @@ class Transport:
                         for link in Transport.active_links:
                             if link.status == RNS.Link.CLOSED: closed_links.append(link)
 
-                        for closed_link in closed_links: Transport.active_links.remove(closed_link)
+                        for closed_link in closed_links:
+                            Transport.qortal_note_link_lifecycle(closed_link, event="active_cleanup", reason="closed_active_removed")
+                            Transport.active_links.remove(closed_link)
 
                     Transport.links_last_checked = time.time()
 
@@ -1438,6 +1445,176 @@ class Transport:
         return False
 
     @staticmethod
+    def qortal_note_link_lifecycle(link=None, link_id=None, event="unknown", reason=None, packet=None):
+        if not QORTAL_RNS_LINK_ROUTE_TRACE:
+            return
+
+        try:
+            if link_id == None and link != None:
+                link_id = getattr(link, "link_id", None)
+
+            if not isinstance(link_id, (bytes, bytearray)):
+                return
+
+            now = time.time()
+            key = bytes(link_id)
+            receiving_interface = getattr(packet, "receiving_interface", None) if packet != None else None
+            with Transport.qortal_link_lifecycle_lock:
+                previous = Transport.qortal_link_lifecycle.get(key)
+                entry = {
+                    "event": event,
+                    "reason": reason or "n/a",
+                    "at": now,
+                    "status": str(getattr(link, "status", "n/a")) if link != None else "n/a",
+                    "initiator": str(getattr(link, "initiator", "n/a")) if link != None else "n/a",
+                    "attached_interface": str(getattr(link, "attached_interface", "n/a")) if link != None else "n/a",
+                    "receiving_interface": str(receiving_interface),
+                    "destination": RNS.hexrep(getattr(getattr(link, "destination", None), "hash", None), delimit=False) if isinstance(getattr(getattr(link, "destination", None), "hash", None), (bytes, bytearray)) else "n/a",
+                    "teardown_reason": str(getattr(link, "teardown_reason", "n/a")) if link != None else "n/a",
+                    "activated_age_ms": int((now - getattr(link, "activated_at", now)) * 1000) if getattr(link, "activated_at", None) else "n/a",
+                    "last_inbound_age_ms": int((now - getattr(link, "last_inbound", now)) * 1000) if getattr(link, "last_inbound", None) else "n/a",
+                    "last_outbound_age_ms": int((now - getattr(link, "last_outbound", now)) * 1000) if getattr(link, "last_outbound", None) else "n/a",
+                    "previous_event": previous.get("event", "n/a") if previous != None else "n/a",
+                    "previous_reason": previous.get("reason", "n/a") if previous != None else "n/a",
+                    "previous_age_ms": int((now - previous.get("at", now)) * 1000) if previous != None else "n/a",
+                }
+                Transport.qortal_link_lifecycle[key] = entry
+                while len(Transport.qortal_link_lifecycle) > Transport.qortal_link_lifecycle_max:
+                    try:
+                        Transport.qortal_link_lifecycle.pop(next(iter(Transport.qortal_link_lifecycle)))
+                    except Exception:
+                        break
+        except Exception:
+            pass
+
+    @staticmethod
+    def qortal_link_lifecycle_summary(link_id):
+        try:
+            if not isinstance(link_id, (bytes, bytearray)):
+                return "lifecycle=n/a"
+
+            with Transport.qortal_link_lifecycle_lock:
+                entry = Transport.qortal_link_lifecycle.get(bytes(link_id))
+
+            if entry == None:
+                return "lifecycle=unknown"
+
+            age_ms = int((time.time() - entry.get("at", time.time())) * 1000)
+            return (
+                f"lifecycle_event={entry.get('event', 'n/a')} "
+                f"lifecycle_reason={entry.get('reason', 'n/a')} "
+                f"lifecycle_age_ms={age_ms} "
+                f"lifecycle_previous_event={entry.get('previous_event', 'n/a')} "
+                f"lifecycle_previous_reason={entry.get('previous_reason', 'n/a')} "
+                f"lifecycle_previous_age_ms={entry.get('previous_age_ms', 'n/a')} "
+                f"lifecycle_status={entry.get('status', 'n/a')} "
+                f"lifecycle_initiator={entry.get('initiator', 'n/a')} "
+                f"lifecycle_teardown_reason={entry.get('teardown_reason', 'n/a')} "
+                f"lifecycle_attached_interface={entry.get('attached_interface', 'n/a')} "
+                f"lifecycle_receiving_interface={entry.get('receiving_interface', 'n/a')} "
+                f"lifecycle_destination={entry.get('destination', 'n/a')} "
+                f"lifecycle_activated_age_ms={entry.get('activated_age_ms', 'n/a')} "
+                f"lifecycle_last_inbound_age_ms={entry.get('last_inbound_age_ms', 'n/a')} "
+                f"lifecycle_last_outbound_age_ms={entry.get('last_outbound_age_ms', 'n/a')}"
+            )
+        except Exception:
+            return "lifecycle=error"
+
+    @staticmethod
+    def qortal_link_route_context_summary(packet=None, link_id=None, include_recent=True):
+        try:
+            destination_hash = link_id
+            if destination_hash == None and packet != None:
+                destination_hash = getattr(packet, "destination_hash", None)
+            if not isinstance(destination_hash, (bytes, bytearray)):
+                return "route_context=n/a"
+
+            destination_key = bytes(destination_hash)
+            now = time.time()
+            now_mono = time.monotonic()
+            receiving_interface = getattr(packet, "receiving_interface", None) if packet != None else None
+            owner = getattr(Transport, "owner", None)
+            process_role = "local_client" if getattr(owner, "is_connected_to_shared_instance", False) else "shared_daemon"
+            receiving_is_local_client = Transport.is_local_client_interface(receiving_interface) if receiving_interface != None else False
+            receiving_to_shared = Transport.interface_to_shared_instance(receiving_interface) if receiving_interface != None else False
+
+            link_entry = None
+            owner_interface = Transport.local_link_owners.get(destination_key)
+            try:
+                link_entry = Transport.link_table.get(destination_key)
+            except Exception:
+                link_entry = None
+
+            if link_entry != None:
+                route_local_side, route_local_interface = Transport._link_route_local_client_side(link_entry)
+                link_table_age_ms = int((now - link_entry[IDX_LT_TIMESTAMP]) * 1000) if link_entry[IDX_LT_TIMESTAMP] else "n/a"
+                link_table_summary = (
+                    "link_table=yes "
+                    f"link_validated={str(link_entry[IDX_LT_VALIDATED]).lower()} "
+                    f"link_route_local_side={route_local_side or 'none'} "
+                    f"link_route_local_interface={route_local_interface} "
+                    f"link_route_owner_match={str(owner_interface != None and owner_interface == route_local_interface).lower()} "
+                    f"link_route_hops={link_entry[IDX_LT_HOPS]} "
+                    f"link_route_age_ms={link_table_age_ms} "
+                    f"link_route_rcvd_if={link_entry[IDX_LT_RCVD_IF]} "
+                    f"link_route_nh_if={link_entry[IDX_LT_NH_IF]}"
+                )
+            else:
+                link_table_summary = "link_table=no link_validated=n/a link_route_local_side=none link_route_local_interface=None link_route_owner_match=false link_route_hops=n/a link_route_age_ms=n/a link_route_rcvd_if=None link_route_nh_if=None"
+
+            path_entry = None
+            try:
+                path_entry = Transport.path_table.get(destination_key)
+            except Exception:
+                path_entry = None
+
+            if path_entry != None:
+                path_age_ms = int((now - path_entry[IDX_PT_TIMESTAMP]) * 1000) if path_entry[IDX_PT_TIMESTAMP] else "n/a"
+                path_summary = f"path_table=yes path_hops={path_entry[IDX_PT_HOPS]} path_age_ms={path_age_ms} path_next_hop={path_entry[IDX_PT_NEXT_HOP]} path_received_from={path_entry[IDX_PT_RVCD_IF]}"
+            else:
+                path_summary = "path_table=no path_hops=n/a path_age_ms=n/a path_next_hop=None path_received_from=None"
+
+            pending_matches = 0
+            try:
+                for pending_link in Transport.pending_links:
+                    if getattr(pending_link, "link_id", None) == destination_key:
+                        pending_matches += 1
+            except Exception:
+                pending_matches = "n/a"
+
+            recent_dispatch_age_ms = "n/a"
+            recent_no_active_age_ms = "n/a"
+            if include_recent:
+                try:
+                    with Transport.qortal_link_ingress_lock:
+                        stats = Transport.qortal_link_ingress_stats.get(destination_key.hex())
+                        if stats != None:
+                            last_dispatch_at = stats.get("last_dispatch_at", 0.0)
+                            last_unpacked_at = stats.get("last_unpacked_at", 0.0)
+                            if last_dispatch_at:
+                                recent_dispatch_age_ms = int((now_mono - last_dispatch_at) * 1000)
+                            if last_unpacked_at and stats.get("last_stage") == "no_active_link":
+                                recent_no_active_age_ms = int((now_mono - last_unpacked_at) * 1000)
+                except Exception:
+                    pass
+
+            return (
+                f"process_role={process_role} "
+                f"owner_connected_shared={str(getattr(owner, 'is_connected_to_shared_instance', False)).lower()} "
+                f"receiving_is_local_client={str(receiving_is_local_client).lower()} "
+                f"receiving_to_shared_instance={str(receiving_to_shared).lower()} "
+                f"local_client_interfaces={len(Transport.local_client_interfaces)} "
+                f"local_link_owner={owner_interface} "
+                f"pending_links_match={pending_matches} "
+                f"recent_dispatch_age_ms={recent_dispatch_age_ms} "
+                f"recent_no_active_age_ms={recent_no_active_age_ms} "
+                f"{link_table_summary} "
+                f"{path_summary}"
+            )
+        except Exception:
+            return "route_context=error"
+
+    @staticmethod
     def qortal_log_link_route_issue(issue, packet, link=None):
         if not QORTAL_RNS_LINK_ROUTE_TRACE:
             return
@@ -1461,7 +1638,11 @@ class Transport:
                 break
 
         link_id = getattr(link, "link_id", None) if link != None else None
+        if link_id == None:
+            link_id = destination_hash
         link_status = getattr(link, "status", "n/a") if link != None else "n/a"
+        lifecycle = Transport.qortal_link_lifecycle_summary(link_id)
+        route_context = Transport.qortal_link_route_context_summary(packet=packet, link_id=link_id)
         RNS.log(
             "[qortal-link-route] "
             f"issue={issue} "
@@ -1473,7 +1654,9 @@ class Transport:
             f"link={RNS.hexrep(link_id, delimit=False) if isinstance(link_id, (bytes, bytearray)) else 'n/a'} "
             f"link_status={link_status} "
             f"attached_interface={attached_interface} "
-            f"active_links={len(Transport.active_links)}",
+            f"active_links={len(Transport.active_links)} "
+            f"{route_context} "
+            f"{lifecycle}",
             RNS.LOG_NOTICE
         )
 
@@ -1612,6 +1795,7 @@ class Transport:
                 f"last_reason={stats['last_reason']} "
                 f"last_packet={stats['last_packet']} "
                 f"active_links={len(Transport.active_links)} "
+                f"{Transport.qortal_link_route_context_summary(packet=packet, include_recent=False)} "
                 f"path_table={len(Transport.path_table)} "
                 f"packet_hashlist={len(Transport.packet_hashlist)}",
                 RNS.LOG_NOTICE
@@ -1878,30 +2062,31 @@ class Transport:
             if packet.hops == link_entry[IDX_LT_HOPS]:
                 return link_entry[IDX_LT_NH_IF]
 
-        grace_routes = Transport.link_route_grace_table.get(packet.destination_hash, [])
         now = time.time()
-        kept_grace_routes = []
         outbound_interface = None
-        for grace in grace_routes:
-            if grace.get("expires_at", 0) > now:
-                kept_grace_routes.append(grace)
-                old_nh_if = grace.get("nh_if")
-                old_rcvd_if = grace.get("rcvd_if")
-                old_rem_hops = grace.get("rem_hops")
-                old_hops = grace.get("hops")
-                if old_nh_if == old_rcvd_if:
-                    if packet.hops == old_rem_hops or packet.hops == old_hops:
+        with Transport.link_route_grace_lock:
+            grace_routes = Transport.link_route_grace_table.get(packet.destination_hash, [])
+            kept_grace_routes = []
+            for grace in grace_routes:
+                if grace.get("expires_at", 0) > now:
+                    kept_grace_routes.append(grace)
+                    old_nh_if = grace.get("nh_if")
+                    old_rcvd_if = grace.get("rcvd_if")
+                    old_rem_hops = grace.get("rem_hops")
+                    old_hops = grace.get("hops")
+                    if old_nh_if == old_rcvd_if:
+                        if packet.hops == old_rem_hops or packet.hops == old_hops:
+                            outbound_interface = old_nh_if
+                    elif packet.receiving_interface == old_nh_if and packet.hops == old_rem_hops:
+                        outbound_interface = old_rcvd_if
+                    elif packet.receiving_interface == old_rcvd_if and packet.hops == old_hops:
                         outbound_interface = old_nh_if
-                elif packet.receiving_interface == old_nh_if and packet.hops == old_rem_hops:
-                    outbound_interface = old_rcvd_if
-                elif packet.receiving_interface == old_rcvd_if and packet.hops == old_hops:
-                    outbound_interface = old_nh_if
 
-        if len(kept_grace_routes) != len(grace_routes):
-            if kept_grace_routes:
-                Transport.link_route_grace_table[packet.destination_hash] = kept_grace_routes
-            else:
-                Transport.link_route_grace_table.pop(packet.destination_hash, None)
+            if len(kept_grace_routes) != len(grace_routes):
+                if kept_grace_routes:
+                    Transport.link_route_grace_table[packet.destination_hash] = kept_grace_routes
+                else:
+                    Transport.link_route_grace_table.pop(packet.destination_hash, None)
 
         return outbound_interface
 
@@ -1917,9 +2102,24 @@ class Transport:
 
     @staticmethod
     def _route_migration_context_allowed(packet):
-        if packet.packet_type != RNS.Packet.DATA or packet.destination_type != RNS.Destination.LINK:
+        if packet.destination_type != RNS.Destination.LINK:
             return False
-        return packet.context == RNS.Packet.NONE
+        if packet.packet_type == RNS.Packet.DATA:
+            return packet.context in (
+                RNS.Packet.NONE,
+                RNS.Packet.REQUEST,
+                RNS.Packet.RESPONSE,
+                RNS.Packet.RESOURCE_ADV,
+                RNS.Packet.RESOURCE_REQ,
+                RNS.Packet.RESOURCE_HMU,
+                RNS.Packet.RESOURCE_ICL,
+                RNS.Packet.RESOURCE_RCL,
+                RNS.Packet.RESOURCE,
+                RNS.Packet.CHANNEL,
+            )
+        if packet.packet_type == RNS.Packet.PROOF:
+            return packet.context == RNS.Packet.RESOURCE_PRF
+        return False
 
     @staticmethod
     def _maybe_forward_link_route_candidate(packet, link_entry):
@@ -2049,7 +2249,8 @@ class Transport:
                 "rem_hops": link_entry[IDX_LT_REM_HOPS],
                 "hops": link_entry[IDX_LT_HOPS],
             }
-            Transport.link_route_grace_table.setdefault(bytes(link_id), []).append(grace)
+            with Transport.link_route_grace_lock:
+                Transport.link_route_grace_table.setdefault(bytes(link_id), []).append(grace)
 
             local_side = candidate.get("local_side")
             if local_side == "received":
@@ -2380,7 +2581,8 @@ class Transport:
                             Transport.link_table[packet.destination_hash][IDX_LT_TIMESTAMP] = time.time()
 
                         else:
-                            Transport._maybe_forward_link_route_candidate(packet, link_entry)
+                            if Transport._maybe_forward_link_route_candidate(packet, link_entry):
+                                return
                         
                         # TODO: Can we return safely here? Test and possibly enable this at some point.
                         # return
@@ -3169,6 +3371,7 @@ class Transport:
     @staticmethod
     def register_link(link):
         RNS.log("Registering link "+str(link), RNS.LOG_EXTREME) if RNS.sl(RNS.LOG_EXTREME) else None
+        Transport.qortal_note_link_lifecycle(link, event="register", reason="initiator_pending" if link.initiator else "inbound_active")
         if link.initiator:
             with Transport.pending_links_lock: Transport.pending_links.append(link)
         else:
@@ -3183,7 +3386,9 @@ class Transport:
                 Transport.pending_links.remove(link)
                 with Transport.active_links_lock: Transport.active_links.append(link)
                 link.status = RNS.Link.ACTIVE
+                Transport.qortal_note_link_lifecycle(link, event="activate", reason="pending_to_active")
             else:
+                Transport.qortal_note_link_lifecycle(link, event="activate_failed", reason="not_in_pending_table")
                 RNS.log("Attempted to activate a link that was not in the pending table", RNS.LOG_ERROR)
 
     @staticmethod

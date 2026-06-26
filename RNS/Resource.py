@@ -40,6 +40,37 @@ from threading import Lock
 from .vendor import umsgpack as umsgpack
 from time import sleep
 
+
+def _env_int(name, default, minimum=None, maximum=None):
+    value = os.environ.get(name)
+    if value == None or str(value).strip() == "":
+        return default
+    try:
+        parsed = int(str(value).strip())
+    except Exception:
+        return default
+    if minimum != None:
+        parsed = max(minimum, parsed)
+    if maximum != None:
+        parsed = min(maximum, parsed)
+    return parsed
+
+
+def _env_float(name, default, minimum=None, maximum=None):
+    value = os.environ.get(name)
+    if value == None or str(value).strip() == "":
+        return default
+    try:
+        parsed = float(str(value).strip())
+    except Exception:
+        return default
+    if minimum != None:
+        parsed = max(minimum, parsed)
+    if maximum != None:
+        parsed = min(maximum, parsed)
+    return parsed
+
+
 class Resource:
     """
     The Resource class allows transferring arbitrary amounts
@@ -55,19 +86,19 @@ class Resource:
     """
 
     # The initial window size at beginning of transfer
-    WINDOW               = 4
+    WINDOW               = _env_int("RNS_RESOURCE_WINDOW", 4, minimum=1)
 
     # Absolute minimum window size during transfer
-    WINDOW_MIN           = 2
+    WINDOW_MIN           = _env_int("RNS_RESOURCE_WINDOW_MIN", 2, minimum=1)
 
     # The maximum window size for transfers on slow links
-    WINDOW_MAX_SLOW      = 10
+    WINDOW_MAX_SLOW      = _env_int("RNS_RESOURCE_WINDOW_MAX_SLOW", 10, minimum=WINDOW_MIN)
 
     # The maximum window size for transfers on very slow links
-    WINDOW_MAX_VERY_SLOW = 4
+    WINDOW_MAX_VERY_SLOW = _env_int("RNS_RESOURCE_WINDOW_MAX_VERY_SLOW", 4, minimum=WINDOW_MIN)
 
     # The maximum window size for transfers on fast links
-    WINDOW_MAX_FAST      = 75
+    WINDOW_MAX_FAST      = _env_int("RNS_RESOURCE_WINDOW_MAX_FAST", 75, minimum=WINDOW_MAX_SLOW)
     
     # For calculating maps and guard segments, this
     # must be set to the global maximum window.
@@ -75,28 +106,28 @@ class Resource:
     
     # If the fast rate is sustained for this many request
     # rounds, the fast link window size will be allowed.
-    FAST_RATE_THRESHOLD  = WINDOW_MAX_SLOW - WINDOW - 2
+    FAST_RATE_THRESHOLD  = _env_int("RNS_RESOURCE_FAST_RATE_THRESHOLD", WINDOW_MAX_SLOW - WINDOW - 2, minimum=0)
 
     # If the very slow rate is sustained for this many request
     # rounds, window will be capped to the very slow limit.
-    VERY_SLOW_RATE_THRESHOLD = 2
+    VERY_SLOW_RATE_THRESHOLD = _env_int("RNS_RESOURCE_VERY_SLOW_RATE_THRESHOLD", 2, minimum=1)
 
     # If the RTT rate is higher than this value,
     # the max window size for fast links will be used.
     # The default is 50 Kbps (the value is stored in
     # bytes per second, hence the "/ 8").
-    RATE_FAST            = (50*1000) / 8
+    RATE_FAST            = _env_float("RNS_RESOURCE_RATE_FAST_BPS", (50*1000) / 8, minimum=1)
 
     # If the RTT rate is lower than this value,
     # the window size will be capped at .
     # The default is 50 Kbps (the value is stored in
     # bytes per second, hence the "/ 8").
-    RATE_VERY_SLOW       = (2*1000) / 8
+    RATE_VERY_SLOW       = _env_float("RNS_RESOURCE_RATE_VERY_SLOW_BPS", (2*1000) / 8, minimum=1)
 
     # The minimum allowed flexibility of the window size.
     # The difference between window_max and window_min
     # will never be smaller than this value.
-    WINDOW_FLEXIBILITY   = 4
+    WINDOW_FLEXIBILITY   = _env_int("RNS_RESOURCE_WINDOW_FLEXIBILITY", 4, minimum=1)
 
     # Number of bytes in a map hash
     MAPHASH_LEN          = 4
@@ -113,7 +144,7 @@ class Resource:
     #
     # Capped at 16777215 (0xFFFFFF) per segment to
     # fit in 3 bytes in resource advertisements.
-    MAX_EFFICIENT_SIZE      = 1 * 1024 * 1024 - 1
+    MAX_EFFICIENT_SIZE      = _env_int("RNS_RESOURCE_MAX_EFFICIENT_SIZE", 1 * 1024 * 1024 - 1, minimum=64 * 1024, maximum=16 * 1024 * 1024 - 1)
     RESPONSE_MAX_GRACE_TIME = 10
 
     # Max metadata size is 16777215 (0xFFFFFF) bytes
@@ -779,10 +810,15 @@ class Resource:
         if self.__progress_callback:
             self.next_segment.progress_callback(self.__progress_callback)
 
-    def validate_proof(self, proof_data):
+    def validate_proof(self, proof_data, validated_callback=None):
         if not self.status == Resource.FAILED:
             if len(proof_data) == RNS.Identity.HASHLENGTH//8*2:
                 if proof_data[RNS.Identity.HASHLENGTH//8:] == self.expected_proof:
+                    if validated_callback != None:
+                        try:
+                            validated_callback()
+                        except Exception as e:
+                            RNS.log("Error while executing resource proof validated callback from "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
                     self.status = Resource.COMPLETE
                     self.link.resource_concluded(self)
                     if self.segment_index == self.total_segments:
@@ -819,14 +855,17 @@ class Resource:
                         self.hashmap = None
 
                         self.next_segment.advertise()
+                    return True
                 else:
-                    pass
+                    return False
             else:
-                pass
+                return False
+        return False
 
 
-    def receive_part(self, packet):
+    def receive_part(self, packet, accepted_callback=None):
         with self.receive_lock:
+            accepted_part = False
 
             self.receiving_part = True
             self.last_activity = time.time()
@@ -871,6 +910,12 @@ class Resource:
                             self.rtt_rxd_bytes += len(part_data)
                             self.received_count += 1
                             self.outstanding_parts -= 1
+                            accepted_part = True
+                            if accepted_callback != None:
+                                try:
+                                    accepted_callback()
+                                except Exception as e:
+                                    RNS.log("Error while executing resource part accepted callback from "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
 
                             # Update consecutive completed pointer
                             if i == self.consecutive_completed_height + 1:
@@ -924,8 +969,10 @@ class Resource:
                                     self.window_max = Resource.WINDOW_MAX_VERY_SLOW
 
                     self.request_next()
+                return accepted_part
             else:
                 self.receiving_part = False
+                return False
 
     # Called on incoming resource to send a request for more data
     def request_next(self):

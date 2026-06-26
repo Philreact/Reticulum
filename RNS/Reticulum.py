@@ -1242,7 +1242,12 @@ class Reticulum:
                 if "link_route_migration" in call:
                     operation = call["link_route_migration"]
                     if operation == "confirm":
-                        self.rpc_return(conn, RNS.Transport.confirm_link_route_migration_from_rpc(call["link_id"], call["packet_hash"]))
+                        link_id = call.get("link_id")
+                        packet_hash = call.get("packet_hash")
+                        if isinstance(link_id, (bytes, bytearray)) and isinstance(packet_hash, (bytes, bytearray)):
+                            self.rpc_return(conn, RNS.Transport.confirm_link_route_migration_from_rpc(bytes(link_id), bytes(packet_hash)))
+                        else:
+                            self.rpc_return(conn, False)
 
                 conn.close()
 
@@ -1312,15 +1317,25 @@ class Reticulum:
 
     def confirm_link_route_migration(self, link_id, packet_hash):
         if self.is_connected_to_shared_instance:
+            rpc_connection = None
             try:
                 rpc_connection = self.get_rpc_client()
                 rpc_connection.send_bytes(mp.packb({"link_route_migration": "confirm", "link_id": link_id, "packet_hash": packet_hash}))
+                if not rpc_connection.poll(0.25):
+                    RNS.log("Shared instance RPC timed out while confirming link route migration", RNS.LOG_WARNING)
+                    return False
                 response = mp.unpackb(rpc_connection.recv_bytes())
                 return bool(response)
 
             except Exception as e:
                 RNS.log(f"Shared instance RPC failed while confirming link route migration: {e}", RNS.LOG_ERROR)
                 return False
+            finally:
+                try:
+                    if rpc_connection != None:
+                        rpc_connection.close()
+                except Exception:
+                    pass
 
         else: return RNS.Transport.confirm_link_route_migration_from_rpc(link_id, packet_hash)
 
