@@ -37,6 +37,14 @@ import time
 import sys
 import os
 import RNS
+from collections import deque
+
+QORTAL_RNS_LOCAL_TRACE = os.environ.get("QORTAL_RNS_LOCAL_TRACE", "1") == "1"
+QORTAL_RNS_LOCAL_TRACE_FRAMES = os.environ.get("QORTAL_RNS_LOCAL_TRACE_FRAMES", "0") == "1"
+
+def qortal_tcp_trace_log(stage, detail):
+    if QORTAL_RNS_LOCAL_TRACE:
+        RNS.log(f"[qortal-local-trace] stage=tcp-{stage} {detail}", RNS.LOG_NOTICE)
 
 class TCPInterface():
     HW_MTU            = 262144
@@ -94,6 +102,11 @@ class TCPClientInterface(Interface):
     I2P_PROBE_INTERVAL = 9
     I2P_PROBES = 5
 
+    TX_QUEUE_MAX_BYTES = int(os.environ.get("RNS_TCP_TX_QUEUE_MAX_BYTES", str(4*1024*1024)))
+    TX_QUEUE_WARN_BYTES = int(os.environ.get("RNS_TCP_TX_QUEUE_WARN_BYTES", str(512*1024)))
+    TX_QUEUE_WARN_INTERVAL = 2.0
+    TX_SEND_WARN_SECONDS = float(os.environ.get("RNS_TCP_TX_SEND_WARN_SECONDS", "0.5"))
+
     def __init__(self, owner, configuration, connected_socket=None):
         super().__init__()
 
@@ -126,6 +139,11 @@ class TCPClientInterface(Interface):
         self.writing          = False
         self.online           = False
         self.detached         = False
+        self.tx_queue         = deque()
+        self.tx_queue_bytes   = 0
+        self.tx_queue_lock    = threading.Lock()
+        self.tx_worker_active = False
+        self.tx_queue_last_warned_at = 0.0
         self.kiss_framing     = kiss_framing
         self.i2p_tunneled     = i2p_tunneled
         self.mode             = RNS.Interfaces.Interface.Interface.MODE_FULL
@@ -208,6 +226,7 @@ class TCPClientInterface(Interface):
         
     def detach(self):
         self.online = False
+        self._clear_tx_queue()
         if self.socket != None:
             if hasattr(self.socket, "close"):
                 if callable(self.socket.close):
@@ -309,29 +328,184 @@ class TCPClientInterface(Interface):
                         
             self.owner.inbound(data, self)
 
-    def process_outgoing(self, data):
-        if self.online and not self.detached:
-            # while self.writing:
-            #     time.sleep(0.01)
+    def _frame_outgoing(self, data):
+        if self.kiss_framing:
+            return bytes([KISS.FEND])+bytes([KISS.CMD_DATA])+KISS.escape(data)+bytes([KISS.FEND])
+        else:
+            return bytes([HDLC.FLAG])+HDLC.escape(data)+bytes([HDLC.FLAG])
+
+    def _clear_tx_queue(self):
+        with self.tx_queue_lock:
+            self.tx_queue.clear()
+            self.tx_queue_bytes = 0
+
+    def _stop_tx_worker(self):
+        with self.tx_queue_lock:
+            self.tx_queue.clear()
+            self.tx_queue_bytes = 0
+            self.tx_worker_active = False
+
+    def _close_socket(self):
+        current_socket = self.socket
+        self.socket = None
+        if current_socket != None:
+            try:
+                current_socket.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
 
             try:
+                current_socket.close()
+            except Exception:
+                pass
+            qortal_tcp_trace_log("tx-socket-closed", f"interface={self}")
+
+    def _handle_tx_failure(self):
+        self.writing = False
+        self._stop_tx_worker()
+        self.online = False
+        self._close_socket()
+
+        if self.initiator and not self.detached:
+            if not self.reconnecting:
+                qortal_tcp_trace_log(
+                    "tx-reconnect-start",
+                    f"interface={self} initiator={self.initiator} detached={self.detached}"
+                )
+                thread = threading.Thread(target=self.reconnect)
+                thread.daemon = True
+                thread.start()
+            else:
+                qortal_tcp_trace_log(
+                    "tx-reconnect-suppressed",
+                    f"interface={self} reason=already_reconnecting"
+                )
+        else:
+            qortal_tcp_trace_log(
+                "tx-teardown",
+                f"interface={self} initiator={self.initiator} detached={self.detached}"
+            )
+            self.teardown()
+
+    def _start_tx_worker_locked(self):
+        if self.tx_worker_active:
+            return
+        self.tx_worker_active = True
+        thread = threading.Thread(target=self._tx_worker)
+        thread.daemon = True
+        thread.start()
+
+    def _tx_worker(self):
+        while True:
+            with self.tx_queue_lock:
+                if len(self.tx_queue) == 0:
+                    self.tx_worker_active = False
+                    return
+                frame = self.tx_queue.popleft()
+                self.tx_queue_bytes -= len(frame)
+
+            try:
+                if not self.online or self.detached or self.socket == None:
+                    raise IOError("TCP interface is not online")
+
                 self.writing = True
-
-                if self.kiss_framing:
-                    data = bytes([KISS.FEND])+bytes([KISS.CMD_DATA])+KISS.escape(data)+bytes([KISS.FEND])
-                else:
-                    data = bytes([HDLC.FLAG])+HDLC.escape(data)+bytes([HDLC.FLAG])
-
-                self.socket.sendall(data)
+                started_at = time.monotonic()
+                self.socket.sendall(frame)
+                duration = time.monotonic() - started_at
                 self.writing = False
-                self.txb += len(data)
+
+                self.txb += len(frame)
                 if hasattr(self, "parent_interface") and self.parent_interface != None:
-                    self.parent_interface.txb += len(data)
+                    self.parent_interface.txb += len(frame)
+
+                if duration >= TCPClientInterface.TX_SEND_WARN_SECONDS:
+                    RNS.log(
+                        "TCP transmit worker send delay on "+str(self)+": "+
+                        str(round(duration, 3))+"s for "+str(len(frame))+" bytes",
+                        RNS.LOG_WARNING
+                    )
+                    qortal_tcp_trace_log(
+                        "tx-send-delay",
+                        f"interface={self} duration_ms={duration*1000.0:.3f} frame_bytes={len(frame)}"
+                    )
 
             except Exception as e:
-                RNS.log("Exception occurred while transmitting via "+str(self)+", tearing down interface", RNS.LOG_ERROR)
+                RNS.log("Exception occurred while transmitting via "+str(self)+", recovering interface", RNS.LOG_ERROR)
                 RNS.log("The contained exception was: "+str(e), RNS.LOG_ERROR)
-                self.teardown()
+                qortal_tcp_trace_log(
+                    "tx-failure",
+                    f"interface={self} error={e} initiator={self.initiator} detached={self.detached} "
+                    f"queued_bytes={self.tx_queue_bytes}"
+                )
+                self._handle_tx_failure()
+                return
+
+    def process_outgoing(self, data):
+        if self.online and not self.detached:
+            try:
+                frame = self._frame_outgoing(data)
+                should_teardown = False
+
+                with self.tx_queue_lock:
+                    queued_after = self.tx_queue_bytes + len(frame)
+                    if queued_after > TCPClientInterface.TX_QUEUE_MAX_BYTES:
+                        should_teardown = True
+                    else:
+                        self.tx_queue.append(frame)
+                        self.tx_queue_bytes = queued_after
+                        if QORTAL_RNS_LOCAL_TRACE_FRAMES:
+                            qortal_tcp_trace_log(
+                                "tx-enqueue",
+                                f"interface={self} frame_bytes={len(frame)} queued_bytes={self.tx_queue_bytes} "
+                                f"queued_chunks={len(self.tx_queue)} worker_active={self.tx_worker_active}"
+                            )
+
+                        now = time.monotonic()
+                        if (
+                            self.tx_queue_bytes >= TCPClientInterface.TX_QUEUE_WARN_BYTES and
+                            now - self.tx_queue_last_warned_at >= TCPClientInterface.TX_QUEUE_WARN_INTERVAL
+                        ):
+                            self.tx_queue_last_warned_at = now
+                            RNS.log(
+                                "TCP transmit queue delayed for "+str(self)+": "+
+                                "queued_bytes="+str(self.tx_queue_bytes)+" queued_chunks="+str(len(self.tx_queue)),
+                                RNS.LOG_WARNING
+                            )
+                            qortal_tcp_trace_log(
+                                "tx-queue-delayed",
+                                f"interface={self} queued_bytes={self.tx_queue_bytes} "
+                                f"queued_chunks={len(self.tx_queue)} worker_active={self.tx_worker_active}"
+                            )
+
+                        self._start_tx_worker_locked()
+
+                if should_teardown:
+                    RNS.log(
+                        "TCP transmit queue over limit for "+str(self)+": "+
+                        "queued_bytes="+str(self.tx_queue_bytes)+" frame_bytes="+str(len(frame))+
+                        " max_bytes="+str(TCPClientInterface.TX_QUEUE_MAX_BYTES),
+                        RNS.LOG_ERROR
+                    )
+                    qortal_tcp_trace_log(
+                        "tx-queue-over-limit",
+                        f"interface={self} queued_bytes={self.tx_queue_bytes} frame_bytes={len(frame)} "
+                        f"max_bytes={TCPClientInterface.TX_QUEUE_MAX_BYTES} worker_active={self.tx_worker_active}"
+                    )
+                    self._handle_tx_failure()
+
+            except Exception as e:
+                RNS.log("Exception occurred while transmitting via "+str(self)+", recovering interface", RNS.LOG_ERROR)
+                RNS.log("The contained exception was: "+str(e), RNS.LOG_ERROR)
+                qortal_tcp_trace_log(
+                    "tx-process-failure",
+                    f"interface={self} error={e} initiator={self.initiator} detached={self.detached}"
+                )
+                self._handle_tx_failure()
+        elif QORTAL_RNS_LOCAL_TRACE_FRAMES:
+            qortal_tcp_trace_log(
+                "tx-drop-not-online",
+                f"interface={self} online={self.online} detached={self.detached}"
+            )
 
 
     def read_loop(self):
@@ -420,6 +594,7 @@ class TCPClientInterface(Interface):
                 self.teardown()
 
     def teardown(self):
+        self._clear_tx_queue()
         if self.initiator and not self.detached:
             RNS.log("The interface "+str(self)+" experienced an unrecoverable error and is being torn down. Restart Reticulum to attempt to open this interface again.", RNS.LOG_ERROR)
             if RNS.Reticulum.panic_on_interface_error:

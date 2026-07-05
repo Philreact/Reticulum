@@ -54,6 +54,7 @@ QORTAL_RNS_LINK_MIGRATION_TRACE = os.environ.get(
     "QORTAL_RNS_LINK_MIGRATION_TRACE",
     os.environ.get("QORTAL_RNS_LINK_ROUTE_TRACE", "1")
 ) == "1"
+QORTAL_RNS_LOCAL_TRACE = os.environ.get("QORTAL_RNS_LOCAL_TRACE", "1") == "1"
 QORTAL_RNS_LINK_INGRESS_INTERVAL = float(os.environ.get(
     "QORTAL_RNS_LINK_INGRESS_INTERVAL",
     os.environ.get("QORTAL_RNS_AUDIO_INGRESS_INTERVAL", "5.0")
@@ -1488,6 +1489,11 @@ class Transport:
             pass
 
     @staticmethod
+    def qortal_log_local_trace(stage, detail):
+        if QORTAL_RNS_LOCAL_TRACE:
+            RNS.log(f"[qortal-local-trace] stage={stage} {detail}", RNS.LOG_NOTICE)
+
+    @staticmethod
     def qortal_link_lifecycle_summary(link_id):
         try:
             if not isinstance(link_id, (bytes, bytearray)):
@@ -2264,6 +2270,14 @@ class Transport:
                 return False
 
             link_entry[IDX_LT_TIMESTAMP] = now
+            local_interface = candidate.get("local_interface")
+            if Transport.is_local_client_interface(local_interface):
+                Transport.local_link_owners[bytes(link_id)] = local_interface
+                Transport.qortal_log_local_trace(
+                    "link-owner-route-migrated",
+                    f"link_id={bytes(link_id).hex()} interface={local_interface} local_side={local_side} "
+                    f"packet={bytes(packet_hash).hex()[:16] if isinstance(packet_hash, (bytes, bytearray)) else 'n/a'}"
+                )
             Transport.link_route_last_migrated_at[bytes(link_id)] = now
 
         Transport.qortal_log_link_route_migration(
@@ -3117,6 +3131,18 @@ class Transport:
                                             new_raw += struct.pack("!B", packet.hops)
                                             new_raw += packet.raw[2:]
                                             Transport.link_table[packet.destination_hash][IDX_LT_VALIDATED] = True
+                                            if Transport.is_local_client_interface(link_entry[IDX_LT_NH_IF]):
+                                                Transport.local_link_owners[bytes(packet.destination_hash)] = link_entry[IDX_LT_NH_IF]
+                                                Transport.qortal_log_local_trace(
+                                                    "link-owner-proof-validated",
+                                                    f"link_id={bytes(packet.destination_hash).hex()} interface={link_entry[IDX_LT_NH_IF]}"
+                                                )
+                                                Transport.qortal_log_link_route_migration(
+                                                    "local_link_validated_confirmed",
+                                                    link_id=packet.destination_hash,
+                                                    new_interface=link_entry[IDX_LT_NH_IF],
+                                                    reason="local_client_link_proof",
+                                                )
                                             Transport.transmit(link_entry[IDX_LT_RCVD_IF], new_raw)
                                             if not Transport.owner.is_connected_to_shared_instance:
                                                 RNS.Identity._used_destination_data(link_entry[IDX_LT_DSTHASH])
