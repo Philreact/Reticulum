@@ -483,6 +483,7 @@ class Transport:
 
     @staticmethod
     def remove_interface(interface):
+        Transport._purge_link_route_state_for_interface(interface, reason="interface_removed")
         with Transport.interfaces_lock:
             if interface in Transport.interfaces:
                 Transport.interfaces.remove(interface)
@@ -577,6 +578,7 @@ class Transport:
                         for link in Transport.pending_links:
                             if link.status == RNS.Link.CLOSED:
                                 Transport.qortal_note_link_lifecycle(link, event="pending_cleanup", reason="closed_pending_removed")
+                                Transport._purge_link_route_state(link.link_id, reason="closed_pending_removed")
                                 # If we are not a Transport Instance, finding a pending link
                                 # that was never activated will trigger an expiry of the path
                                 # to the destination, and an attempt to rediscover the path.
@@ -608,6 +610,7 @@ class Transport:
                         for closed_link in closed_links:
                             Transport.qortal_note_link_lifecycle(closed_link, event="active_cleanup", reason="closed_active_removed")
                             Transport.active_links.remove(closed_link)
+                            Transport._purge_link_route_state(closed_link.link_id, reason="closed_active_removed")
 
                     Transport.links_last_checked = time.time()
 
@@ -933,8 +936,7 @@ class Transport:
                     i = 0
                     with Transport.link_table_lock:
                         for link_id in stale_links:
-                            Transport.link_table.pop(link_id)
-                            Transport.local_link_owners.pop(bytes(link_id), None)
+                            Transport._purge_link_route_state(link_id, reason="stale_link_table", lock_held=True)
                             i += 1
 
                     if i > 0:
@@ -2021,6 +2023,89 @@ class Transport:
             return False
 
     @staticmethod
+    def _purge_link_route_state(link_id, reason="stale_link_route", lock_held=False):
+        if link_id == None:
+            return False
+
+        try:
+            link_id = bytes(link_id)
+        except Exception:
+            return False
+
+        removed_route = False
+        if lock_held:
+            removed_route = Transport.link_table.pop(link_id, None) != None
+        else:
+            with Transport.link_table_lock:
+                removed_route = Transport.link_table.pop(link_id, None) != None
+
+        removed_owner = Transport.local_link_owners.pop(link_id, None) != None
+
+        removed_candidates = 0
+        with Transport.link_route_candidate_lock:
+            stale_keys = [
+                key for key, candidate in Transport.link_route_candidates.items()
+                if candidate.get("link_id") == link_id
+            ]
+            for key in stale_keys:
+                Transport.link_route_candidates.pop(key, None)
+                removed_candidates += 1
+
+        removed_grace = 0
+        with Transport.link_route_grace_lock:
+            removed_grace = len(Transport.link_route_grace_table.pop(link_id, []) or [])
+
+        removed_migration = Transport.link_route_last_migrated_at.pop(link_id, None) != None
+
+        if removed_route or removed_owner or removed_candidates or removed_grace or removed_migration:
+            Transport.qortal_log_link_route_migration(
+                "stale_link_route_purged",
+                link_id=link_id,
+                reason=reason,
+                result=(
+                    f"route={str(removed_route).lower()} owner={str(removed_owner).lower()} "
+                    f"candidates={removed_candidates} grace={removed_grace} "
+                    f"migration={str(removed_migration).lower()}"
+                ),
+            )
+            return True
+
+        return False
+
+    @staticmethod
+    def _purge_link_route_state_for_interface(interface, reason="interface_removed"):
+        if interface == None:
+            return 0
+
+        stale_link_ids = []
+        with Transport.link_table_lock:
+            for link_id, link_entry in list(Transport.link_table.items()):
+                if link_entry[IDX_LT_RCVD_IF] == interface or link_entry[IDX_LT_NH_IF] == interface:
+                    stale_link_ids.append(bytes(link_id))
+
+        purged = 0
+        for link_id in stale_link_ids:
+            if Transport._purge_link_route_state(link_id, reason=reason):
+                purged += 1
+
+        stale_owner_ids = []
+        for link_id, owner_interface in list(Transport.local_link_owners.items()):
+            if owner_interface == interface:
+                stale_owner_ids.append(bytes(link_id))
+
+        for link_id in stale_owner_ids:
+            if Transport._purge_link_route_state(link_id, reason=reason):
+                purged += 1
+
+        if purged > 0:
+            Transport.qortal_log_local_trace(
+                "link-owner-interface-purged",
+                f"interface={interface} links={purged} reason={reason}"
+            )
+
+        return purged
+
+    @staticmethod
     def _trim_link_route_candidates_locked():
         while len(Transport.link_route_candidates) > RNS_LINK_ROUTE_MIGRATION_MAX_CANDIDATES:
             try:
@@ -3072,6 +3157,24 @@ class Transport:
                                     while packet.packet_hash in Transport.packet_hashlist:
                                         Transport.packet_hashlist.remove(packet.packet_hash)
                         if not matched_link:
+                            stale_local_link_route = False
+                            with Transport.link_table_lock:
+                                link_entry = Transport.link_table.get(packet.destination_hash)
+                                if link_entry != None:
+                                    _local_side, local_interface = Transport._link_route_local_client_side(link_entry)
+                                    if local_interface != None:
+                                        stale_local_link_route = True
+
+                            if stale_local_link_route:
+                                with Transport.pending_links_lock:
+                                    for link in Transport.pending_links:
+                                        if getattr(link, "link_id", None) == packet.destination_hash and getattr(link, "status", None) != RNS.Link.CLOSED:
+                                            stale_local_link_route = False
+                                            break
+
+                            if stale_local_link_route:
+                                Transport._purge_link_route_state(packet.destination_hash, reason="no_active_local_owner")
+
                             if Transport.from_local_client(packet):
                                 with Transport.link_table_lock:
                                     has_link_route = packet.destination_hash in Transport.link_table
