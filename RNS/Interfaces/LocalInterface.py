@@ -53,8 +53,9 @@ QORTAL_RNS_LOCAL_RX_QUEUE_WARN_BYTES = int(os.environ.get("QORTAL_RNS_LOCAL_RX_Q
 QORTAL_RNS_LOCAL_RX_QUEUE_HIGH_BYTES = int(os.environ.get("QORTAL_RNS_LOCAL_RX_QUEUE_HIGH_BYTES", str(512*1024)))
 QORTAL_RNS_LOCAL_RX_QUEUE_LOW_BYTES = int(os.environ.get("QORTAL_RNS_LOCAL_RX_QUEUE_LOW_BYTES", str(128*1024)))
 QORTAL_RNS_LOCAL_RX_QUEUE_HARD_BYTES = int(os.environ.get("QORTAL_RNS_LOCAL_RX_QUEUE_HARD_BYTES", str(4*1024*1024)))
-QORTAL_RNS_LOCAL_RX_BATCH_FRAMES = int(os.environ.get("QORTAL_RNS_LOCAL_RX_BATCH_FRAMES", "64"))
-QORTAL_RNS_LOCAL_RX_BATCH_SECONDS = float(os.environ.get("QORTAL_RNS_LOCAL_RX_BATCH_SECONDS", "0.004"))
+QORTAL_RNS_LOCAL_RX_BATCH_FRAMES = int(os.environ.get("QORTAL_RNS_LOCAL_RX_BATCH_FRAMES", "256"))
+QORTAL_RNS_LOCAL_RX_BATCH_SECONDS = float(os.environ.get("QORTAL_RNS_LOCAL_RX_BATCH_SECONDS", "0.016"))
+QORTAL_RNS_LOCAL_RX_CONTINUE_FRONT = os.environ.get("QORTAL_RNS_LOCAL_RX_CONTINUE_FRONT", "1") != "0"
 QORTAL_RNS_LOCAL_RX_QUEUE_WARN_AGE_MS = int(os.environ.get("QORTAL_RNS_LOCAL_RX_QUEUE_WARN_AGE_MS", "100"))
 QORTAL_RNS_LOCAL_RX_QUEUE_ERROR_AGE_MS = int(os.environ.get("QORTAL_RNS_LOCAL_RX_QUEUE_ERROR_AGE_MS", "500"))
 QORTAL_RNS_LOCAL_RX_INLINE_WARN_MS = int(os.environ.get("QORTAL_RNS_LOCAL_RX_INLINE_WARN_MS", "50"))
@@ -993,6 +994,20 @@ class LocalClientInterface(Interface):
         self._maybe_update_epoll_receive_interest_locked()
         self.epoll_receive_queue_condition.notify()
 
+    def _enqueue_epoll_receive_continue_locked(self, now):
+        self._ensure_epoll_receive_worker_locked()
+        if self.epoll_receive_continue_queued:
+            return
+
+        self.epoll_receive_continue_queued = True
+        item = (now, _LOCAL_RX_CONTINUE)
+        if QORTAL_RNS_LOCAL_RX_CONTINUE_FRONT:
+            # Buffered complete frames are already local work; drain them before newer socket chunks.
+            self.epoll_receive_queue.appendleft(item)
+        else:
+            self.epoll_receive_queue.append(item)
+        self.epoll_receive_queue_condition.notify()
+
     def _enqueue_epoll_receive(self, data_in):
         now = time.monotonic()
         with self.epoll_receive_queue_condition:
@@ -1009,6 +1024,19 @@ class LocalClientInterface(Interface):
     def _process_epoll_receive_chunk(self, data_in, queued_at=None):
         started_at = time.monotonic()
         is_continue = data_in is _LOCAL_RX_CONTINUE
+        if queued_at != None and qortal_local_trace_enabled(self) and is_continue:
+            queue_age_ms = (started_at - queued_at) * 1000.0
+            if QORTAL_RNS_LOCAL_TRACE_FRAMES or queue_age_ms >= QORTAL_RNS_LOCAL_TRACE_DELAY_MS:
+                with self.epoll_receive_queue_condition:
+                    queued_chunks = len(self.epoll_receive_queue)
+                    queued_bytes = self.epoll_receive_queue_bytes
+                qortal_local_trace_log(
+                    "local-rx-continue-drain",
+                    f"role={qortal_local_trace_role(self)} interface={self} "
+                    f"queue_age_ms={queue_age_ms:.3f} frame_buffer={len(self.frame_buffer)} "
+                    f"queued_chunks={queued_chunks} queued_bytes={queued_bytes}"
+                )
+
         if queued_at != None and qortal_local_trace_enabled(self) and not is_continue:
             queue_age_ms = (started_at - queued_at) * 1000.0
             if QORTAL_RNS_LOCAL_TRACE_FRAMES or queue_age_ms >= QORTAL_RNS_LOCAL_RX_QUEUE_WARN_AGE_MS:
@@ -1047,17 +1075,23 @@ class LocalClientInterface(Interface):
                 max_seconds=QORTAL_RNS_LOCAL_RX_BATCH_SECONDS,
             )
             if more_frames:
+                now = time.monotonic()
                 if qortal_local_trace_enabled(self):
+                    with self.epoll_receive_queue_condition:
+                        queued_chunks = len(self.epoll_receive_queue)
+                        queued_bytes = self.epoll_receive_queue_bytes
+                        continue_queued = self.epoll_receive_continue_queued
                     qortal_local_trace_log(
                         "local-rx-batch-yield",
                         f"role={qortal_local_trace_role(self)} interface={self} "
-                        f"frames={processed_frames} frame_buffer={len(self.frame_buffer)}"
+                        f"frames={processed_frames} frame_buffer={len(self.frame_buffer)} "
+                        f"queued_chunks={queued_chunks} queued_bytes={queued_bytes} "
+                        f"continue_queued={continue_queued} continue_front={QORTAL_RNS_LOCAL_RX_CONTINUE_FRONT} "
+                        f"batch_frames={QORTAL_RNS_LOCAL_RX_BATCH_FRAMES} "
+                        f"batch_seconds={QORTAL_RNS_LOCAL_RX_BATCH_SECONDS:.3f}"
                     )
                 with self.epoll_receive_queue_condition:
-                    if not self.epoll_receive_continue_queued:
-                        self.epoll_receive_continue_queued = True
-                        self.epoll_receive_queue.append((time.monotonic(), _LOCAL_RX_CONTINUE))
-                        self.epoll_receive_queue_condition.notify()
+                    self._enqueue_epoll_receive_continue_locked(now)
 
         except Exception as e:
             self.online = False
