@@ -29,7 +29,6 @@
 # SOFTWARE.
 
 from RNS.Interfaces.Interface import Interface
-from RNS.Interfaces.BackboneInterface import BackboneInterface
 import socketserver
 import threading
 import selectors
@@ -157,14 +156,15 @@ class LocalSelectorManager:
     supported_cache = None
     client_filenos = {}
     listener_filenos = {}
+    wakeup_read = None
+    wakeup_write = None
+    wakeup_registered = False
 
     @staticmethod
     def supported():
         if not QORTAL_RNS_LOCAL_SELECTOR_IO_V2:
             return False
-        if RNS.vendor.platformutils.use_epoll():
-            return False
-        if not RNS.vendor.platformutils.is_darwin():
+        if not RNS.vendor.platformutils.use_epoll() and not RNS.vendor.platformutils.is_darwin():
             return False
         if LocalSelectorManager.supported_cache != None:
             return LocalSelectorManager.supported_cache
@@ -173,15 +173,15 @@ class LocalSelectorManager:
             selector = selectors.DefaultSelector()
             backend_name = selector.__class__.__name__
             selector.close()
-            supported = backend_name == "KqueueSelector"
+            supported = backend_name in ("EpollSelector", "KqueueSelector")
             LocalSelectorManager.supported_cache = supported
             if not LocalSelectorManager.logged_backend:
                 LocalSelectorManager.logged_backend = True
                 if supported:
                     if QORTAL_RNS_LOCAL_TRACE:
-                        RNS.log(f"LocalInterface selector backend={backend_name} default_on=True", RNS.LOG_NOTICE)
+                        RNS.log(f"LocalInterface dedicated local I/O backend={backend_name} default_on=True", RNS.LOG_NOTICE)
                 else:
-                    RNS.log(f"LocalInterface selector backend={backend_name} default_on=False reason=not_kqueue", RNS.LOG_WARNING)
+                    RNS.log(f"LocalInterface selector backend={backend_name} default_on=False reason=unsupported_selector", RNS.LOG_WARNING)
             return supported
 
         except Exception as e:
@@ -195,6 +195,61 @@ class LocalSelectorManager:
     def ensure_selector():
         if LocalSelectorManager.selector == None:
             LocalSelectorManager.selector = selectors.DefaultSelector()
+            if not LocalSelectorManager.logged_backend:
+                LocalSelectorManager.logged_backend = True
+                if QORTAL_RNS_LOCAL_TRACE:
+                    RNS.log(
+                        f"LocalInterface dedicated local I/O backend={LocalSelectorManager.selector.__class__.__name__} active=True",
+                        RNS.LOG_NOTICE
+                    )
+        if not LocalSelectorManager.wakeup_registered:
+            LocalSelectorManager.ensure_wakeup()
+
+    @staticmethod
+    def ensure_wakeup():
+        if LocalSelectorManager.wakeup_registered:
+            return
+        try:
+            LocalSelectorManager.wakeup_read, LocalSelectorManager.wakeup_write = socket.socketpair()
+            LocalSelectorManager.wakeup_read.setblocking(False)
+            LocalSelectorManager.wakeup_write.setblocking(False)
+            LocalSelectorManager.selector.register(LocalSelectorManager.wakeup_read, selectors.EVENT_READ, data=("wakeup",))
+            LocalSelectorManager.wakeup_registered = True
+        except Exception as e:
+            RNS.log(f"LocalInterface selector wakeup unavailable: {e}", RNS.LOG_WARNING)
+
+    @staticmethod
+    def wake():
+        if LocalSelectorManager.wakeup_write == None:
+            return
+        try:
+            LocalSelectorManager.wakeup_write.send(b"\x00")
+        except BlockingIOError:
+            pass
+        except OSError as e:
+            if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EBADF):
+                RNS.log(f"Error while waking LocalInterface selector: {e}", RNS.LOG_DEBUG)
+        except Exception as e:
+            RNS.log(f"Error while waking LocalInterface selector: {e}", RNS.LOG_DEBUG)
+
+    @staticmethod
+    def drain_wakeup():
+        if LocalSelectorManager.wakeup_read == None:
+            return
+        while True:
+            try:
+                if len(LocalSelectorManager.wakeup_read.recv(1024)) == 0:
+                    break
+            except BlockingIOError:
+                break
+            except OSError as e:
+                if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    break
+                RNS.log(f"Error while draining LocalInterface selector wakeup: {e}", RNS.LOG_DEBUG)
+                break
+            except Exception as e:
+                RNS.log(f"Error while draining LocalInterface selector wakeup: {e}", RNS.LOG_DEBUG)
+                break
 
     @staticmethod
     def start():
@@ -222,6 +277,7 @@ class LocalSelectorManager:
                     LocalSelectorManager.selector.modify(sock, events, data=data)
                 except KeyError:
                     LocalSelectorManager.selector.register(sock, events, data=data)
+                LocalSelectorManager.wake()
             return True
 
         except OSError as e:
@@ -242,6 +298,7 @@ class LocalSelectorManager:
                         LocalSelectorManager.selector.unregister(sock)
                     except KeyError:
                         pass
+                    LocalSelectorManager.wake()
         except OSError as e:
             if e.errno in (errno.EBADF, errno.ENOENT):
                 RNS.log(f"Ignoring stale selector unregister in {context}: {e}", RNS.LOG_DEBUG)
@@ -249,6 +306,23 @@ class LocalSelectorManager:
                 RNS.log(f"Error while unregistering local selector socket in {context}: {e}", RNS.LOG_DEBUG)
         except Exception as e:
             RNS.log(f"Error while unregistering local selector socket in {context}: {e}", RNS.LOG_DEBUG)
+
+    @staticmethod
+    def deregister_listeners(owner_interface=None):
+        stale_filenos = []
+        with LocalSelectorManager.lock:
+            for fileno, (interface, server_socket) in list(LocalSelectorManager.listener_filenos.items()):
+                if owner_interface == None or interface == owner_interface:
+                    stale_filenos.append((fileno, server_socket))
+
+        for fileno, server_socket in stale_filenos:
+            LocalSelectorManager._unregister(server_socket, "deregister_listener")
+            try:
+                server_socket.close()
+            except Exception as e:
+                RNS.log(f"Error while closing local selector listener socket: {e}", RNS.LOG_DEBUG)
+            with LocalSelectorManager.lock:
+                LocalSelectorManager.listener_filenos.pop(fileno, None)
 
     @staticmethod
     def add_listener(interface, bind_address, socket_type=socket.AF_INET):
@@ -347,6 +421,11 @@ class LocalSelectorManager:
                 if time.monotonic() - read_started >= QORTAL_RNS_LOCAL_RX_READ_MAX_SECONDS:
                     break
             else:
+                if qortal_local_trace_enabled(interface):
+                    qortal_local_trace_log(
+                        "local-socket-closed",
+                        f"role={qortal_local_trace_role(interface)} interface={interface} fileno={client_socket.fileno()}"
+                    )
                 LocalSelectorManager._remove_client(interface, client_socket)
                 try: client_socket.close()
                 except Exception as e: RNS.log(f"Error while closing selector client socket for {interface}: {e}", RNS.LOG_WARNING)
@@ -459,10 +538,14 @@ class LocalSelectorManager:
             try:
                 with LocalSelectorManager.lock:
                     selector = LocalSelectorManager.selector
+                loop_started = time.monotonic()
                 events = selector.select(QORTAL_RNS_LOCAL_SELECTOR_POLL_SECONDS)
                 for key, mask in events:
                     data = key.data
                     if data == None:
+                        continue
+                    if data[0] == "wakeup":
+                        LocalSelectorManager.drain_wakeup()
                         continue
                     if data[0] == "client":
                         interface = data[1]
@@ -479,6 +562,14 @@ class LocalSelectorManager:
                         owner_interface, server_socket = data[1], data[2]
                         if mask & selectors.EVENT_READ:
                             LocalSelectorManager._handle_listener(owner_interface, server_socket)
+
+                if QORTAL_RNS_LOCAL_TRACE and len(events) > 0:
+                    duration_ms = (time.monotonic() - loop_started) * 1000.0
+                    if duration_ms >= QORTAL_RNS_LOCAL_TRACE_DELAY_MS:
+                        qortal_local_trace_log(
+                            "local-selector-loop-delay",
+                            f"events={len(events)} duration_ms={duration_ms:.3f}"
+                        )
 
             except Exception as e:
                 RNS.log(f"LocalInterface selector backend error: {e}", RNS.LOG_ERROR)
@@ -601,8 +692,8 @@ class LocalClientInterface(Interface):
         self.never_connected = False
 
         if RNS.vendor.platformutils.is_android(): self.phy_keepalive = True
-        if self.epoll_backend: BackboneInterface.add_client_socket(self.socket, self)
-        elif self.selector_backend: LocalSelectorManager.add_client_socket(self.socket, self)
+        if self.epoll_backend or self.selector_backend:
+            LocalSelectorManager.add_client_socket(self.socket, self)
 
         return True
 
@@ -627,9 +718,7 @@ class LocalClientInterface(Interface):
                     RNS.log("Reconnected socket for "+str(self)+".", RNS.LOG_INFO)
 
                 self.reconnecting = False
-                if self.selector_backend:
-                    LocalSelectorManager.add_client_socket(self.socket, self)
-                elif not self.epoll_backend:
+                if not self.epoll_backend and not self.selector_backend:
                     thread = threading.Thread(target=self.read_loop)
                     thread.daemon = True
                     thread.start()
@@ -650,7 +739,7 @@ class LocalClientInterface(Interface):
             try:
                 if self.epoll_backend:
                     self.append_transmit_frame(bytes([HDLC.FLAG])+bytes([HDLC.FLAG]))
-                    BackboneInterface.tx_ready(self)
+                    LocalSelectorManager.tx_ready(self)
 
                 elif self.selector_backend:
                     self.append_transmit_frame(bytes([HDLC.FLAG])+bytes([HDLC.FLAG]))
@@ -802,10 +891,7 @@ class LocalClientInterface(Interface):
                                 f"frame_len={len(frame)} tx_ready=yes backend={'epoll' if self.epoll_backend else 'selector'} "
                                 f"{qortal_local_trace_packet_detail(qortal_raw_packet)}"
                             )
-                    if self.epoll_backend:
-                        BackboneInterface.tx_ready(self)
-                    else:
-                        LocalSelectorManager.tx_ready(self)
+                    LocalSelectorManager.tx_ready(self)
 
                 else:
                     self.writing = True
@@ -948,10 +1034,7 @@ class LocalClientInterface(Interface):
         if not self.epoll_receive_paused and self.epoll_receive_queue_bytes >= QORTAL_RNS_LOCAL_RX_QUEUE_HIGH_BYTES:
             try:
                 self.epoll_receive_paused = True
-                if self.epoll_backend:
-                    BackboneInterface.set_rx_ready(self, False)
-                else:
-                    LocalSelectorManager.set_rx_ready(self, False)
+                LocalSelectorManager.set_rx_ready(self, False)
                 RNS.log(
                     f"LocalInterface receive queue paused for {self}: "
                     f"queued_bytes={self.epoll_receive_queue_bytes} queued_chunks={len(self.epoll_receive_queue)}",
@@ -964,10 +1047,7 @@ class LocalClientInterface(Interface):
         if self.epoll_receive_paused and self.epoll_receive_queue_bytes <= QORTAL_RNS_LOCAL_RX_QUEUE_LOW_BYTES:
             try:
                 self.epoll_receive_paused = False
-                if self.epoll_backend:
-                    BackboneInterface.set_rx_ready(self, True)
-                else:
-                    LocalSelectorManager.set_rx_ready(self, True)
+                LocalSelectorManager.set_rx_ready(self, True)
                 RNS.log(
                     f"LocalInterface receive queue resumed for {self}: "
                     f"queued_bytes={self.epoll_receive_queue_bytes} queued_chunks={len(self.epoll_receive_queue)}",
@@ -1199,7 +1279,7 @@ class LocalClientInterface(Interface):
                     self.detached = True
 
                     try:
-                        if self.selector_backend and self.socket != None:
+                        if (self.epoll_backend or self.selector_backend) and self.socket != None:
                             LocalSelectorManager._remove_client(self, self.socket)
                     except Exception as e:
                         RNS.log("Error while unregistering selector socket for "+str(self)+": "+str(e))
@@ -1224,7 +1304,7 @@ class LocalClientInterface(Interface):
         self.IN = False
 
         try:
-            if self.selector_backend and self.socket != None:
+            if (self.epoll_backend or self.selector_backend) and self.socket != None:
                 LocalSelectorManager._remove_client(self, self.socket)
         except Exception as e:
             RNS.log("Error while unregistering selector socket for "+str(self)+": "+str(e), RNS.LOG_DEBUG)
@@ -1287,10 +1367,7 @@ class LocalServerInterface(Interface):
 
             self.owner = owner
             self.is_local_shared_instance = True
-            if self.epoll_backend:
-                BackboneInterface.add_listener(self, self.socket_path, socket_type=socket.AF_UNIX)
-            else:
-                LocalSelectorManager.add_listener(self, self.socket_path, socket_type=socket.AF_UNIX)
+            LocalSelectorManager.add_listener(self, self.socket_path, socket_type=socket.AF_UNIX)
 
         elif bindport != None:
             self.receives = True
@@ -1301,8 +1378,7 @@ class LocalServerInterface(Interface):
             self.is_local_shared_instance = True
 
             address = (self.bind_ip, self.bind_port)
-            if self.epoll_backend: BackboneInterface.add_listener(self, address)
-            elif self.selector_backend: LocalSelectorManager.add_listener(self, address)
+            if self.epoll_backend or self.selector_backend: LocalSelectorManager.add_listener(self, address)
             else:
                 def handlerFactory(callback):
                     def createHandler(*args, **keys):
@@ -1357,10 +1433,7 @@ class LocalServerInterface(Interface):
                     f"role={qortal_local_trace_role(spawned_interface)} interface={spawned_interface} "
                     f"parent={self} clients={self.clients + 1}"
                 )
-            if self.epoll_backend:
-                BackboneInterface.add_client_socket(client_socket, spawned_interface)
-            else:
-                LocalSelectorManager.add_client_socket(client_socket, spawned_interface)
+            LocalSelectorManager.add_client_socket(client_socket, spawned_interface)
             self.clients += 1
             return True
 
@@ -1389,6 +1462,12 @@ class LocalServerInterface(Interface):
 
     def process_outgoing(self, data):
         pass
+
+    def detach(self):
+        self.online = False
+        self.detached = True
+        if self.epoll_backend or self.selector_backend:
+            LocalSelectorManager.deregister_listeners(self)
 
     def received_announce(self, from_spawned=False):
         if from_spawned: self.ia_freq_deque.append(time.time())
