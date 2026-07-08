@@ -634,6 +634,8 @@ class LocalClientInterface(Interface):
         self.epoll_receive_worker_thread = None
         self.epoll_receive_worker_generation = 0
         self.epoll_receive_processing = False
+        self.epoll_receive_processing_token = 0
+        self.epoll_receive_next_processing_token = 0
         self.epoll_receive_processing_started_at = 0.0
         self.epoll_receive_processing_thread_ident = None
         self.epoll_receive_processing_len = 0
@@ -1300,31 +1302,49 @@ class LocalClientInterface(Interface):
                 self.teardown()
 
     def _frame_buffer_has_complete_frame(self):
-        frame_start = self.frame_buffer.find(HDLC.FLAG)
+        return self._buffer_has_complete_frame(self.frame_buffer)
+
+    def _buffer_has_complete_frame(self, frame_buffer):
+        frame_start = frame_buffer.find(HDLC.FLAG)
         if frame_start == -1:
             return False
-        return self.frame_buffer.find(HDLC.FLAG, frame_start+1) != -1
+        return frame_buffer.find(HDLC.FLAG, frame_start+1) != -1
 
-    def handle_hdlc(self, data_in, max_frames=None, max_seconds=None):
+    def _epoll_receive_token_is_current(self, processing_token):
+        if processing_token == None:
+            return True
+        with self.epoll_receive_queue_condition:
+            return self.epoll_receive_processing_token == processing_token
+
+    def handle_hdlc(self, data_in, max_frames=None, max_seconds=None, processing_token=None):
         started_at = time.monotonic()
         processed_frames = 0
+        frame_buffer = self.frame_buffer
         if len(data_in) > 0:
-            self.frame_buffer.extend(data_in)
+            frame_buffer.extend(data_in)
         flags_remaining = True
         while flags_remaining:
             if max_frames != None and processed_frames >= max_frames:
-                return processed_frames, self._frame_buffer_has_complete_frame()
+                return processed_frames, self._buffer_has_complete_frame(frame_buffer)
             if max_seconds != None and processed_frames > 0 and time.monotonic() - started_at >= max_seconds:
-                return processed_frames, self._frame_buffer_has_complete_frame()
+                return processed_frames, self._buffer_has_complete_frame(frame_buffer)
 
-            frame_start = self.frame_buffer.find(HDLC.FLAG)
+            frame_start = frame_buffer.find(HDLC.FLAG)
             if frame_start != -1:
-                frame_end = self.frame_buffer.find(HDLC.FLAG, frame_start+1)
+                frame_end = frame_buffer.find(HDLC.FLAG, frame_start+1)
                 if frame_end != -1:
-                    frame = bytes(self.frame_buffer[frame_start+1:frame_end])
+                    frame = bytes(frame_buffer[frame_start+1:frame_end])
                     frame = frame.replace(bytes([HDLC.ESC, HDLC.FLAG ^ HDLC.ESC_MASK]), bytes([HDLC.FLAG]))
                     frame = frame.replace(bytes([HDLC.ESC, HDLC.ESC  ^ HDLC.ESC_MASK]), bytes([HDLC.ESC]))
                     if len(frame) > RNS.Reticulum.HEADER_MINSIZE:
+                        if not self._epoll_receive_token_is_current(processing_token):
+                            if qortal_local_trace_enabled(self):
+                                qortal_local_trace_log(
+                                    "local-rx-abandoned-frame-drop",
+                                    f"role={qortal_local_trace_role(self)} interface={self} "
+                                    f"token={processing_token} len={len(frame)}"
+                                )
+                            return processed_frames, False
                         packet = None
                         if qortal_local_trace_enabled(self):
                             packet = qortal_local_trace_packet(frame)
@@ -1349,9 +1369,17 @@ class LocalClientInterface(Interface):
                                         f"dest_gap_ms={gap_ms:.3f} len={len(frame)} "
                                         f"{qortal_local_trace_packet_detail(packet)}"
                                     )
+                        if not self._epoll_receive_token_is_current(processing_token):
+                            if qortal_local_trace_enabled(self):
+                                qortal_local_trace_log(
+                                    "local-rx-abandoned-frame-drop",
+                                    f"role={qortal_local_trace_role(self)} interface={self} "
+                                    f"token={processing_token} len={len(frame)}"
+                                )
+                            return processed_frames, False
                         self._enqueue_local_dispatch_frame(frame, packet=packet)
                         processed_frames += 1
-                    del self.frame_buffer[:frame_end]
+                    del frame_buffer[:frame_end]
 
                 else: flags_remaining = False
 
@@ -1398,6 +1426,7 @@ class LocalClientInterface(Interface):
             now = time.monotonic()
             stuck = None
             idle = None
+            replaced_stuck = None
             with self.epoll_receive_queue_condition:
                 if not self.online and len(self.epoll_receive_queue) == 0 and not self.epoll_receive_processing:
                     return
@@ -1431,11 +1460,21 @@ class LocalClientInterface(Interface):
 
                 if self.epoll_receive_processing and self.epoll_receive_processing_started_at > 0:
                     duration_ms = (now - self.epoll_receive_processing_started_at) * 1000.0
-                    if (
+                    should_warn = (
                         duration_ms >= QORTAL_RNS_LOCAL_RX_WORKER_WARN_MS
                         and now - self.epoll_receive_last_stuck_warned_at >= QORTAL_RNS_LOCAL_RX_QUEUE_WARN_INTERVAL
+                    )
+                    should_replace = (
+                        duration_ms >= QORTAL_RNS_LOCAL_RX_WORKER_WARN_MS * 2
+                        and len(self.epoll_receive_queue) > 0
+                        and now - self.epoll_receive_last_replaced_at >= QORTAL_RNS_LOCAL_RX_WORKER_REPLACE_INTERVAL
+                    )
+                    if (
+                        should_warn
+                        or should_replace
                     ):
-                        self.epoll_receive_last_stuck_warned_at = now
+                        if should_warn:
+                            self.epoll_receive_last_stuck_warned_at = now
                         stuck = (
                             duration_ms,
                             self.epoll_receive_processing_thread_ident,
@@ -1443,14 +1482,68 @@ class LocalClientInterface(Interface):
                             len(self.epoll_receive_queue),
                             self.epoll_receive_queue_bytes,
                             self.epoll_receive_worker_generation,
+                            self.epoll_receive_processing_token,
+                        )
+                    if should_replace:
+                        old_worker_id = self.epoll_receive_worker_generation
+                        old_token = self.epoll_receive_processing_token
+                        old_thread_ident = self.epoll_receive_processing_thread_ident
+                        old_len = self.epoll_receive_processing_len
+                        old_frame_buffer_len = len(self.frame_buffer)
+                        queued_chunks = len(self.epoll_receive_queue)
+                        queued_bytes = self.epoll_receive_queue_bytes
+                        self.epoll_receive_last_replaced_at = now
+                        self.epoll_receive_processing = False
+                        self.epoll_receive_processing_token = 0
+                        self.epoll_receive_processing_started_at = 0.0
+                        self.epoll_receive_processing_thread_ident = None
+                        self.epoll_receive_processing_len = 0
+                        self.epoll_receive_continue_queued = False
+                        # The old worker might still be inside HDLC decoding. Give new
+                        # work a fresh buffer so the replacement cannot mutate the same
+                        # bytearray as the abandoned worker.
+                        self.frame_buffer = bytearray()
+                        new_worker_id = self._start_epoll_receive_worker_locked("replaced_stuck")
+                        self.epoll_receive_queue_condition.notify_all()
+                        replaced_stuck = (
+                            duration_ms,
+                            old_worker_id,
+                            new_worker_id,
+                            old_token,
+                            old_thread_ident,
+                            old_len,
+                            old_frame_buffer_len,
+                            queued_chunks,
+                            queued_bytes,
                         )
 
             if stuck != None:
-                duration_ms, thread_ident, data_len, queued_chunks, queued_bytes, worker_id = stuck
+                duration_ms, thread_ident, data_len, queued_chunks, queued_bytes, worker_id, token = stuck
                 stack = self._local_dispatch_stack_trace(thread_ident)
                 RNS.log(
                     f"LocalInterface receive worker stuck for {self}: "
-                    f"worker={worker_id} duration_ms={duration_ms:.1f} len={data_len} "
+                    f"worker={worker_id} token={token} duration_ms={duration_ms:.1f} len={data_len} "
+                    f"queued_bytes={queued_bytes} queued_chunks={queued_chunks}\n{stack}",
+                    RNS.LOG_ERROR
+                )
+
+            if replaced_stuck != None:
+                (
+                    duration_ms,
+                    old_worker_id,
+                    new_worker_id,
+                    old_token,
+                    old_thread_ident,
+                    old_len,
+                    old_frame_buffer_len,
+                    queued_chunks,
+                    queued_bytes,
+                ) = replaced_stuck
+                stack = self._local_dispatch_stack_trace(old_thread_ident)
+                RNS.log(
+                    f"LocalInterface abandoned stuck receive worker for {self}: "
+                    f"old_worker={old_worker_id} new_worker={new_worker_id} token={old_token} "
+                    f"duration_ms={duration_ms:.1f} len={old_len} frame_buffer={old_frame_buffer_len} "
                     f"queued_bytes={queued_bytes} queued_chunks={queued_chunks}\n{stack}",
                     RNS.LOG_ERROR
                 )
@@ -1562,9 +1655,15 @@ class LocalClientInterface(Interface):
         with self.epoll_receive_queue_condition:
             self._enqueue_epoll_receive_locked(data_in, now)
 
-    def _finish_epoll_receive_processing(self):
+    def _finish_epoll_receive_processing(self, processing_token=None):
         with self.epoll_receive_queue_condition:
+            if (
+                processing_token != None
+                and self.epoll_receive_processing_token != processing_token
+            ):
+                return
             self.epoll_receive_processing = False
+            self.epoll_receive_processing_token = 0
             self.epoll_receive_processing_started_at = 0.0
             self.epoll_receive_processing_thread_ident = None
             self.epoll_receive_processing_len = 0
@@ -1573,7 +1672,7 @@ class LocalClientInterface(Interface):
                 self._ensure_epoll_receive_worker_locked()
                 self.epoll_receive_queue_condition.notify()
 
-    def _process_epoll_receive_chunk(self, data_in, queued_at=None):
+    def _process_epoll_receive_chunk(self, data_in, queued_at=None, processing_token=None):
         started_at = time.monotonic()
         is_continue = data_in is _LOCAL_RX_CONTINUE
         try:
@@ -1600,7 +1699,7 @@ class LocalClientInterface(Interface):
                     )
 
             if QORTAL_RNS_LOCAL_IO_V2:
-                self._receive_inline_batched(data_in)
+                self._receive_inline_batched(data_in, processing_token=processing_token)
             else:
                 self._receive_inline(data_in)
         except Exception as e:
@@ -1619,9 +1718,9 @@ class LocalClientInterface(Interface):
             except Exception as e:
                 RNS.log(f"LocalInterface receive trace error for {self}: {e}", RNS.LOG_WARNING)
             finally:
-                self._finish_epoll_receive_processing()
+                self._finish_epoll_receive_processing(processing_token)
 
-    def _receive_inline_batched(self, data_in):
+    def _receive_inline_batched(self, data_in, processing_token=None):
         is_continue = data_in is _LOCAL_RX_CONTINUE
         if not is_continue and len(data_in) == 0:
             self._receive_inline(data_in)
@@ -1632,6 +1731,7 @@ class LocalClientInterface(Interface):
                 b"" if is_continue else data_in,
                 max_frames=QORTAL_RNS_LOCAL_RX_BATCH_FRAMES,
                 max_seconds=QORTAL_RNS_LOCAL_RX_BATCH_SECONDS,
+                processing_token=processing_token,
             )
             if more_frames:
                 now = time.monotonic()
@@ -1650,9 +1750,22 @@ class LocalClientInterface(Interface):
                         f"batch_seconds={QORTAL_RNS_LOCAL_RX_BATCH_SECONDS:.3f}"
                     )
                 with self.epoll_receive_queue_condition:
-                    self._enqueue_epoll_receive_continue_locked(now)
+                    if processing_token == None or self.epoll_receive_processing_token == processing_token:
+                        self._enqueue_epoll_receive_continue_locked(now)
 
         except Exception as e:
+            stale_processing = False
+            if processing_token != None:
+                with self.epoll_receive_queue_condition:
+                    stale_processing = self.epoll_receive_processing_token != processing_token
+            if stale_processing:
+                RNS.log(
+                    f"Ignoring stale LocalInterface receive error for {self}: "
+                    f"token={processing_token} error={e}",
+                    RNS.LOG_WARNING
+                )
+                RNS.trace_exception(e)
+                return
             self.online = False
             RNS.log("An interface error occurred, the contained exception was: "+str(e), RNS.LOG_ERROR)
             RNS.log("Tearing down "+str(self), RNS.LOG_ERROR)
@@ -1660,6 +1773,7 @@ class LocalClientInterface(Interface):
 
     def _epoll_receive_worker(self, worker_id):
         while True:
+            processing_token = None
             try:
                 with self.epoll_receive_queue_condition:
                     if self.epoll_receive_worker_generation != worker_id:
@@ -1670,6 +1784,9 @@ class LocalClientInterface(Interface):
                             return
 
                     self.epoll_receive_processing = True
+                    self.epoll_receive_next_processing_token += 1
+                    processing_token = self.epoll_receive_next_processing_token
+                    self.epoll_receive_processing_token = processing_token
                     self.epoll_receive_processing_started_at = time.monotonic()
                     self.epoll_receive_processing_thread_ident = threading.get_ident()
                     queued_at, data_in = self.epoll_receive_queue.popleft()
@@ -1679,12 +1796,12 @@ class LocalClientInterface(Interface):
                     if data_in is not _LOCAL_RX_CONTINUE:
                         self.epoll_receive_queue_bytes -= len(data_in)
 
-                self._process_epoll_receive_chunk(data_in, queued_at)
+                self._process_epoll_receive_chunk(data_in, queued_at, processing_token)
 
             except Exception as e:
                 RNS.log(f"LocalInterface receive worker loop error for {self}: {e}", RNS.LOG_ERROR)
                 RNS.trace_exception(e)
-                self._finish_epoll_receive_processing()
+                self._finish_epoll_receive_processing(processing_token)
 
     def _receive_inline(self, data_in):
         try:
@@ -1720,11 +1837,14 @@ class LocalClientInterface(Interface):
                     self._enqueue_epoll_receive_locked(data_in, now)
                     return
                 self.epoll_receive_processing = True
+                self.epoll_receive_next_processing_token += 1
+                processing_token = self.epoll_receive_next_processing_token
+                self.epoll_receive_processing_token = processing_token
                 self.epoll_receive_processing_started_at = time.monotonic()
                 self.epoll_receive_processing_thread_ident = threading.get_ident()
                 self.epoll_receive_processing_len = len(data_in)
                 self._ensure_epoll_receive_watchdog_locked()
-            self._process_epoll_receive_chunk(data_in)
+            self._process_epoll_receive_chunk(data_in, processing_token=processing_token)
         else:
             self._receive_inline(data_in)
 
