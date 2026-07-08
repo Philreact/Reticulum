@@ -3125,6 +3125,9 @@ class Transport:
             elif packet.packet_type == RNS.Packet.DATA:
                 if packet.destination_type == RNS.Destination.LINK:
                     matched_link = False
+                    link_to_receive = None
+                    cache_request_link = None
+                    cache_request_data = None
                     with Transport.active_links_lock:
                         for link in Transport.active_links:
                             if link.link_id == packet.destination_hash:
@@ -3132,16 +3135,13 @@ class Transport:
                                 if link.attached_interface == packet.receiving_interface:
                                     packet.link = link
                                     if packet.context == RNS.Packet.CACHE_REQUEST:
-                                        cached_packet = Transport.get_cached_packet(packet.data)
-                                        if cached_packet != None:
-                                            cached_packet.unpack()
-                                            RNS.Packet(destination=link, data=cached_packet.data,
-                                                       packet_type=cached_packet.packet_type, context=cached_packet.context).send()
+                                        cache_request_link = link
+                                        cache_request_data = packet.data
                                     
                                     else:
                                         Transport.qortal_log_link_rx("dispatch_to_link", packet=packet, raw_len=len(raw))
                                         Transport.qortal_note_link_ingress("dispatch", packet=packet, raw_len=len(raw), started_at=qortal_inbound_started_at, link=link)
-                                        link.receive(packet)
+                                        link_to_receive = link
                                     break
                                 
                                 else:
@@ -3188,6 +3188,16 @@ class Transport:
                                     )
                             Transport.qortal_log_link_route_issue("no_active_link", packet)
                             Transport.qortal_note_link_ingress("no_active_link", packet=packet, raw_len=len(raw), started_at=qortal_inbound_started_at, reason="no_active_link")
+
+                    if cache_request_link != None:
+                        cached_packet = Transport.get_cached_packet(cache_request_data)
+                        if cached_packet != None:
+                            cached_packet.unpack()
+                            RNS.Packet(destination=cache_request_link, data=cached_packet.data,
+                                       packet_type=cached_packet.packet_type, context=cached_packet.context).send()
+
+                    if link_to_receive != None:
+                        link_to_receive.receive(packet)
                 else:
                     destination = None
                     with Transport.destinations_map_lock:
@@ -3288,11 +3298,14 @@ class Transport:
                         if pending_link: pending_link.validate_proof(packet)
 
                 elif packet.context == RNS.Packet.RESOURCE_PRF:
+                    link_to_receive = None
                     with Transport.active_links_lock:
                         for link in Transport.active_links:
                             if link.link_id == packet.destination_hash:
-                                link.receive(packet)
+                                link_to_receive = link
                                 break
+                    if link_to_receive != None:
+                        link_to_receive.receive(packet)
                 else:
                     if packet.destination_type == RNS.Destination.LINK:
                         with Transport.active_links_lock:

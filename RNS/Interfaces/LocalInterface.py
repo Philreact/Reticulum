@@ -37,6 +37,7 @@ import time
 import sys
 import os
 import errno
+import traceback
 import RNS
 from threading import Lock
 from collections import deque
@@ -68,6 +69,18 @@ QORTAL_RNS_LOCAL_TX_DRAIN_MAX_BYTES = 1024*1024
 QORTAL_RNS_LOCAL_TX_DRAIN_MAX_SECONDS = 0.006
 QORTAL_RNS_LOCAL_RX_READ_MAX_BYTES = 1024*1024
 QORTAL_RNS_LOCAL_RX_READ_MAX_SECONDS = 0.004
+QORTAL_RNS_LOCAL_DISPATCH_ENABLED = os.environ.get("QORTAL_RNS_LOCAL_DISPATCH_ENABLED", "1") != "0"
+QORTAL_RNS_LOCAL_DISPATCH_WORKERS = max(1, int(os.environ.get("QORTAL_RNS_LOCAL_DISPATCH_WORKERS", "4")))
+QORTAL_RNS_LOCAL_DISPATCH_MAX_WORKERS = max(QORTAL_RNS_LOCAL_DISPATCH_WORKERS, int(os.environ.get("QORTAL_RNS_LOCAL_DISPATCH_MAX_WORKERS", "12")))
+QORTAL_RNS_LOCAL_DISPATCH_QUEUE_WARN_AGE_MS = int(os.environ.get("QORTAL_RNS_LOCAL_DISPATCH_QUEUE_WARN_AGE_MS", "250"))
+QORTAL_RNS_LOCAL_DISPATCH_QUEUE_ERROR_AGE_MS = int(os.environ.get("QORTAL_RNS_LOCAL_DISPATCH_QUEUE_ERROR_AGE_MS", "1500"))
+QORTAL_RNS_LOCAL_DISPATCH_TOTAL_HIGH_BYTES = int(os.environ.get("QORTAL_RNS_LOCAL_DISPATCH_TOTAL_HIGH_BYTES", str(512*1024)))
+QORTAL_RNS_LOCAL_DISPATCH_TOTAL_LOW_BYTES = int(os.environ.get("QORTAL_RNS_LOCAL_DISPATCH_TOTAL_LOW_BYTES", str(128*1024)))
+QORTAL_RNS_LOCAL_DISPATCH_KEY_HARD_BYTES = int(os.environ.get("QORTAL_RNS_LOCAL_DISPATCH_KEY_HARD_BYTES", str(2*1024*1024)))
+QORTAL_RNS_LOCAL_DISPATCH_KEY_HARD_CHUNKS = int(os.environ.get("QORTAL_RNS_LOCAL_DISPATCH_KEY_HARD_CHUNKS", "2048"))
+QORTAL_RNS_LOCAL_DISPATCH_FAIL_COOLDOWN_MS = int(os.environ.get("QORTAL_RNS_LOCAL_DISPATCH_FAIL_COOLDOWN_MS", "5000"))
+QORTAL_RNS_LOCAL_DISPATCH_WORKER_WARN_MS = int(os.environ.get("QORTAL_RNS_LOCAL_DISPATCH_WORKER_WARN_MS", "2500"))
+QORTAL_RNS_LOCAL_DISPATCH_WARN_INTERVAL = float(os.environ.get("QORTAL_RNS_LOCAL_DISPATCH_WARN_INTERVAL", "2.0"))
 _LOCAL_RX_CONTINUE = object()
 
 def qortal_local_trace_enabled(interface=None):
@@ -621,6 +634,22 @@ class LocalClientInterface(Interface):
         self.epoll_receive_paused = False
         self.epoll_receive_hard_warned_at = 0.0
         self.epoll_receive_continue_queued = False
+        self.local_dispatch_condition = threading.Condition()
+        self.local_dispatch_queues = {}
+        self.local_dispatch_queue_bytes = {}
+        self.local_dispatch_queue_oldest_at = {}
+        self.local_dispatch_ready = deque()
+        self.local_dispatch_ready_set = set()
+        self.local_dispatch_busy = set()
+        self.local_dispatch_failed_until = {}
+        self.local_dispatch_active_workers = {}
+        self.local_dispatch_total_bytes = 0
+        self.local_dispatch_total_chunks = 0
+        self.local_dispatch_worker_count = 0
+        self.local_dispatch_watchdog_started = False
+        self.local_dispatch_last_warned_at = 0.0
+        self.local_dispatch_last_hard_warned_at = 0.0
+        self.local_dispatch_stopped = False
 
         if RNS.vendor.platformutils.use_epoll():
             self.epoll_backend = True
@@ -764,6 +793,329 @@ class LocalClientInterface(Interface):
         except Exception as e:
             RNS.log(f"An error occurred in the processing of an incoming frame for {self}: {e}", RNS.LOG_ERROR)
             RNS.trace_exception(e)
+
+    def _local_dispatch_key(self, frame, packet=None):
+        if packet == None:
+            packet = qortal_local_trace_packet(frame)
+        if packet != None:
+            destination_hash = getattr(packet, "destination_hash", None)
+            if isinstance(destination_hash, (bytes, bytearray)):
+                return bytes(destination_hash)
+        return None
+
+    def _local_dispatch_key_label(self, key):
+        if isinstance(key, (bytes, bytearray)):
+            return bytes(key).hex()[:16]
+        return "fallback"
+
+    def _ensure_local_dispatch_workers_locked(self):
+        if self.local_dispatch_stopped:
+            return
+        while self.local_dispatch_worker_count < QORTAL_RNS_LOCAL_DISPATCH_WORKERS:
+            self._start_local_dispatch_worker_locked()
+
+    def _start_local_dispatch_worker_locked(self):
+        if self.local_dispatch_stopped:
+            return False
+        if self.local_dispatch_worker_count >= QORTAL_RNS_LOCAL_DISPATCH_MAX_WORKERS:
+            return False
+        self.local_dispatch_worker_count += 1
+        worker_id = self.local_dispatch_worker_count
+        thread = threading.Thread(target=self._local_dispatch_worker, args=(worker_id,), daemon=True)
+        thread.start()
+        return True
+
+    def _ensure_local_dispatch_watchdog_locked(self):
+        if self.local_dispatch_stopped:
+            return
+        if self.local_dispatch_watchdog_started:
+            return
+        self.local_dispatch_watchdog_started = True
+        thread = threading.Thread(target=self._local_dispatch_watchdog, daemon=True)
+        thread.start()
+
+    def _maybe_update_epoll_receive_interest_from_dispatch(self):
+        if not (self.epoll_backend or self.selector_backend):
+            return
+        with self.epoll_receive_queue_condition:
+            self._maybe_update_epoll_receive_interest_locked()
+
+    def _teardown_local_dispatch_link(self, key, reason):
+        if not isinstance(key, (bytes, bytearray)):
+            return
+        links = []
+        try:
+            with RNS.Transport.active_links_lock:
+                for link in RNS.Transport.active_links:
+                    if getattr(link, "link_id", None) == key:
+                        links.append(link)
+        except Exception as e:
+            RNS.log(f"Could not inspect active links while isolating local dispatch key for {self}: {e}", RNS.LOG_WARNING)
+            return
+
+        for link in links:
+            try:
+                RNS.log(
+                    f"LocalInterface tearing down isolated stalled link for {self}: "
+                    f"dest={self._local_dispatch_key_label(key)} reason={reason}",
+                    RNS.LOG_ERROR
+                )
+                link.teardown()
+            except Exception as e:
+                RNS.log(f"Could not tear down isolated stalled link for {self}: {e}", RNS.LOG_WARNING)
+
+    def _warn_local_dispatch_locked(self, now):
+        if self.local_dispatch_total_chunks == 0:
+            return
+        if now - self.local_dispatch_last_warned_at < QORTAL_RNS_LOCAL_DISPATCH_WARN_INTERVAL:
+            return
+
+        oldest_age_ms = 0.0
+        oldest_key = None
+        oldest_at = None
+        for key, queued_at in self.local_dispatch_queue_oldest_at.items():
+            if queued_at != None and (oldest_at == None or queued_at < oldest_at):
+                oldest_at = queued_at
+                oldest_key = key
+
+        if oldest_at != None:
+            oldest_age_ms = (now - oldest_at) * 1000.0
+
+        if (
+            oldest_age_ms < QORTAL_RNS_LOCAL_DISPATCH_QUEUE_WARN_AGE_MS
+            and self.local_dispatch_total_bytes < QORTAL_RNS_LOCAL_DISPATCH_TOTAL_HIGH_BYTES
+        ):
+            return
+
+        self.local_dispatch_last_warned_at = now
+        level = RNS.LOG_ERROR if oldest_age_ms >= QORTAL_RNS_LOCAL_DISPATCH_QUEUE_ERROR_AGE_MS else RNS.LOG_WARNING
+        RNS.log(
+            f"LocalInterface dispatch queue delayed for {self}: "
+            f"oldest_age_ms={oldest_age_ms:.1f} oldest_dest={self._local_dispatch_key_label(oldest_key)} "
+            f"queued_bytes={self.local_dispatch_total_bytes} queued_chunks={self.local_dispatch_total_chunks} "
+            f"destinations={len(self.local_dispatch_queues)} active_workers={len(self.local_dispatch_active_workers)} "
+            f"workers={self.local_dispatch_worker_count}",
+            level
+        )
+
+    def _enqueue_local_dispatch_frame(self, frame, packet=None):
+        if not QORTAL_RNS_LOCAL_DISPATCH_ENABLED:
+            self.process_incoming(frame)
+            return
+
+        key = self._local_dispatch_key(frame, packet=packet)
+        now = time.monotonic()
+        frame_len = len(frame)
+        teardown_key = None
+        dropped_bytes = 0
+        dropped_chunks = 0
+
+        with self.local_dispatch_condition:
+            if self.local_dispatch_stopped:
+                return
+            self._ensure_local_dispatch_workers_locked()
+            self._ensure_local_dispatch_watchdog_locked()
+
+            failed_until = self.local_dispatch_failed_until.get(key)
+            if failed_until != None:
+                if now < failed_until:
+                    if now - self.local_dispatch_last_hard_warned_at >= QORTAL_RNS_LOCAL_DISPATCH_WARN_INTERVAL:
+                        self.local_dispatch_last_hard_warned_at = now
+                        RNS.log(
+                            f"LocalInterface dispatch frame dropped during per-destination isolation for {self}: "
+                            f"dest={self._local_dispatch_key_label(key)} frame_len={frame_len}",
+                            RNS.LOG_WARNING
+                        )
+                    return
+                else:
+                    self.local_dispatch_failed_until.pop(key, None)
+
+            queue = self.local_dispatch_queues.get(key)
+            if queue == None:
+                queue = deque()
+                self.local_dispatch_queues[key] = queue
+                self.local_dispatch_queue_bytes[key] = 0
+
+            next_key_bytes = self.local_dispatch_queue_bytes.get(key, 0) + frame_len
+            next_key_chunks = len(queue) + 1
+            if next_key_bytes > QORTAL_RNS_LOCAL_DISPATCH_KEY_HARD_BYTES or next_key_chunks > QORTAL_RNS_LOCAL_DISPATCH_KEY_HARD_CHUNKS:
+                dropped_chunks = len(queue)
+                dropped_bytes = self.local_dispatch_queue_bytes.get(key, 0)
+                queue.clear()
+                self.local_dispatch_queue_bytes[key] = 0
+                self.local_dispatch_queue_oldest_at.pop(key, None)
+                self.local_dispatch_total_bytes = max(0, self.local_dispatch_total_bytes - dropped_bytes)
+                self.local_dispatch_total_chunks = max(0, self.local_dispatch_total_chunks - dropped_chunks)
+                if key in self.local_dispatch_ready_set:
+                    self.local_dispatch_ready_set.discard(key)
+                    try:
+                        self.local_dispatch_ready.remove(key)
+                    except ValueError:
+                        pass
+                if key not in self.local_dispatch_busy:
+                    self.local_dispatch_queues.pop(key, None)
+                    self.local_dispatch_queue_bytes.pop(key, None)
+                    self.local_dispatch_queue_oldest_at.pop(key, None)
+                self.local_dispatch_failed_until[key] = now + (QORTAL_RNS_LOCAL_DISPATCH_FAIL_COOLDOWN_MS / 1000.0)
+                teardown_key = key
+
+                if now - self.local_dispatch_last_hard_warned_at >= QORTAL_RNS_LOCAL_DISPATCH_WARN_INTERVAL:
+                    self.local_dispatch_last_hard_warned_at = now
+                    RNS.log(
+                        f"LocalInterface dispatch queue over per-destination hard limit for {self}: "
+                        f"dest={self._local_dispatch_key_label(key)} dropped_bytes={dropped_bytes} "
+                        f"dropped_chunks={dropped_chunks} frame_len={frame_len} "
+                        f"key_hard_bytes={QORTAL_RNS_LOCAL_DISPATCH_KEY_HARD_BYTES} "
+                        f"key_hard_chunks={QORTAL_RNS_LOCAL_DISPATCH_KEY_HARD_CHUNKS}",
+                        RNS.LOG_ERROR
+                    )
+                self.local_dispatch_condition.notify_all()
+
+            else:
+                queue.append((now, frame, frame_len))
+                self.local_dispatch_queue_bytes[key] = next_key_bytes
+                self.local_dispatch_total_bytes += frame_len
+                self.local_dispatch_total_chunks += 1
+                if key not in self.local_dispatch_queue_oldest_at:
+                    self.local_dispatch_queue_oldest_at[key] = now
+                if key not in self.local_dispatch_busy and key not in self.local_dispatch_ready_set:
+                    self.local_dispatch_ready.append(key)
+                    self.local_dispatch_ready_set.add(key)
+                self._warn_local_dispatch_locked(now)
+                self.local_dispatch_condition.notify()
+
+        if teardown_key != None:
+            self._teardown_local_dispatch_link(teardown_key, reason="dispatch_queue_hard_limit")
+        self._maybe_update_epoll_receive_interest_from_dispatch()
+
+    def _local_dispatch_worker(self, worker_id):
+        while True:
+            key = None
+            queued_at = None
+            frame = None
+            frame_len = 0
+            with self.local_dispatch_condition:
+                while len(self.local_dispatch_ready) == 0 and not self.local_dispatch_stopped:
+                    self.local_dispatch_condition.wait()
+                if self.local_dispatch_stopped and len(self.local_dispatch_ready) == 0:
+                    return
+
+                key = self.local_dispatch_ready.popleft()
+                self.local_dispatch_ready_set.discard(key)
+                queue = self.local_dispatch_queues.get(key)
+                if queue == None or len(queue) == 0:
+                    continue
+
+                self.local_dispatch_busy.add(key)
+                queued_at, frame, frame_len = queue.popleft()
+                self.local_dispatch_total_bytes = max(0, self.local_dispatch_total_bytes - frame_len)
+                self.local_dispatch_total_chunks = max(0, self.local_dispatch_total_chunks - 1)
+                self.local_dispatch_queue_bytes[key] = max(0, self.local_dispatch_queue_bytes.get(key, 0) - frame_len)
+                if len(queue) > 0:
+                    self.local_dispatch_queue_oldest_at[key] = queue[0][0]
+                else:
+                    self.local_dispatch_queue_oldest_at.pop(key, None)
+
+                thread_ident = threading.get_ident()
+                self.local_dispatch_active_workers[worker_id] = {
+                    "thread_ident": thread_ident,
+                    "key": key,
+                    "started_at": time.monotonic(),
+                    "queued_at": queued_at,
+                    "frame_len": frame_len,
+                }
+
+            try:
+                if qortal_local_trace_enabled(self):
+                    queue_age_ms = (time.monotonic() - queued_at) * 1000.0
+                    if QORTAL_RNS_LOCAL_TRACE_FRAMES or queue_age_ms >= QORTAL_RNS_LOCAL_TRACE_DELAY_MS:
+                        qortal_local_trace_log(
+                            "local-dispatch-frame",
+                            f"role={qortal_local_trace_role(self)} interface={self} "
+                            f"worker={worker_id} dest={self._local_dispatch_key_label(key)} "
+                            f"queue_age_ms={queue_age_ms:.3f} len={frame_len}"
+                        )
+                self.process_incoming(frame)
+
+            except Exception as e:
+                RNS.log(f"LocalInterface dispatch worker error for {self}: {e}", RNS.LOG_ERROR)
+                RNS.trace_exception(e)
+
+            finally:
+                with self.local_dispatch_condition:
+                    self.local_dispatch_active_workers.pop(worker_id, None)
+                    self.local_dispatch_busy.discard(key)
+                    queue = self.local_dispatch_queues.get(key)
+                    if queue != None and len(queue) > 0:
+                        if key not in self.local_dispatch_ready_set:
+                            self.local_dispatch_ready.append(key)
+                            self.local_dispatch_ready_set.add(key)
+                    else:
+                        self.local_dispatch_queues.pop(key, None)
+                        self.local_dispatch_queue_bytes.pop(key, None)
+                        self.local_dispatch_queue_oldest_at.pop(key, None)
+                    self.local_dispatch_condition.notify()
+                self._maybe_update_epoll_receive_interest_from_dispatch()
+
+    def _local_dispatch_stack_trace(self, thread_ident):
+        try:
+            frame = sys._current_frames().get(thread_ident)
+            if frame == None:
+                return "stack unavailable"
+            return "".join(traceback.format_stack(frame))
+        except Exception as e:
+            return f"stack unavailable: {e}"
+
+    def _local_dispatch_watchdog(self):
+        while True:
+            time.sleep(QORTAL_RNS_LOCAL_DISPATCH_WARN_INTERVAL)
+            now = time.monotonic()
+            stuck_workers = []
+            with self.local_dispatch_condition:
+                if (
+                    self.local_dispatch_stopped
+                    and len(self.local_dispatch_active_workers) == 0
+                    and self.local_dispatch_total_chunks == 0
+                ):
+                    return
+                for worker_id, info in self.local_dispatch_active_workers.items():
+                    duration_ms = (now - info["started_at"]) * 1000.0
+                    if duration_ms >= QORTAL_RNS_LOCAL_DISPATCH_WORKER_WARN_MS:
+                        stuck_workers.append((worker_id, dict(info), duration_ms))
+
+                self._warn_local_dispatch_locked(now)
+
+                if (
+                    len(stuck_workers) > 0
+                    and len(self.local_dispatch_active_workers) >= self.local_dispatch_worker_count
+                    and self.local_dispatch_worker_count < QORTAL_RNS_LOCAL_DISPATCH_MAX_WORKERS
+                ):
+                    self._start_local_dispatch_worker_locked()
+
+            for worker_id, info, duration_ms in stuck_workers:
+                stack = self._local_dispatch_stack_trace(info.get("thread_ident"))
+                RNS.log(
+                    f"LocalInterface dispatch worker stuck for {self}: "
+                    f"worker={worker_id} dest={self._local_dispatch_key_label(info.get('key'))} "
+                    f"duration_ms={duration_ms:.1f} frame_len={info.get('frame_len')} "
+                    f"workers={self.local_dispatch_worker_count}\n{stack}",
+                    RNS.LOG_ERROR
+                )
+
+    def _stop_local_dispatch(self):
+        if not QORTAL_RNS_LOCAL_DISPATCH_ENABLED:
+            return
+        with self.local_dispatch_condition:
+            self.local_dispatch_stopped = True
+            self.local_dispatch_queues.clear()
+            self.local_dispatch_queue_bytes.clear()
+            self.local_dispatch_queue_oldest_at.clear()
+            self.local_dispatch_ready.clear()
+            self.local_dispatch_ready_set.clear()
+            self.local_dispatch_failed_until.clear()
+            self.local_dispatch_total_bytes = 0
+            self.local_dispatch_total_chunks = 0
+            self.local_dispatch_condition.notify_all()
 
     def append_transmit_frame(self, frame):
         now = time.monotonic()
@@ -962,6 +1314,7 @@ class LocalClientInterface(Interface):
                     frame = frame.replace(bytes([HDLC.ESC, HDLC.FLAG ^ HDLC.ESC_MASK]), bytes([HDLC.FLAG]))
                     frame = frame.replace(bytes([HDLC.ESC, HDLC.ESC  ^ HDLC.ESC_MASK]), bytes([HDLC.ESC]))
                     if len(frame) > RNS.Reticulum.HEADER_MINSIZE:
+                        packet = None
                         if qortal_local_trace_enabled(self):
                             packet = qortal_local_trace_packet(frame)
                             if packet != None:
@@ -985,7 +1338,7 @@ class LocalClientInterface(Interface):
                                         f"dest_gap_ms={gap_ms:.3f} len={len(frame)} "
                                         f"{qortal_local_trace_packet_detail(packet)}"
                                     )
-                        self.process_incoming(frame)
+                        self._enqueue_local_dispatch_frame(frame, packet=packet)
                         processed_frames += 1
                     del self.frame_buffer[:frame_end]
 
@@ -1031,26 +1384,35 @@ class LocalClientInterface(Interface):
         if self.socket == None:
             return
 
-        if not self.epoll_receive_paused and self.epoll_receive_queue_bytes >= QORTAL_RNS_LOCAL_RX_QUEUE_HIGH_BYTES:
+        dispatch_bytes = self.local_dispatch_total_bytes if QORTAL_RNS_LOCAL_DISPATCH_ENABLED else 0
+        pressure_bytes = self.epoll_receive_queue_bytes + dispatch_bytes
+        high_bytes = max(QORTAL_RNS_LOCAL_RX_QUEUE_HIGH_BYTES, QORTAL_RNS_LOCAL_DISPATCH_TOTAL_HIGH_BYTES)
+        low_bytes = max(QORTAL_RNS_LOCAL_RX_QUEUE_LOW_BYTES, QORTAL_RNS_LOCAL_DISPATCH_TOTAL_LOW_BYTES)
+
+        if not self.epoll_receive_paused and pressure_bytes >= high_bytes:
             try:
                 self.epoll_receive_paused = True
                 LocalSelectorManager.set_rx_ready(self, False)
                 RNS.log(
-                    f"LocalInterface receive queue paused for {self}: "
-                    f"queued_bytes={self.epoll_receive_queue_bytes} queued_chunks={len(self.epoll_receive_queue)}",
+                    f"LocalInterface receive readiness paused for {self}: "
+                    f"pressure_bytes={pressure_bytes} receive_bytes={self.epoll_receive_queue_bytes} "
+                    f"dispatch_bytes={dispatch_bytes} receive_chunks={len(self.epoll_receive_queue)} "
+                    f"dispatch_chunks={self.local_dispatch_total_chunks}",
                     RNS.LOG_WARNING
                 )
             except Exception as e:
                 self.epoll_receive_paused = False
                 RNS.log(f"Error while pausing RX readiness for {self}: {e}", RNS.LOG_WARNING)
 
-        if self.epoll_receive_paused and self.epoll_receive_queue_bytes <= QORTAL_RNS_LOCAL_RX_QUEUE_LOW_BYTES:
+        if self.epoll_receive_paused and pressure_bytes <= low_bytes:
             try:
                 self.epoll_receive_paused = False
                 LocalSelectorManager.set_rx_ready(self, True)
                 RNS.log(
-                    f"LocalInterface receive queue resumed for {self}: "
-                    f"queued_bytes={self.epoll_receive_queue_bytes} queued_chunks={len(self.epoll_receive_queue)}",
+                    f"LocalInterface receive readiness resumed for {self}: "
+                    f"pressure_bytes={pressure_bytes} receive_bytes={self.epoll_receive_queue_bytes} "
+                    f"dispatch_bytes={dispatch_bytes} receive_chunks={len(self.epoll_receive_queue)} "
+                    f"dispatch_chunks={self.local_dispatch_total_chunks}",
                     RNS.LOG_NOTICE
                 )
             except Exception as e:
@@ -1272,6 +1634,7 @@ class LocalClientInterface(Interface):
             self.teardown()
 
     def detach(self):
+        self._stop_local_dispatch()
         if self.socket != None:
             if hasattr(self.socket, "close"):
                 if callable(self.socket.close):
@@ -1302,6 +1665,7 @@ class LocalClientInterface(Interface):
         self.online = False
         self.OUT = False
         self.IN = False
+        self._stop_local_dispatch()
 
         try:
             if (self.epoll_backend or self.selector_backend) and self.socket != None:
