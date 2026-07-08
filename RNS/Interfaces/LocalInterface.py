@@ -59,6 +59,7 @@ QORTAL_RNS_LOCAL_RX_CONTINUE_FRONT = os.environ.get("QORTAL_RNS_LOCAL_RX_CONTINU
 QORTAL_RNS_LOCAL_RX_QUEUE_WARN_AGE_MS = int(os.environ.get("QORTAL_RNS_LOCAL_RX_QUEUE_WARN_AGE_MS", "100"))
 QORTAL_RNS_LOCAL_RX_QUEUE_ERROR_AGE_MS = int(os.environ.get("QORTAL_RNS_LOCAL_RX_QUEUE_ERROR_AGE_MS", "500"))
 QORTAL_RNS_LOCAL_RX_INLINE_WARN_MS = int(os.environ.get("QORTAL_RNS_LOCAL_RX_INLINE_WARN_MS", "50"))
+QORTAL_RNS_LOCAL_RX_WORKER_WARN_MS = int(os.environ.get("QORTAL_RNS_LOCAL_RX_WORKER_WARN_MS", "2500"))
 QORTAL_RNS_LOCAL_RX_QUEUE_WARN_INTERVAL = 2.0
 QORTAL_RNS_LOCAL_TX_QUEUE_WARN_BYTES = 128*1024
 QORTAL_RNS_LOCAL_TX_QUEUE_WARN_INTERVAL = 2.0
@@ -630,6 +631,11 @@ class LocalClientInterface(Interface):
         self.epoll_receive_queue_condition = threading.Condition()
         self.epoll_receive_worker_started = False
         self.epoll_receive_processing = False
+        self.epoll_receive_processing_started_at = 0.0
+        self.epoll_receive_processing_thread_ident = None
+        self.epoll_receive_processing_len = 0
+        self.epoll_receive_watchdog_started = False
+        self.epoll_receive_last_stuck_warned_at = 0.0
         self.epoll_receive_queue_last_warned_at = 0.0
         self.epoll_receive_paused = False
         self.epoll_receive_hard_warned_at = 0.0
@@ -1356,6 +1362,48 @@ class LocalClientInterface(Interface):
             self.epoll_receive_worker_started = True
             thread = threading.Thread(target=self._epoll_receive_worker, daemon=True)
             thread.start()
+        self._ensure_epoll_receive_watchdog_locked()
+
+    def _ensure_epoll_receive_watchdog_locked(self):
+        if self.epoll_receive_watchdog_started:
+            return
+        self.epoll_receive_watchdog_started = True
+        thread = threading.Thread(target=self._epoll_receive_watchdog, daemon=True)
+        thread.start()
+
+    def _epoll_receive_watchdog(self):
+        while True:
+            time.sleep(QORTAL_RNS_LOCAL_RX_QUEUE_WARN_INTERVAL)
+            now = time.monotonic()
+            stuck = None
+            with self.epoll_receive_queue_condition:
+                if not self.online and len(self.epoll_receive_queue) == 0 and not self.epoll_receive_processing:
+                    return
+                if not self.epoll_receive_processing or self.epoll_receive_processing_started_at <= 0:
+                    continue
+                duration_ms = (now - self.epoll_receive_processing_started_at) * 1000.0
+                if duration_ms < QORTAL_RNS_LOCAL_RX_WORKER_WARN_MS:
+                    continue
+                if now - self.epoll_receive_last_stuck_warned_at < QORTAL_RNS_LOCAL_RX_QUEUE_WARN_INTERVAL:
+                    continue
+                self.epoll_receive_last_stuck_warned_at = now
+                stuck = (
+                    duration_ms,
+                    self.epoll_receive_processing_thread_ident,
+                    self.epoll_receive_processing_len,
+                    len(self.epoll_receive_queue),
+                    self.epoll_receive_queue_bytes,
+                )
+
+            if stuck != None:
+                duration_ms, thread_ident, data_len, queued_chunks, queued_bytes = stuck
+                stack = self._local_dispatch_stack_trace(thread_ident)
+                RNS.log(
+                    f"LocalInterface receive worker stuck for {self}: "
+                    f"duration_ms={duration_ms:.1f} len={data_len} "
+                    f"queued_bytes={queued_bytes} queued_chunks={queued_chunks}\n{stack}",
+                    RNS.LOG_ERROR
+                )
 
     def _warn_epoll_receive_queue_locked(self, now):
         if len(self.epoll_receive_queue) == 0:
@@ -1458,6 +1506,9 @@ class LocalClientInterface(Interface):
     def _finish_epoll_receive_processing(self):
         with self.epoll_receive_queue_condition:
             self.epoll_receive_processing = False
+            self.epoll_receive_processing_started_at = 0.0
+            self.epoll_receive_processing_thread_ident = None
+            self.epoll_receive_processing_len = 0
             self._maybe_update_epoll_receive_interest_locked()
             if len(self.epoll_receive_queue) > 0:
                 self._ensure_epoll_receive_worker_locked()
@@ -1466,43 +1517,50 @@ class LocalClientInterface(Interface):
     def _process_epoll_receive_chunk(self, data_in, queued_at=None):
         started_at = time.monotonic()
         is_continue = data_in is _LOCAL_RX_CONTINUE
-        if queued_at != None and qortal_local_trace_enabled(self) and is_continue:
-            queue_age_ms = (started_at - queued_at) * 1000.0
-            if QORTAL_RNS_LOCAL_TRACE_FRAMES or queue_age_ms >= QORTAL_RNS_LOCAL_TRACE_DELAY_MS:
-                with self.epoll_receive_queue_condition:
-                    queued_chunks = len(self.epoll_receive_queue)
-                    queued_bytes = self.epoll_receive_queue_bytes
-                qortal_local_trace_log(
-                    "local-rx-continue-drain",
-                    f"role={qortal_local_trace_role(self)} interface={self} "
-                    f"queue_age_ms={queue_age_ms:.3f} frame_buffer={len(self.frame_buffer)} "
-                    f"queued_chunks={queued_chunks} queued_bytes={queued_bytes}"
-                )
-
-        if queued_at != None and qortal_local_trace_enabled(self) and not is_continue:
-            queue_age_ms = (started_at - queued_at) * 1000.0
-            if QORTAL_RNS_LOCAL_TRACE_FRAMES or queue_age_ms >= QORTAL_RNS_LOCAL_RX_QUEUE_WARN_AGE_MS:
-                qortal_local_trace_log(
-                    "local-rx-queue-drain",
-                    f"role={qortal_local_trace_role(self)} interface={self} "
-                    f"queue_age_ms={queue_age_ms:.3f} len={len(data_in)}"
-                )
-
         try:
+            if queued_at != None and qortal_local_trace_enabled(self) and is_continue:
+                queue_age_ms = (started_at - queued_at) * 1000.0
+                if QORTAL_RNS_LOCAL_TRACE_FRAMES or queue_age_ms >= QORTAL_RNS_LOCAL_TRACE_DELAY_MS:
+                    with self.epoll_receive_queue_condition:
+                        queued_chunks = len(self.epoll_receive_queue)
+                        queued_bytes = self.epoll_receive_queue_bytes
+                    qortal_local_trace_log(
+                        "local-rx-continue-drain",
+                        f"role={qortal_local_trace_role(self)} interface={self} "
+                        f"queue_age_ms={queue_age_ms:.3f} frame_buffer={len(self.frame_buffer)} "
+                        f"queued_chunks={queued_chunks} queued_bytes={queued_bytes}"
+                    )
+
+            if queued_at != None and qortal_local_trace_enabled(self) and not is_continue:
+                queue_age_ms = (started_at - queued_at) * 1000.0
+                if QORTAL_RNS_LOCAL_TRACE_FRAMES or queue_age_ms >= QORTAL_RNS_LOCAL_RX_QUEUE_WARN_AGE_MS:
+                    qortal_local_trace_log(
+                        "local-rx-queue-drain",
+                        f"role={qortal_local_trace_role(self)} interface={self} "
+                        f"queue_age_ms={queue_age_ms:.3f} len={len(data_in)}"
+                    )
+
             if QORTAL_RNS_LOCAL_IO_V2:
                 self._receive_inline_batched(data_in)
             else:
                 self._receive_inline(data_in)
+        except Exception as e:
+            RNS.log(f"LocalInterface receive worker error for {self}: {e}", RNS.LOG_ERROR)
+            RNS.trace_exception(e)
         finally:
-            if qortal_local_trace_enabled(self):
-                duration_ms = (time.monotonic() - started_at) * 1000.0
-                if duration_ms >= QORTAL_RNS_LOCAL_RX_INLINE_WARN_MS:
-                    qortal_local_trace_log(
-                        "local-rx-process-delay",
-                        f"role={qortal_local_trace_role(self)} interface={self} "
-                        f"duration_ms={duration_ms:.3f} len={0 if is_continue else len(data_in)}"
-                    )
-            self._finish_epoll_receive_processing()
+            try:
+                if qortal_local_trace_enabled(self):
+                    duration_ms = (time.monotonic() - started_at) * 1000.0
+                    if duration_ms >= QORTAL_RNS_LOCAL_RX_INLINE_WARN_MS:
+                        qortal_local_trace_log(
+                            "local-rx-process-delay",
+                            f"role={qortal_local_trace_role(self)} interface={self} "
+                            f"duration_ms={duration_ms:.3f} len={0 if is_continue else len(data_in)}"
+                        )
+            except Exception as e:
+                RNS.log(f"LocalInterface receive trace error for {self}: {e}", RNS.LOG_WARNING)
+            finally:
+                self._finish_epoll_receive_processing()
 
     def _receive_inline_batched(self, data_in):
         is_continue = data_in is _LOCAL_RX_CONTINUE
@@ -1543,18 +1601,27 @@ class LocalClientInterface(Interface):
 
     def _epoll_receive_worker(self):
         while True:
-            with self.epoll_receive_queue_condition:
-                while len(self.epoll_receive_queue) == 0 or self.epoll_receive_processing:
-                    self.epoll_receive_queue_condition.wait()
+            try:
+                with self.epoll_receive_queue_condition:
+                    while len(self.epoll_receive_queue) == 0 or self.epoll_receive_processing:
+                        self.epoll_receive_queue_condition.wait()
 
-                self.epoll_receive_processing = True
-                queued_at, data_in = self.epoll_receive_queue.popleft()
-                if data_in is _LOCAL_RX_CONTINUE:
-                    self.epoll_receive_continue_queued = False
-                if data_in is not _LOCAL_RX_CONTINUE:
-                    self.epoll_receive_queue_bytes -= len(data_in)
+                    self.epoll_receive_processing = True
+                    self.epoll_receive_processing_started_at = time.monotonic()
+                    self.epoll_receive_processing_thread_ident = threading.get_ident()
+                    queued_at, data_in = self.epoll_receive_queue.popleft()
+                    self.epoll_receive_processing_len = 0 if data_in is _LOCAL_RX_CONTINUE else len(data_in)
+                    if data_in is _LOCAL_RX_CONTINUE:
+                        self.epoll_receive_continue_queued = False
+                    if data_in is not _LOCAL_RX_CONTINUE:
+                        self.epoll_receive_queue_bytes -= len(data_in)
 
-            self._process_epoll_receive_chunk(data_in, queued_at)
+                self._process_epoll_receive_chunk(data_in, queued_at)
+
+            except Exception as e:
+                RNS.log(f"LocalInterface receive worker loop error for {self}: {e}", RNS.LOG_ERROR)
+                RNS.trace_exception(e)
+                self._finish_epoll_receive_processing()
 
     def _receive_inline(self, data_in):
         try:
@@ -1590,6 +1657,10 @@ class LocalClientInterface(Interface):
                     self._enqueue_epoll_receive_locked(data_in, now)
                     return
                 self.epoll_receive_processing = True
+                self.epoll_receive_processing_started_at = time.monotonic()
+                self.epoll_receive_processing_thread_ident = threading.get_ident()
+                self.epoll_receive_processing_len = len(data_in)
+                self._ensure_epoll_receive_watchdog_locked()
             self._process_epoll_receive_chunk(data_in)
         else:
             self._receive_inline(data_in)
