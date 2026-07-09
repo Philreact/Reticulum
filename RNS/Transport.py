@@ -3157,24 +3157,6 @@ class Transport:
                                     while packet.packet_hash in Transport.packet_hashlist:
                                         Transport.packet_hashlist.remove(packet.packet_hash)
                         if not matched_link:
-                            stale_local_link_route = False
-                            with Transport.link_table_lock:
-                                link_entry = Transport.link_table.get(packet.destination_hash)
-                                if link_entry != None:
-                                    _local_side, local_interface = Transport._link_route_local_client_side(link_entry)
-                                    if local_interface != None:
-                                        stale_local_link_route = True
-
-                            if stale_local_link_route:
-                                with Transport.pending_links_lock:
-                                    for link in Transport.pending_links:
-                                        if getattr(link, "link_id", None) == packet.destination_hash and getattr(link, "status", None) != RNS.Link.CLOSED:
-                                            stale_local_link_route = False
-                                            break
-
-                            if stale_local_link_route:
-                                Transport._purge_link_route_state(packet.destination_hash, reason="no_active_local_owner")
-
                             if Transport.from_local_client(packet):
                                 with Transport.link_table_lock:
                                     has_link_route = packet.destination_hash in Transport.link_table
