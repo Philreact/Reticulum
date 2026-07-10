@@ -76,7 +76,7 @@ RNS_LINK_ROUTE_MIGRATION_DEBOUNCE_SECONDS = float(os.environ.get("RNS_LINK_ROUTE
 RNS_LINK_ROUTE_MIGRATION_CANDIDATE_DEBOUNCE_SECONDS = float(os.environ.get("RNS_LINK_ROUTE_MIGRATION_CANDIDATE_DEBOUNCE_SECONDS", "0.25"))
 RNS_LINK_ROUTE_MIGRATION_GRACE_SECONDS = float(os.environ.get("RNS_LINK_ROUTE_MIGRATION_GRACE_SECONDS", "5.0"))
 RNS_LINK_ROUTE_MIGRATION_MAX_CANDIDATES = int(os.environ.get("RNS_LINK_ROUTE_MIGRATION_MAX_CANDIDATES", "512"))
-RNS_LINK_ROUTE_ONEWAY_TIMEOUT = float(os.environ.get("RNS_LINK_ROUTE_ONEWAY_TIMEOUT", "15.0"))
+RNS_LINK_ROUTE_ONEWAY_TIMEOUT = float(os.environ.get("RNS_LINK_ROUTE_ONEWAY_TIMEOUT", "45.0"))
 RNS_LOCAL_LINK_OWNERSHIP_SYNC = os.environ.get("RNS_LOCAL_LINK_OWNERSHIP_SYNC", "1") != "0"
 
 class Transport:
@@ -787,22 +787,24 @@ class Transport:
                                         if link_entry[IDX_LT_DSTHASH] in Transport.path_requests:
                                             last_path_request = Transport.path_requests[link_entry[IDX_LT_DSTHASH]]
 
+                                    destination_hash = link_entry[IDX_LT_DSTHASH]
                                     lr_taken_hops = link_entry[IDX_LT_HOPS]
+                                    blocked_if = None
 
                                     path_request_throttle = time.time() - last_path_request < Transport.PATH_REQUEST_MI
                                     path_request_conditions = False
                                     
                                     # If the path has been invalidated between the time of
                                     # making the link request and now, try to rediscover it
-                                    if not Transport.has_path(link_entry[IDX_LT_DSTHASH]):
-                                        RNS.log("Trying to rediscover path for "+RNS.prettyhexrep(link_entry[IDX_LT_DSTHASH])+" since an attempted link was never established, and path is now missing", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+                                    if not Transport.has_path(destination_hash):
+                                        RNS.log("Trying to rediscover path for "+RNS.prettyhexrep(destination_hash)+" since an attempted link was never established, and path is now missing", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
                                         path_request_conditions = True
 
                                     # If this link request was originated from a local client
                                     # attempt to rediscover a path to the destination, if this
                                     # has not already happened recently.
                                     elif not path_request_throttle and lr_taken_hops == 0:
-                                        RNS.log("Trying to rediscover path for "+RNS.prettyhexrep(link_entry[IDX_LT_DSTHASH])+" since an attempted local client link was never established", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+                                        RNS.log("Trying to rediscover path for "+RNS.prettyhexrep(destination_hash)+" since an attempted local client link was never established", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
                                         path_request_conditions = True
 
                                     # If the link destination was previously only 1 hop
@@ -810,47 +812,55 @@ class Transport:
                                     # of our interfaces, and that it roamed somewhere else.
                                     # In that case, try to discover a new path, and mark
                                     # the old one as unresponsive.
-                                    elif not path_request_throttle and Transport.hops_to(link_entry[IDX_LT_DSTHASH]) == 1:
-                                        RNS.log("Trying to rediscover path for "+RNS.prettyhexrep(link_entry[IDX_LT_DSTHASH])+" since an attempted link was never established, and destination was previously local to an interface on this instance", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+                                    elif not path_request_throttle and Transport.hops_to(destination_hash) == 1:
+                                        RNS.log("Trying to rediscover path for "+RNS.prettyhexrep(destination_hash)+" since an attempted link was never established, and destination was previously local to an interface on this instance", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
                                         path_request_conditions = True
                                         blocked_if = link_entry[IDX_LT_RCVD_IF]
-
-                                        # TODO: This might result in the path re-resolution
-                                        # only being able to happen once, since new path found
-                                        # after allowing update from higher hop-count path, after
-                                        # marking old path unresponsive, might be more than 1 hop away,
-                                        # thus dealocking us into waiting for a new announce all-together.
-                                        # Is this problematic, or does it actually not matter?
-                                        # Best would be to have full support for alternative paths,
-                                        # and score them according to number of unsuccessful tries or
-                                        # similar.
-                                        if RNS.Reticulum.transport_enabled():
-                                            if hasattr(link_entry[IDX_LT_RCVD_IF], "mode") and link_entry[IDX_LT_RCVD_IF].mode != RNS.Interfaces.Interface.Interface.MODE_BOUNDARY:
-                                                Transport.mark_path_unresponsive(link_entry[IDX_LT_DSTHASH])
 
                                     # If the link initiator is only 1 hop away,
                                     # this likely means that network topology has
                                     # changed. In that case, we try to discover a new path,
                                     # and mark the old one as potentially unresponsive.
                                     elif not path_request_throttle and lr_taken_hops == 1:
-                                        RNS.log("Trying to rediscover path for "+RNS.prettyhexrep(link_entry[IDX_LT_DSTHASH])+" since an attempted link was never established, and link initiator is local to an interface on this instance", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+                                        RNS.log("Trying to rediscover path for "+RNS.prettyhexrep(destination_hash)+" since an attempted link was never established, and link initiator is local to an interface on this instance", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
                                         path_request_conditions = True
                                         blocked_if = link_entry[IDX_LT_RCVD_IF]
 
-                                        if RNS.Reticulum.transport_enabled():
-                                            if hasattr(link_entry[IDX_LT_RCVD_IF], "mode") and link_entry[IDX_LT_RCVD_IF].mode != RNS.Interfaces.Interface.Interface.MODE_BOUNDARY:
-                                                Transport.mark_path_unresponsive(link_entry[IDX_LT_DSTHASH])
+                                    elif not path_request_throttle:
+                                        RNS.log("Trying to rediscover path for "+RNS.prettyhexrep(destination_hash)+" since an attempted multi-hop link was never established", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+                                        path_request_conditions = True
 
                                     if path_request_conditions:
+                                        if RNS.Reticulum.transport_enabled() and Transport.has_path(destination_hash):
+                                            path_hops = Transport.hops_to(destination_hash)
+                                            path_interface = Transport.next_hop_interface(destination_hash)
+                                            path_interface_is_boundary = (
+                                                hasattr(path_interface, "mode") and
+                                                path_interface.mode == RNS.Interfaces.Interface.Interface.MODE_BOUNDARY
+                                            )
+                                            if not path_interface_is_boundary:
+                                                if Transport.mark_path_unresponsive(destination_hash):
+                                                    Transport.qortal_log_link_route_migration(
+                                                        "link_establish_timeout_path_unresponsive",
+                                                        link_id=destination_hash,
+                                                        old_interface=path_interface,
+                                                        old_hops=path_hops,
+                                                        reason="pending_link_proof_timeout",
+                                                        result=(
+                                                            f"pending_link_id={link_id.hex() if isinstance(link_id, (bytes, bytearray)) else 'n/a'} "
+                                                            f"lr_taken_hops={lr_taken_hops}"
+                                                        ),
+                                                    )
+
                                         with Transport.path_requests_lock:
-                                            if not link_entry[IDX_LT_DSTHASH] in path_requests:
-                                                path_requests[link_entry[IDX_LT_DSTHASH]] = blocked_if
+                                            if not destination_hash in path_requests:
+                                                path_requests[destination_hash] = blocked_if
 
                                         if not RNS.Reticulum.transport_enabled():
                                             # Drop current path if we are not a transport instance, to
                                             # allow using higher-hop count paths or reused announces
                                             # from newly adjacent transport instances.
-                                            Transport.expire_path(link_entry[IDX_LT_DSTHASH])
+                                            Transport.expire_path(destination_hash)
 
                     # Cull the path table
                     stale_paths = []
