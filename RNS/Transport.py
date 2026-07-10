@@ -76,6 +76,7 @@ RNS_LINK_ROUTE_MIGRATION_DEBOUNCE_SECONDS = float(os.environ.get("RNS_LINK_ROUTE
 RNS_LINK_ROUTE_MIGRATION_CANDIDATE_DEBOUNCE_SECONDS = float(os.environ.get("RNS_LINK_ROUTE_MIGRATION_CANDIDATE_DEBOUNCE_SECONDS", "0.25"))
 RNS_LINK_ROUTE_MIGRATION_GRACE_SECONDS = float(os.environ.get("RNS_LINK_ROUTE_MIGRATION_GRACE_SECONDS", "5.0"))
 RNS_LINK_ROUTE_MIGRATION_MAX_CANDIDATES = int(os.environ.get("RNS_LINK_ROUTE_MIGRATION_MAX_CANDIDATES", "512"))
+RNS_LINK_ROUTE_ONEWAY_TIMEOUT = float(os.environ.get("RNS_LINK_ROUTE_ONEWAY_TIMEOUT", "15.0"))
 RNS_LOCAL_LINK_OWNERSHIP_SYNC = os.environ.get("RNS_LOCAL_LINK_OWNERSHIP_SYNC", "1") != "0"
 
 class Transport:
@@ -233,6 +234,7 @@ class Transport:
     link_route_last_migrated_at = {}
     link_route_migration_log_last = {}
     link_route_migration_log_interval = 1.0
+    link_route_last_outbound = {}
     local_link_owners          = {}
     announces_last_checked      = 0.0
     announces_check_interval    = 1.0
@@ -742,17 +744,42 @@ class Transport:
 
                     # Cull the link table according to timeout
                     stale_links = []
+                    oneway_links = []
+                    now = time.time()
                     with Transport.link_table_lock:
                         for link_id in Transport.link_table:
                             link_entry = Transport.link_table[link_id]
 
                             if link_entry[IDX_LT_VALIDATED] == True:
-                                if time.time() > link_entry[IDX_LT_TIMESTAMP] + Transport.LINK_TIMEOUT: stale_links.append(link_id)
+                                if now > link_entry[IDX_LT_TIMESTAMP] + Transport.LINK_TIMEOUT: stale_links.append(link_id)
                                 elif not link_entry[IDX_LT_NH_IF] in Transport.interfaces:              stale_links.append(link_id)
                                 elif not link_entry[IDX_LT_RCVD_IF] in Transport.interfaces:            stale_links.append(link_id)
+                                else:
+                                    link_key = bytes(link_id)
+                                    last_outbound = Transport.link_route_last_outbound.get(link_key)
+                                    owner_interface = Transport.local_link_owners.get(link_key)
+                                    route_local_side, route_local_interface = Transport._link_route_local_client_side(link_entry)
+                                    if (
+                                        last_outbound != None and
+                                        owner_interface != None and
+                                        route_local_interface != None and
+                                        owner_interface == route_local_interface and
+                                        now - last_outbound <= RNS_LINK_ROUTE_ONEWAY_TIMEOUT and
+                                        now - link_entry[IDX_LT_TIMESTAMP] > RNS_LINK_ROUTE_ONEWAY_TIMEOUT
+                                    ):
+                                        oneway_links.append((
+                                            link_key,
+                                            route_local_side,
+                                            route_local_interface,
+                                            int((now - link_entry[IDX_LT_TIMESTAMP]) * 1000),
+                                            int((now - last_outbound) * 1000),
+                                            link_entry[IDX_LT_RCVD_IF],
+                                            link_entry[IDX_LT_NH_IF],
+                                            owner_interface == route_local_interface,
+                                        ))
                             
                             else:
-                                if time.time() > link_entry[IDX_LT_PROOF_TMO]:
+                                if now > link_entry[IDX_LT_PROOF_TMO]:
                                     stale_links.append(link_id)
 
                                     last_path_request = 0
@@ -938,6 +965,33 @@ class Transport:
                         for link_id in stale_links:
                             Transport._purge_link_route_state(link_id, reason="stale_link_table", lock_held=True)
                             i += 1
+
+                        for entry in oneway_links:
+                            link_id, route_local_side, route_local_interface, route_age_ms, outbound_age_ms, rcvd_if, nh_if, owner_match = entry
+                            Transport.qortal_log_link_route_migration(
+                                "oneway_link_route_detected",
+                                link_id=link_id,
+                                old_interface=rcvd_if,
+                                new_interface=nh_if,
+                                reason=route_local_side,
+                                result=(
+                                    f"route_age_ms={route_age_ms} outbound_age_ms={outbound_age_ms} "
+                                    f"local_interface={route_local_interface} owner_match={str(owner_match).lower()}"
+                                ),
+                            )
+                            if Transport._purge_link_route_state(link_id, reason="oneway_link_route_timeout", lock_held=True):
+                                Transport.qortal_log_link_route_migration(
+                                    "oneway_link_route_purged",
+                                    link_id=link_id,
+                                    old_interface=rcvd_if,
+                                    new_interface=nh_if,
+                                    reason=route_local_side,
+                                    result=(
+                                        f"route_age_ms={route_age_ms} outbound_age_ms={outbound_age_ms} "
+                                        f"local_interface={route_local_interface} owner_match={str(owner_match).lower()}"
+                                    ),
+                                )
+                                i += 1
 
                     if i > 0:
                         if i == 1: RNS.log("Released "+str(i)+" link", RNS.LOG_EXTREME) if RNS.sl(RNS.LOG_EXTREME) else None
@@ -1556,6 +1610,8 @@ class Transport:
             if link_entry != None:
                 route_local_side, route_local_interface = Transport._link_route_local_client_side(link_entry)
                 link_table_age_ms = int((now - link_entry[IDX_LT_TIMESTAMP]) * 1000) if link_entry[IDX_LT_TIMESTAMP] else "n/a"
+                link_route_last_outbound = Transport.link_route_last_outbound.get(destination_key)
+                link_route_outbound_age_ms = int((now - link_route_last_outbound) * 1000) if link_route_last_outbound else "n/a"
                 link_table_summary = (
                     "link_table=yes "
                     f"link_validated={str(link_entry[IDX_LT_VALIDATED]).lower()} "
@@ -1564,11 +1620,12 @@ class Transport:
                     f"link_route_owner_match={str(owner_interface != None and owner_interface == route_local_interface).lower()} "
                     f"link_route_hops={link_entry[IDX_LT_HOPS]} "
                     f"link_route_age_ms={link_table_age_ms} "
+                    f"link_route_outbound_age_ms={link_route_outbound_age_ms} "
                     f"link_route_rcvd_if={link_entry[IDX_LT_RCVD_IF]} "
                     f"link_route_nh_if={link_entry[IDX_LT_NH_IF]}"
                 )
             else:
-                link_table_summary = "link_table=no link_validated=n/a link_route_local_side=none link_route_local_interface=None link_route_owner_match=false link_route_hops=n/a link_route_age_ms=n/a link_route_rcvd_if=None link_route_nh_if=None"
+                link_table_summary = "link_table=no link_validated=n/a link_route_local_side=none link_route_local_interface=None link_route_owner_match=false link_route_hops=n/a link_route_age_ms=n/a link_route_outbound_age_ms=n/a link_route_rcvd_if=None link_route_nh_if=None"
 
             path_entry = None
             try:
@@ -2040,6 +2097,7 @@ class Transport:
                 removed_route = Transport.link_table.pop(link_id, None) != None
 
         removed_owner = Transport.local_link_owners.pop(link_id, None) != None
+        removed_last_outbound = Transport.link_route_last_outbound.pop(link_id, None) != None
 
         removed_candidates = 0
         with Transport.link_route_candidate_lock:
@@ -2057,13 +2115,13 @@ class Transport:
 
         removed_migration = Transport.link_route_last_migrated_at.pop(link_id, None) != None
 
-        if removed_route or removed_owner or removed_candidates or removed_grace or removed_migration:
+        if removed_route or removed_owner or removed_last_outbound or removed_candidates or removed_grace or removed_migration:
             Transport.qortal_log_link_route_migration(
                 "stale_link_route_purged",
                 link_id=link_id,
                 reason=reason,
                 result=(
-                    f"route={str(removed_route).lower()} owner={str(removed_owner).lower()} "
+                    f"route={str(removed_route).lower()} owner={str(removed_owner).lower()} last_outbound={str(removed_last_outbound).lower()} "
                     f"candidates={removed_candidates} grace={removed_grace} "
                     f"migration={str(removed_migration).lower()}"
                 ),
@@ -2677,7 +2735,11 @@ class Transport:
                             new_raw += struct.pack("!B", packet.hops)
                             new_raw += packet.raw[2:]
                             Transport.transmit(outbound_interface, new_raw)
-                            Transport.link_table[packet.destination_hash][IDX_LT_TIMESTAMP] = time.time()
+                            now = time.time()
+                            if from_local_client:
+                                Transport.link_route_last_outbound[bytes(packet.destination_hash)] = now
+                            else:
+                                Transport.link_table[packet.destination_hash][IDX_LT_TIMESTAMP] = now
                             return
 
                         else:
@@ -3226,6 +3288,7 @@ class Transport:
                                             new_raw += struct.pack("!B", packet.hops)
                                             new_raw += packet.raw[2:]
                                             Transport.link_table[packet.destination_hash][IDX_LT_VALIDATED] = True
+                                            Transport.link_table[packet.destination_hash][IDX_LT_TIMESTAMP] = time.time()
                                             if Transport.is_local_client_interface(link_entry[IDX_LT_NH_IF]):
                                                 Transport.local_link_owners[bytes(packet.destination_hash)] = link_entry[IDX_LT_NH_IF]
                                                 Transport.qortal_log_local_trace(
@@ -4202,6 +4265,7 @@ class Transport:
         Transport.reverse_table     = {}
         Transport.link_table        = {}
         Transport.local_link_owners = {}
+        Transport.link_route_last_outbound = {}
         Transport.held_announces    = {}
         Transport.tunnels           = {}
 
