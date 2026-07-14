@@ -250,6 +250,7 @@ class Link:
         self.last_keepalive = 0
         self.last_proof = 0
         self.last_data = 0
+        self.local_route_activity_notified_at = 0.0
         self.tx = 0
         self.rx = 0
         self.txbytes = 0
@@ -554,9 +555,12 @@ class Link:
                 except Exception as e:
                     RNS.log("Error occurred in external link establishment callback. The contained exception was: "+str(e), RNS.LOG_ERROR)
 
+                return True
+
         except Exception as e:
             RNS.log("Error occurred while processing RTT packet, tearing down link. The contained exception was: "+str(e), RNS.LOG_ERROR)
             self.teardown()
+        return False
 
     def track_phy_stats(self, track):
         """
@@ -722,8 +726,10 @@ class Link:
                 self.__update_phy_stats(packet)
                 RNS.Transport.qortal_note_link_lifecycle(self, event="close", reason="remote_teardown", packet=packet)
                 self.link_closed()
+                return True
         except Exception as e:
             pass
+        return False
 
     def link_closed(self):
         for resource in self.incoming_resources: resource.cancel()
@@ -993,8 +999,7 @@ class Link:
                         return True
 
                     if route_migration_candidate:
-                        if not RNS.Transport.confirm_link_route_migration(self, packet):
-                            RNS.Transport.qortal_log_link_route_migration("link_route_migration_rejected", link_id=packet.destination_hash, packet_hash=packet.packet_hash, old_interface=self.attached_interface, new_interface=packet.receiving_interface, reason="confirm_failed")
+                        RNS.Transport.confirm_link_route_migration_async(self, packet)
 
                     self.last_inbound = time.time()
                     if packet.context != RNS.Packet.KEEPALIVE:
@@ -1003,11 +1008,9 @@ class Link:
                     self.rxbytes += len(packet.data)
                     if self.status == Link.STALE:
                         self.status = Link.ACTIVE
+                    RNS.Transport.notify_local_link_activity(self)
                     inbound_accounted = True
                     return True
-
-                if not route_migration_candidate:
-                    account_valid_inbound()
 
                 if packet.packet_type == RNS.Packet.DATA:
                     should_query = False
@@ -1072,6 +1075,7 @@ class Link:
                                         self.teardown()
 
                                     else:
+                                        account_valid_inbound()
                                         self.__remote_identity = identity
                                         if self.callbacks.remote_identified != None:
                                             try: self.callbacks.remote_identified(self, self.__remote_identity)
@@ -1109,11 +1113,13 @@ class Link:
 
                     elif packet.context == RNS.Packet.LRRTT:
                         if not self.initiator:
-                            self.rtt_packet(packet)
+                            if self.rtt_packet(packet):
+                                account_valid_inbound()
                             self.__update_phy_stats(packet, query_shared=True)
 
                     elif packet.context == RNS.Packet.LINKCLOSE:
-                        self.teardown_packet(packet)
+                        if self.teardown_packet(packet):
+                            account_valid_inbound()
                         self.__update_phy_stats(packet, query_shared=True)
 
                     elif packet.context == RNS.Packet.RESOURCE_ADV:
@@ -1207,9 +1213,12 @@ class Link:
 
                     elif packet.context == RNS.Packet.KEEPALIVE:
                         if not self.initiator and packet.data == bytes([0xFF]):
+                            account_valid_inbound()
                             keepalive_packet = RNS.Packet(self, bytes([0xFE]), context=RNS.Packet.KEEPALIVE)
                             keepalive_packet.send()
                             self.had_outbound(is_keepalive = True)
+                        elif self.initiator and packet.data == bytes([0xFE]):
+                            account_valid_inbound()
 
 
                     # TODO: find the most efficient way to allow multiple
@@ -1241,12 +1250,9 @@ class Link:
                         resource_hash = packet.data[0:RNS.Identity.HASHLENGTH//8]
                         for resource in self.outgoing_resources:
                             if resource_hash == resource.hash:
-                                if route_migration_candidate:
-                                    if resource.validate_proof(packet.data, validated_callback=account_valid_inbound):
-                                        account_valid_inbound()
-                                else:
-                                    def job(resource=resource): resource.validate_proof(packet.data)
-                                    threading.Thread(target=job, daemon=True).start()
+                                def job(resource=resource):
+                                    resource.validate_proof(packet.data, validated_callback=account_valid_inbound)
+                                threading.Thread(target=job, daemon=True).start()
                                 self.__update_phy_stats(packet, query_shared=True)
 
         self.watchdog_lock = False

@@ -39,7 +39,7 @@ import os
 import RNS
 from collections import deque
 
-QORTAL_RNS_LOCAL_TRACE = os.environ.get("QORTAL_RNS_LOCAL_TRACE", "1") == "1"
+QORTAL_RNS_LOCAL_TRACE = os.environ.get("QORTAL_RNS_LOCAL_TRACE", "0") == "1"
 QORTAL_RNS_LOCAL_TRACE_FRAMES = os.environ.get("QORTAL_RNS_LOCAL_TRACE_FRAMES", "0") == "1"
 
 def qortal_tcp_trace_log(stage, detail):

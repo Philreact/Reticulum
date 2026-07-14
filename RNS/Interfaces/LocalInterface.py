@@ -42,13 +42,13 @@ import RNS
 from threading import Lock
 from collections import deque
 
-QORTAL_RNS_LOCAL_TRACE = os.environ.get("QORTAL_RNS_LOCAL_TRACE", "1") == "1"
+QORTAL_RNS_LOCAL_TRACE = os.environ.get("QORTAL_RNS_LOCAL_TRACE", "0") == "1"
 QORTAL_RNS_LOCAL_IO_V2 = os.environ.get("RNS_LOCAL_IO_V2", "1") != "0"
 QORTAL_RNS_LOCAL_SELECTOR_IO_V2 = os.environ.get("RNS_LOCAL_SELECTOR_IO_V2", os.environ.get("RNS_LOCAL_IO_V2", "1")) != "0"
 QORTAL_RNS_LOCAL_TRACE_GAP_MS = int(os.environ.get("QORTAL_RNS_LOCAL_TRACE_GAP_MS", "320"))
 QORTAL_RNS_LOCAL_TRACE_DELAY_MS = int(os.environ.get("QORTAL_RNS_LOCAL_TRACE_DELAY_MS", "80"))
 QORTAL_RNS_LOCAL_TRACE_FRAMES = os.environ.get("QORTAL_RNS_LOCAL_TRACE_FRAMES", "0") == "1"
-QORTAL_RNS_LOCAL_TRACE_DEST_GAPS = os.environ.get("QORTAL_RNS_LOCAL_TRACE_DEST_GAPS", "1") == "1"
+QORTAL_RNS_LOCAL_TRACE_DEST_GAPS = os.environ.get("QORTAL_RNS_LOCAL_TRACE_DEST_GAPS", "0") == "1"
 QORTAL_RNS_LOCAL_RX_QUEUE_WARN_BYTES = int(os.environ.get("QORTAL_RNS_LOCAL_RX_QUEUE_WARN_BYTES", str(256*1024)))
 QORTAL_RNS_LOCAL_RX_QUEUE_HIGH_BYTES = int(os.environ.get("QORTAL_RNS_LOCAL_RX_QUEUE_HIGH_BYTES", str(512*1024)))
 QORTAL_RNS_LOCAL_RX_QUEUE_LOW_BYTES = int(os.environ.get("QORTAL_RNS_LOCAL_RX_QUEUE_LOW_BYTES", str(128*1024)))
@@ -69,6 +69,8 @@ QORTAL_RNS_LOCAL_TX_DRAIN_WARN_MS = int(os.environ.get("QORTAL_RNS_LOCAL_TX_DRAI
 QORTAL_RNS_LOCAL_SELECTOR_POLL_SECONDS = float(os.environ.get("QORTAL_RNS_LOCAL_SELECTOR_POLL_SECONDS", "0.05"))
 QORTAL_RNS_LOCAL_TX_DRAIN_MAX_BYTES = 1024*1024
 QORTAL_RNS_LOCAL_TX_DRAIN_MAX_SECONDS = 0.006
+QORTAL_RNS_LOCAL_TX_REARM_SECONDS = float(os.environ.get("QORTAL_RNS_LOCAL_TX_REARM_SECONDS", "2.0"))
+QORTAL_RNS_LOCAL_TX_RECOVERY_SECONDS = float(os.environ.get("QORTAL_RNS_LOCAL_TX_RECOVERY_SECONDS", "5.0"))
 QORTAL_RNS_LOCAL_RX_READ_MAX_BYTES = 1024*1024
 QORTAL_RNS_LOCAL_RX_READ_MAX_SECONDS = 0.004
 QORTAL_RNS_LOCAL_DISPATCH_ENABLED = os.environ.get("QORTAL_RNS_LOCAL_DISPATCH_ENABLED", "1") != "0"
@@ -174,6 +176,7 @@ class LocalSelectorManager:
     wakeup_read = None
     wakeup_write = None
     wakeup_registered = False
+    job_thread = None
 
     @staticmethod
     def supported():
@@ -269,11 +272,14 @@ class LocalSelectorManager:
     @staticmethod
     def start():
         with LocalSelectorManager.lock:
-            if LocalSelectorManager.job_active:
+            thread = LocalSelectorManager.job_thread
+            if LocalSelectorManager.job_active and thread != None and thread.is_alive():
                 return
             LocalSelectorManager.ensure_selector()
             LocalSelectorManager.job_active = True
-            threading.Thread(target=LocalSelectorManager.__job, daemon=True).start()
+            thread = threading.Thread(target=LocalSelectorManager.__job, daemon=True)
+            LocalSelectorManager.job_thread = thread
+            thread.start()
 
     @staticmethod
     def _register_or_modify(sock, events, data, context):
@@ -372,6 +378,8 @@ class LocalSelectorManager:
     def tx_ready(interface):
         if interface.socket:
             LocalSelectorManager._register_or_modify(interface.socket, LocalSelectorManager._events_for_interface(interface, want_write=True), ("client", interface), "tx_ready")
+            if not LocalSelectorManager.job_active:
+                LocalSelectorManager.start()
 
     @staticmethod
     def set_rx_ready(interface, enabled):
@@ -444,7 +452,8 @@ class LocalSelectorManager:
                 LocalSelectorManager._remove_client(interface, client_socket)
                 try: client_socket.close()
                 except Exception as e: RNS.log(f"Error while closing selector client socket for {interface}: {e}", RNS.LOG_WARNING)
-                interface.receive(received_bytes)
+                if interface.socket is client_socket:
+                    interface.receive(received_bytes)
                 break
 
     @staticmethod
@@ -476,7 +485,8 @@ class LocalSelectorManager:
                     LocalSelectorManager._remove_client(interface, client_socket)
                     try: client_socket.close()
                     except Exception as close_error: RNS.log(f"Error while closing selector socket for {interface}: {close_error}", RNS.LOG_WARNING)
-                    interface.receive(b"")
+                    if interface.socket is client_socket:
+                        interface.receive(b"")
             except Exception as e:
                 written = 0
                 write_failed = True
@@ -485,7 +495,8 @@ class LocalSelectorManager:
                 LocalSelectorManager._remove_client(interface, client_socket)
                 try: client_socket.close()
                 except Exception as close_error: RNS.log(f"Error while closing selector socket for {interface}: {close_error}", RNS.LOG_WARNING)
-                interface.receive(b"")
+                if interface.socket is client_socket:
+                    interface.receive(b"")
 
             if write_failed:
                 break
@@ -549,8 +560,9 @@ class LocalSelectorManager:
 
     @staticmethod
     def __job():
-        while True:
-            try:
+        current_thread = threading.current_thread()
+        try:
+            while True:
                 with LocalSelectorManager.lock:
                     selector = LocalSelectorManager.selector
                 loop_started = time.monotonic()
@@ -586,9 +598,14 @@ class LocalSelectorManager:
                             f"events={len(events)} duration_ms={duration_ms:.3f}"
                         )
 
-            except Exception as e:
-                RNS.log(f"LocalInterface selector backend error: {e}", RNS.LOG_ERROR)
-                RNS.trace_exception(e)
+        except Exception as e:
+            RNS.log(f"LocalInterface selector backend error: {e}", RNS.LOG_ERROR)
+            RNS.trace_exception(e)
+        finally:
+            with LocalSelectorManager.lock:
+                if LocalSelectorManager.job_thread == current_thread:
+                    LocalSelectorManager.job_active = False
+                    LocalSelectorManager.job_thread = None
 
 class LocalClientInterface(Interface):
     RECONNECT_WAIT = 8
@@ -611,6 +628,7 @@ class LocalClientInterface(Interface):
         self.socket           = None
         self.parent_interface = None
         self.reconnecting     = False
+        self.reconnect_lock   = Lock()
         self.never_connected  = True
         self.detached         = False
         self.name             = name
@@ -627,6 +645,12 @@ class LocalClientInterface(Interface):
         self.qortal_trace_transmit_buffer_first_enqueued_at = 0.0
         self.qortal_trace_transmit_buffer_last_enqueued_at = 0.0
         self.qortal_trace_transmit_buffer_last_warned_at = 0.0
+        self.transmit_buffer_last_progress_at = time.monotonic()
+        self.transmit_watchdog_started = False
+        self.transmit_recovery_lock = Lock()
+        self.transmit_recovery_active = False
+        self.transmit_rearm_last_at = 0.0
+        self.transmit_rearm_logged = False
         self.epoll_receive_queue = deque()
         self.epoll_receive_queue_bytes = 0
         self.epoll_receive_queue_condition = threading.Condition()
@@ -736,30 +760,41 @@ class LocalClientInterface(Interface):
         if RNS.vendor.platformutils.is_android(): self.phy_keepalive = True
         if self.epoll_backend or self.selector_backend:
             LocalSelectorManager.add_client_socket(self.socket, self)
+            self._ensure_transmit_watchdog()
 
         return True
 
 
-    def reconnect(self):
+    def reconnect(self, immediate=False):
         if self.is_connected_to_shared_instance:
-            if not self.reconnecting:
+            with self.reconnect_lock:
+                if self.detached or self.online or self.reconnecting:
+                    return
                 self.reconnecting = True
-                attempts = 0
+            attempts = 0
 
+            try:
                 while not self.online:
-                    time.sleep(LocalClientInterface.RECONNECT_WAIT)
+                    if attempts > 0 or not immediate:
+                        time.sleep(LocalClientInterface.RECONNECT_WAIT)
+                    if self.detached:
+                        return
                     attempts += 1
 
                     try:
-                        self.connect()
+                        with self.reconnect_lock:
+                            if self.detached:
+                                return
+                            self.connect()
 
                     except Exception as e:
                         RNS.log("Connection attempt for "+str(self)+" failed: "+str(e), RNS.LOG_DEBUG)
 
+                if self.detached:
+                    return
                 if not self.never_connected:
                     RNS.log("Reconnected socket for "+str(self)+".", RNS.LOG_INFO)
 
-                self.reconnecting = False
                 if not self.epoll_backend and not self.selector_backend:
                     thread = threading.Thread(target=self.read_loop)
                     thread.daemon = True
@@ -767,12 +802,135 @@ class LocalClientInterface(Interface):
 
                 def job():
                     time.sleep(LocalClientInterface.RECONNECT_WAIT+2)
-                    RNS.Transport.shared_connection_reappeared()
+                    if not self.detached and self.online:
+                        RNS.Transport.shared_connection_reappeared()
                 threading.Thread(target=job, daemon=True).start()
+
+            finally:
+                with self.reconnect_lock:
+                    self.reconnecting = False
 
         else:
             RNS.log("Attempt to reconnect on a non-initiator shared local interface. This should not happen.", RNS.LOG_ERROR)
             raise IOError("Attempt to reconnect on a non-initiator local interface")
+
+    def _ensure_transmit_watchdog(self):
+        if self.transmit_watchdog_started:
+            return
+        self.transmit_watchdog_started = True
+        threading.Thread(target=self._transmit_watchdog, daemon=True).start()
+
+    def _transmit_stalled_for(self, now=None):
+        now = time.monotonic() if now == None else now
+        with self.transmit_buffer_lock:
+            queued_bytes = self.transmit_buffer_queued_bytes if QORTAL_RNS_LOCAL_IO_V2 else len(self.transmit_buffer)
+            first_enqueued_at = self.qortal_trace_transmit_buffer_first_enqueued_at
+            last_progress_at = self.transmit_buffer_last_progress_at
+        if queued_bytes <= 0 or first_enqueued_at <= 0:
+            return queued_bytes, 0.0
+        return queued_bytes, max(0.0, now - max(first_enqueued_at, last_progress_at))
+
+    def _request_transmit_recovery(self, reason):
+        if self.detached or self.reconnecting or not getattr(self, "is_connected_to_shared_instance", False):
+            return False
+        with self.transmit_recovery_lock:
+            if self.transmit_recovery_active:
+                return False
+            self.transmit_recovery_active = True
+        threading.Thread(target=self._recover_stalled_transmit, args=(reason,), daemon=True).start()
+        return True
+
+    def _recover_stalled_transmit(self, reason):
+        queued_bytes, stalled_for = self._transmit_stalled_for()
+        old_socket = self.socket
+        try:
+            with self.reconnect_lock:
+                if self.detached or self.reconnecting or queued_bytes <= 0 or self.socket is not old_socket:
+                    return
+                self.online = False
+                self.socket = None
+
+            RNS.log(
+                f"LocalInterface recovering stalled shared socket for {self}: "
+                f"reason={reason} queued_bytes={queued_bytes} stalled_for_ms={int(stalled_for*1000)}",
+                RNS.LOG_WARNING
+            )
+            if old_socket != None:
+                LocalSelectorManager._remove_client(self, old_socket)
+                try: old_socket.shutdown(socket.SHUT_RDWR)
+                except Exception: pass
+                try: old_socket.close()
+                except Exception: pass
+            self._realign_transmit_buffer_for_reconnect()
+            RNS.Transport.shared_connection_disappeared()
+            self.reconnect(immediate=True)
+            if self.detached or not self.online:
+                return
+            self.transmit_buffer_last_progress_at = time.monotonic()
+            self.transmit_rearm_logged = False
+            queued_after, _ = self._transmit_stalled_for()
+            RNS.log(
+                f"LocalInterface recovered stalled shared socket for {self}: "
+                f"reason={reason} queued_bytes={queued_after}",
+                RNS.LOG_NOTICE
+            )
+
+        except Exception as e:
+            RNS.log(f"LocalInterface stalled shared socket recovery failed for {self}: {e}", RNS.LOG_ERROR)
+            RNS.trace_exception(e)
+        finally:
+            with self.transmit_recovery_lock:
+                self.transmit_recovery_active = False
+
+    def _transmit_watchdog(self):
+        while not self.detached:
+            time.sleep(min(1.0, max(0.1, QORTAL_RNS_LOCAL_TX_REARM_SECONDS/2)))
+            try:
+                if not self.online or self.socket == None or self.reconnecting:
+                    continue
+                now = time.monotonic()
+                queued_bytes, stalled_for = self._transmit_stalled_for(now)
+                if queued_bytes <= 0:
+                    self.transmit_rearm_logged = False
+                    continue
+
+                if stalled_for >= QORTAL_RNS_LOCAL_TX_RECOVERY_SECONDS:
+                    self._request_transmit_recovery("no_tx_progress")
+                    continue
+
+                if stalled_for >= QORTAL_RNS_LOCAL_TX_REARM_SECONDS and now - self.transmit_rearm_last_at >= 1.0:
+                    self.transmit_rearm_last_at = now
+                    LocalSelectorManager.tx_ready(self)
+                    if not self.transmit_rearm_logged:
+                        self.transmit_rearm_logged = True
+                        RNS.log(
+                            f"LocalInterface rearmed stalled transmit readiness for {self}: "
+                            f"queued_bytes={queued_bytes} stalled_for_ms={int(stalled_for*1000)}",
+                            RNS.LOG_WARNING
+                        )
+            except Exception as e:
+                RNS.log(f"LocalInterface transmit watchdog error for {self}: {e}", RNS.LOG_WARNING)
+
+    def _realign_transmit_buffer_for_reconnect(self):
+        with self.transmit_buffer_lock:
+            if not QORTAL_RNS_LOCAL_IO_V2:
+                discarded = len(self.transmit_buffer)
+                self.transmit_buffer = b""
+                self.qortal_trace_transmit_buffer_first_enqueued_at = 0.0
+                self.qortal_trace_transmit_buffer_last_enqueued_at = 0.0
+                return discarded
+            if self.transmit_buffer_head_offset <= 0:
+                return 0
+            partial_frame = self.transmit_buffer_chunks.popleft()
+            discarded = len(partial_frame) - self.transmit_buffer_head_offset
+            self.transmit_buffer_queued_bytes -= discarded
+            self.transmit_buffer_head_offset = 0
+            if self.transmit_buffer_queued_bytes == 0:
+                self.qortal_trace_transmit_buffer_first_enqueued_at = 0.0
+                self.qortal_trace_transmit_buffer_last_enqueued_at = 0.0
+            else:
+                self.qortal_trace_transmit_buffer_first_enqueued_at = time.monotonic()
+            return discarded
 
 
     def send_keepalive(self):
@@ -1143,6 +1301,8 @@ class LocalClientInterface(Interface):
                 queued_after = len(self.transmit_buffer)
             if queued_before == 0:
                 self.qortal_trace_transmit_buffer_first_enqueued_at = now
+                self.transmit_buffer_last_progress_at = now
+                self.transmit_rearm_logged = False
             self.qortal_trace_transmit_buffer_last_enqueued_at = now
             queued_chunks = len(self.transmit_buffer_chunks) if QORTAL_RNS_LOCAL_IO_V2 else (1 if len(self.transmit_buffer) > 0 else 0)
 
@@ -1192,6 +1352,9 @@ class LocalClientInterface(Interface):
             if remaining == 0:
                 self.qortal_trace_transmit_buffer_first_enqueued_at = 0.0
                 self.qortal_trace_transmit_buffer_last_enqueued_at = 0.0
+            if byte_count > 0:
+                self.transmit_buffer_last_progress_at = time.monotonic()
+                self.transmit_rearm_logged = False
             return remaining
 
     def transmit_buffer_len(self):
@@ -1889,31 +2052,29 @@ class LocalClientInterface(Interface):
 
     def detach(self):
         self._stop_local_dispatch()
-        if self.socket != None:
-            if hasattr(self.socket, "close"):
-                if callable(self.socket.close):
-                    RNS.log("Detaching "+str(self), RNS.LOG_DEBUG)
-                    self.detached = True
+        with self.reconnect_lock:
+            self.detached = True
+            detached_socket = self.socket
+            self.socket = None
 
-                    try:
-                        if (self.epoll_backend or self.selector_backend) and self.socket != None:
-                            LocalSelectorManager._remove_client(self, self.socket)
-                    except Exception as e:
-                        RNS.log("Error while unregistering selector socket for "+str(self)+": "+str(e))
+        if detached_socket != None and hasattr(detached_socket, "close") and callable(detached_socket.close):
+            RNS.log("Detaching "+str(self), RNS.LOG_DEBUG)
 
-                    try:
-                        if self.socket != None:
-                            self.socket.shutdown(socket.SHUT_RDWR)
-                    except Exception as e:
-                        RNS.log("Error while shutting down socket for "+str(self)+": "+str(e))
+            try:
+                if self.epoll_backend or self.selector_backend:
+                    LocalSelectorManager._remove_client(self, detached_socket)
+            except Exception as e:
+                RNS.log("Error while unregistering selector socket for "+str(self)+": "+str(e))
 
-                    try:
-                        if self.socket != None:
-                            self.socket.close()
-                    except Exception as e:
-                        RNS.log("Error while closing socket for "+str(self)+": "+str(e))
+            try:
+                detached_socket.shutdown(socket.SHUT_RDWR)
+            except Exception as e:
+                RNS.log("Error while shutting down socket for "+str(self)+": "+str(e))
 
-                    self.socket = None
+            try:
+                detached_socket.close()
+            except Exception as e:
+                RNS.log("Error while closing socket for "+str(self)+": "+str(e))
 
     def teardown(self, nowarning=False):
         self.online = False
