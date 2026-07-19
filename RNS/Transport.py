@@ -3907,6 +3907,69 @@ class Transport:
             else: return None
 
     @staticmethod
+    def path_snapshot(destination_hash):
+        """Return a serialisable snapshot of the selected route to a destination."""
+        try:
+            destination_hash = bytes(destination_hash)
+        except Exception:
+            return None
+
+        with Transport.path_table_lock:
+            entry = Transport.path_table.get(destination_hash)
+            if entry == None:
+                return None
+            packet_hash = entry[IDX_PT_PACKET]
+            return {
+                "hash": destination_hash,
+                "timestamp": entry[IDX_PT_TIMESTAMP],
+                "via": entry[IDX_PT_NEXT_HOP],
+                "hops": entry[IDX_PT_HOPS],
+                "expires": entry[IDX_PT_EXPIRES],
+                "interface": str(entry[IDX_PT_RVCD_IF]),
+                "packet": bytes(packet_hash) if isinstance(packet_hash, (bytes, bytearray)) else None,
+            }
+
+    @staticmethod
+    def link_route_snapshot(link_id):
+        """Return the current daemon-side route for a validated local Link."""
+        try:
+            link_id = bytes(link_id)
+        except Exception:
+            return None
+
+        with Transport.link_table_lock:
+            entry = Transport.link_table.get(link_id)
+            if entry == None:
+                return None
+
+            local_side, local_interface = Transport._link_route_local_client_side(entry)
+            if local_side == "received":
+                external_interface = entry[IDX_LT_NH_IF]
+                remote_hops = entry[IDX_LT_REM_HOPS]
+            elif local_side == "next_hop":
+                external_interface = entry[IDX_LT_RCVD_IF]
+                remote_hops = entry[IDX_LT_HOPS]
+            else:
+                external_interface = None
+                remote_hops = None
+
+            last_outbound = Transport.link_route_last_outbound.get(link_id)
+            last_migrated = Transport.link_route_last_migrated_at.get(link_id)
+            return {
+                "link_id": link_id,
+                "destination_hash": entry[IDX_LT_DSTHASH],
+                "timestamp": entry[IDX_LT_TIMESTAMP],
+                "validated": bool(entry[IDX_LT_VALIDATED]),
+                "local_side": local_side,
+                "local_interface": str(local_interface) if local_interface != None else None,
+                "external_interface": str(external_interface) if external_interface != None else None,
+                "remote_hops": remote_hops,
+                "next_hop": entry[IDX_LT_NH_TRID],
+                "last_outbound": last_outbound,
+                "last_migrated": last_migrated,
+            }
+
+    @staticmethod
     def next_hop_interface_bitrate(destination_hash):
         next_hop_interface = Transport.next_hop_interface(destination_hash)
         if next_hop_interface != None: return next_hop_interface.bitrate

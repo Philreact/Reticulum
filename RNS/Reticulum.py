@@ -1199,6 +1199,9 @@ class Reticulum:
                         mh = call["max_hops"]
                         self.rpc_return(conn, self.get_path_table(max_hops=mh))
 
+                    if path == "path_snapshot":        self.rpc_return(conn, RNS.Transport.path_snapshot(call["destination_hash"]))
+                    if path == "link_route_snapshot": self.rpc_return(conn, RNS.Transport.link_route_snapshot(call["link_id"]))
+
                     if path == "interface_stats":       self.rpc_return(conn, self.get_interface_stats())
                     if path == "rate_table":            self.rpc_return(conn, self.get_rate_table())
                     if path == "next_hop_if_name":      self.rpc_return(conn, self.get_next_hop_if_name(call["destination_hash"]))
@@ -1338,6 +1341,50 @@ class Reticulum:
                     pass
 
         else: return RNS.Transport.confirm_link_route_migration_from_rpc(link_id, packet_hash)
+
+    def get_path_snapshot(self, destination_hash):
+        if self.is_connected_to_shared_instance:
+            rpc_connection = None
+            try:
+                rpc_connection = self.get_rpc_client()
+                rpc_connection.send_bytes(mp.packb({"get": "path_snapshot", "destination_hash": destination_hash}))
+                if not rpc_connection.poll(0.25):
+                    RNS.log("Shared instance RPC timed out while reading destination path", RNS.LOG_WARNING)
+                    return None
+                return mp.unpackb(rpc_connection.recv_bytes())
+            except Exception as e:
+                RNS.log(f"Shared instance RPC failed while reading destination path: {e}", RNS.LOG_ERROR)
+                return None
+            finally:
+                try:
+                    if rpc_connection != None:
+                        rpc_connection.close()
+                except Exception:
+                    pass
+
+        return RNS.Transport.path_snapshot(destination_hash)
+
+    def get_link_route_snapshot(self, link_id):
+        if self.is_connected_to_shared_instance:
+            rpc_connection = None
+            try:
+                rpc_connection = self.get_rpc_client()
+                rpc_connection.send_bytes(mp.packb({"get": "link_route_snapshot", "link_id": link_id}))
+                if not rpc_connection.poll(0.25):
+                    RNS.log("Shared instance RPC timed out while reading Link route", RNS.LOG_WARNING)
+                    return None
+                return mp.unpackb(rpc_connection.recv_bytes())
+            except Exception as e:
+                RNS.log(f"Shared instance RPC failed while reading Link route: {e}", RNS.LOG_ERROR)
+                return None
+            finally:
+                try:
+                    if rpc_connection != None:
+                        rpc_connection.close()
+                except Exception:
+                    pass
+
+        return RNS.Transport.link_route_snapshot(link_id)
 
     def get_interface_stats(self):
         if self.is_connected_to_shared_instance:

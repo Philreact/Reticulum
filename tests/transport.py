@@ -40,6 +40,7 @@ class TestSharedLinkRouteLiveness(unittest.TestCase):
         self.saved_link_route_last_migrated_at = Transport.link_route_last_migrated_at
         self.saved_link_route_migration_confirming = Transport.link_route_migration_confirming
         self.saved_interfaces = Transport.interfaces
+        self.saved_local_client_interfaces = Transport.local_client_interfaces
         Transport.link_table = {}
         Transport.local_link_owners = {}
         Transport.link_route_last_outbound = {}
@@ -48,6 +49,7 @@ class TestSharedLinkRouteLiveness(unittest.TestCase):
         Transport.link_route_last_migrated_at = {}
         Transport.link_route_migration_confirming = set()
         Transport.interfaces = []
+        Transport.local_client_interfaces = []
 
     def tearDown(self):
         Transport.link_table = self.saved_link_table
@@ -58,6 +60,7 @@ class TestSharedLinkRouteLiveness(unittest.TestCase):
         Transport.link_route_last_migrated_at = self.saved_link_route_last_migrated_at
         Transport.link_route_migration_confirming = self.saved_link_route_migration_confirming
         Transport.interfaces = self.saved_interfaces
+        Transport.local_client_interfaces = self.saved_local_client_interfaces
 
     def make_entry(self, local_interface, network_interface, timestamp=10.0):
         entry = [None] * 9
@@ -193,6 +196,59 @@ class TestSharedLinkRouteLiveness(unittest.TestCase):
         self.assertIs(entry[IDX_LT_RCVD_IF], local_interface)
         self.assertIs(entry[IDX_LT_NH_IF], new_network_interface)
         self.assertIs(Transport.local_link_owners[link_id], local_interface)
+
+    def test_link_route_snapshot_reports_remote_side_for_local_client(self):
+        link_id = b"l" * 16
+        local_interface = _LocalInterface()
+        network_interface = object()
+        Transport.local_client_interfaces = [local_interface]
+        entry = self.make_entry(local_interface, network_interface, timestamp=20.0)
+        entry[IDX_LT_REM_HOPS] = 6
+        Transport.link_table[link_id] = entry
+        Transport.local_link_owners[link_id] = local_interface
+        Transport.link_route_last_outbound[link_id] = 19.0
+
+        snapshot = Transport.link_route_snapshot(link_id)
+
+        self.assertEqual(snapshot["link_id"], link_id)
+        self.assertEqual(snapshot["local_side"], "received")
+        self.assertEqual(snapshot["remote_hops"], 6)
+        self.assertEqual(snapshot["external_interface"], str(network_interface))
+        self.assertEqual(snapshot["last_outbound"], 19.0)
+
+    def test_link_route_snapshot_reports_remote_side_for_local_destination(self):
+        link_id = b"l" * 16
+        local_interface = _LocalInterface()
+        network_interface = object()
+        Transport.local_client_interfaces = [local_interface]
+        entry = self.make_entry(network_interface, local_interface, timestamp=20.0)
+        entry[IDX_LT_HOPS] = 5
+        Transport.link_table[link_id] = entry
+        Transport.local_link_owners[link_id] = local_interface
+
+        snapshot = Transport.link_route_snapshot(link_id)
+
+        self.assertEqual(snapshot["local_side"], "next_hop")
+        self.assertEqual(snapshot["remote_hops"], 5)
+        self.assertEqual(snapshot["external_interface"], str(network_interface))
+
+    def test_path_snapshot_is_copy_safe_and_serialisable(self):
+        destination_hash = b"d" * 16
+        packet_hash = b"p" * 16
+        interface = object()
+        saved_path_table = Transport.path_table
+        try:
+            Transport.path_table = {
+                destination_hash: [10.0, b"n" * 16, 4, 100.0, [], interface, packet_hash]
+            }
+            snapshot = Transport.path_snapshot(destination_hash)
+        finally:
+            Transport.path_table = saved_path_table
+
+        self.assertEqual(snapshot["hash"], destination_hash)
+        self.assertEqual(snapshot["hops"], 4)
+        self.assertEqual(snapshot["packet"], packet_hash)
+        self.assertEqual(snapshot["interface"], str(interface))
 
 
 if __name__ == "__main__":
