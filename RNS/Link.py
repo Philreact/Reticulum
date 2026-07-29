@@ -968,9 +968,10 @@ class Link:
 
         else:
             RNS.log("Incoming response resource failed with status: "+RNS.hexrep([resource.status]), RNS.LOG_DEBUG)
-            for pending_request in self.pending_requests:
+            for pending_request in list(self.pending_requests):
                 if pending_request.request_id == resource.request_id:
-                    pending_request.request_timed_out(None)
+                    pending_request._conclude_failed()
+                    break
 
     def get_channel(self):
         """
@@ -1472,15 +1473,7 @@ class RequestReceipt():
             response_timeout_thread.start()
         else:
             RNS.log("Sending request "+RNS.prettyhexrep(self.request_id)+" as resource failed with status: "+RNS.hexrep([resource.status]), RNS.LOG_DEBUG)
-            self.status = RequestReceipt.FAILED
-            self.concluded_at = time.time()
-            self.link.pending_requests.remove(self)
-
-            if self.callbacks.failed != None:
-                try:
-                    self.callbacks.failed(self)
-                except Exception as e:
-                    RNS.log("Error while executing request failed callback from "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
+            self._conclude_failed()
 
 
     def __response_timeout_job(self):
@@ -1494,7 +1487,11 @@ class RequestReceipt():
 
 
     def request_timed_out(self, packet_receipt):
-        if self in self.link.pending_requests and self.status == RequestReceipt.DELIVERED:
+        self._conclude_failed()
+
+
+    def _conclude_failed(self):
+        if self in self.link.pending_requests and self.status not in [RequestReceipt.FAILED, RequestReceipt.READY]:
             self.status = RequestReceipt.FAILED
             self.concluded_at = time.time()
             self.link.pending_requests.remove(self)
@@ -1502,7 +1499,11 @@ class RequestReceipt():
             if self.callbacks.failed != None:
                 try: self.callbacks.failed(self)
                 except Exception as e:
-                    RNS.log("Error while executing request timed out callback from "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
+                    RNS.log("Error while executing request failed callback from "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
+
+            return True
+
+        return False
 
 
     def response_resource_progress(self, resource):

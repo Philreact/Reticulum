@@ -7,6 +7,7 @@ from .link import TestLink
 from .channel import TestChannel
 from .local_interface import TestLocalInterfaceRecovery
 from .transport import TestSharedLinkRouteLiveness
+from .request_receipt import TestRequestReceiptFailure
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
