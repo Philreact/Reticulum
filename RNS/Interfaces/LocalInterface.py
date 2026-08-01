@@ -831,7 +831,7 @@ class LocalClientInterface(Interface):
         return queued_bytes, max(0.0, now - max(first_enqueued_at, last_progress_at))
 
     def _request_transmit_recovery(self, reason):
-        if self.detached or self.reconnecting or not getattr(self, "is_connected_to_shared_instance", False):
+        if self.detached or self.reconnecting:
             return False
         with self.transmit_recovery_lock:
             if self.transmit_recovery_active:
@@ -844,14 +844,20 @@ class LocalClientInterface(Interface):
         queued_bytes, stalled_for = self._transmit_stalled_for()
         old_socket = self.socket
         try:
+            # The selector may have resumed writing after the watchdog queued
+            # this recovery. Never replace a connection that is progressing
+            # again by the time the recovery worker actually runs.
+            if reason == "no_tx_progress" and stalled_for < QORTAL_RNS_LOCAL_TX_RECOVERY_SECONDS:
+                return
             with self.reconnect_lock:
                 if self.detached or self.reconnecting or queued_bytes <= 0 or self.socket is not old_socket:
                     return
                 self.online = False
                 self.socket = None
 
+            is_shared_client = getattr(self, "is_connected_to_shared_instance", False)
             RNS.log(
-                f"LocalInterface recovering stalled shared socket for {self}: "
+                f"LocalInterface recovering stalled {'shared' if is_shared_client else 'local client'} socket for {self}: "
                 f"reason={reason} queued_bytes={queued_bytes} stalled_for_ms={int(stalled_for*1000)}",
                 RNS.LOG_WARNING
             )
@@ -861,6 +867,16 @@ class LocalClientInterface(Interface):
                 except Exception: pass
                 try: old_socket.close()
                 except Exception: pass
+
+            if not is_shared_client:
+                # Accepted daemon-side clients cannot reconnect themselves.
+                # Closing this side makes the initiator observe EOF and use its
+                # existing shared-instance reconnect path. Nothing queued on
+                # this dead interface can be replayed, so release it now.
+                self._clear_transmit_buffer()
+                self.teardown(nowarning=True)
+                return
+
             self._realign_transmit_buffer_for_reconnect()
             RNS.Transport.shared_connection_disappeared()
             self.reconnect(immediate=True)
@@ -876,7 +892,7 @@ class LocalClientInterface(Interface):
             )
 
         except Exception as e:
-            RNS.log(f"LocalInterface stalled shared socket recovery failed for {self}: {e}", RNS.LOG_ERROR)
+            RNS.log(f"LocalInterface stalled socket recovery failed for {self}: {e}", RNS.LOG_ERROR)
             RNS.trace_exception(e)
         finally:
             with self.transmit_recovery_lock:
@@ -887,6 +903,11 @@ class LocalClientInterface(Interface):
             time.sleep(min(1.0, max(0.1, QORTAL_RNS_LOCAL_TX_REARM_SECONDS/2)))
             try:
                 if not self.online or self.socket == None or self.reconnecting:
+                    # Accepted daemon-side interfaces are one-shot objects. Once
+                    # their client disconnects or is recovered, there is nothing
+                    # for this watchdog to reconnect and its thread must exit.
+                    if not self.is_connected_to_shared_instance and not self.online:
+                        return
                     continue
                 now = time.monotonic()
                 queued_bytes, stalled_for = self._transmit_stalled_for(now)
@@ -930,6 +951,22 @@ class LocalClientInterface(Interface):
                 self.qortal_trace_transmit_buffer_last_enqueued_at = 0.0
             else:
                 self.qortal_trace_transmit_buffer_first_enqueued_at = time.monotonic()
+            return discarded
+
+    def _clear_transmit_buffer(self):
+        with self.transmit_buffer_lock:
+            if QORTAL_RNS_LOCAL_IO_V2:
+                discarded = self.transmit_buffer_queued_bytes
+                self.transmit_buffer_chunks.clear()
+                self.transmit_buffer_queued_bytes = 0
+                self.transmit_buffer_head_offset = 0
+            else:
+                discarded = len(self.transmit_buffer)
+                self.transmit_buffer = b""
+            self.qortal_trace_transmit_buffer_first_enqueued_at = 0.0
+            self.qortal_trace_transmit_buffer_last_enqueued_at = 0.0
+            self.transmit_buffer_last_progress_at = time.monotonic()
+            self.transmit_rearm_logged = False
             return discarded
 
 
@@ -2213,6 +2250,10 @@ class LocalServerInterface(Interface):
                     f"parent={self} clients={self.clients + 1}"
                 )
             LocalSelectorManager.add_client_socket(client_socket, spawned_interface)
+            # Accepted daemon-side clients need the same progress supervision
+            # as the initiating side. A client that stops reading otherwise
+            # leaves an apparently open socket with an unbounded transmit queue.
+            spawned_interface._ensure_transmit_watchdog()
             self.clients += 1
             return True
 

@@ -88,6 +88,51 @@ class TestLocalInterfaceRecovery(unittest.TestCase):
         self.assertEqual(interface.transmit_buffer_queued_bytes, 4)
         self.assertFalse(interface.transmit_recovery_active)
 
+    def test_daemon_side_stall_closes_client_without_shared_reconnect(self):
+        interface = self.make_interface()
+        interface.is_connected_to_shared_instance = False
+        interface.parent_interface = Mock()
+        interface._stop_local_dispatch = Mock()
+        interface.teardown = Mock()
+        interface.reconnect = Mock()
+
+        with patch.object(LocalSelectorManager, "_remove_client"), \
+             patch.object(RNS.Transport, "shared_connection_disappeared") as disappeared:
+            interface._recover_stalled_transmit("test")
+
+        interface.teardown.assert_called_once_with(nowarning=True)
+        interface.reconnect.assert_not_called()
+        disappeared.assert_not_called()
+        self.assertEqual(interface.transmit_buffer_queued_bytes, 0)
+        self.assertEqual(list(interface.transmit_buffer_chunks), [])
+        self.assertEqual(interface.transmit_buffer_head_offset, 0)
+        self.assertFalse(interface.transmit_recovery_active)
+
+    def test_daemon_side_watchdog_exits_after_client_disconnect(self):
+        interface = self.make_interface()
+        interface.is_connected_to_shared_instance = False
+        interface.online = False
+        interface.socket = None
+
+        with patch.object(local_interface_module.time, "sleep"):
+            interface._transmit_watchdog()
+
+    def test_recovery_is_cancelled_if_transmit_progress_resumes(self):
+        interface = self.make_interface()
+        interface.transmit_buffer_last_progress_at = local_interface_module.time.monotonic()
+        original_socket = interface.socket
+        interface.reconnect = Mock()
+
+        with patch.object(LocalSelectorManager, "_remove_client"), \
+             patch.object(RNS.Transport, "shared_connection_disappeared") as disappeared:
+            interface._recover_stalled_transmit("no_tx_progress")
+
+        self.assertIs(interface.socket, original_socket)
+        self.assertTrue(interface.online)
+        interface.reconnect.assert_not_called()
+        disappeared.assert_not_called()
+        self.assertFalse(interface.transmit_recovery_active)
+
     def test_stale_socket_close_does_not_reconnect_current_socket(self):
         stale_socket = Mock()
         stale_socket.recv.return_value = b""
