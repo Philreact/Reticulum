@@ -30,6 +30,22 @@ CHANNEL         = 0x0E
 
 APP_NAME = "rnstransport"
 
+def discovery_connection_interface_type(interface_type):
+    if interface_type in ["BackboneInterface", "TCPServerInterface"]:
+        if RNS.vendor.platformutils.is_windows() or RNS.vendor.platformutils.is_darwin():
+            return "TCPClientInterface"
+
+        backbone_platform_supported = (
+            RNS.vendor.platformutils.is_linux()
+            or RNS.vendor.platformutils.is_android()
+        )
+        if interface_type == "BackboneInterface" and backbone_platform_supported:
+            return "BackboneInterface"
+
+        return "TCPClientInterface"
+
+    return interface_type
+
 class InterfaceAnnouncer():
     JOB_INTERVAL = 60
     DEFAULT_STAMP_VALUE = 16
@@ -331,10 +347,10 @@ class InterfaceAnnounceHandler:
                         if IFAC_NETKEY  in unpacked: info["ifac_netkey"]  = str(unpacked[IFAC_NETKEY])
 
                         if interface_type in ["BackboneInterface", "TCPServerInterface"]:
-                            backbone_support     = not RNS.vendor.platformutils.is_windows() and not RNS.vendor.platformutils.is_darwin()
+                            connection_interface = discovery_connection_interface_type(interface_type)
+                            backbone_support     = connection_interface == "BackboneInterface"
                             info["reachable_on"] = unpacked[REACHABLE_ON]
                             info["port"]         = unpacked[PORT]
-                            connection_interface = "BackboneInterface" if backbone_support else "TCPClientInterface"
                             info["type"]         = connection_interface
                             remote_str           = "remote" if backbone_support else "target_host"
                             cfg_name             = info["name"]
@@ -429,7 +445,7 @@ class InterfaceDiscovery():
     STATUS_AVAILABLE   = 1000
     STATUS_CODE_MAP    = {"available": STATUS_AVAILABLE, "unknown": STATUS_UNKNOWN, "stale": STATUS_STALE}
     AUTOCONNECT_TYPES  = ["BackboneInterface", "TCPServerInterface", "TCPClientInterface"]
-    DISCOVERABLE_TYPES = ["BackboneInterface", "TCPServerInterface", "I2PInterface", "RNodeInterface", "WeaveInterface", "KISSInterface"]
+    DISCOVERABLE_TYPES = ["BackboneInterface", "TCPServerInterface", "TCPClientInterface", "I2PInterface", "RNodeInterface", "WeaveInterface", "KISSInterface"]
 
     AC_TRANSPORT_MODE  = RNS.Interfaces.Interface.Interface.MODE_GATEWAY
     AC_GRAVITY         = 0
@@ -700,7 +716,9 @@ class InterfaceDiscovery():
             if RNS.Reticulum.should_autoconnect_discovered_interfaces():
                 autoconnected_count = self.autoconnect_count()
                 if autoconnected_count < RNS.Reticulum.max_autoconnected_interfaces():
-                    interface_type = info["type"]
+                    # Re-normalise persisted discoveries as well. Records created by
+                    # older versions can still contain the advertised server type.
+                    interface_type = discovery_connection_interface_type(info["type"])
                     if interface_type in self.AUTOCONNECT_TYPES:
                         endpoint_hash = self.endpoint_hash(info)
                         exists = self.interface_exists(info)

@@ -8,6 +8,7 @@ from .channel import TestChannel
 from .request_receipt import TestRequestReceiptFailure
 from .logging import TestLoggingFailureRecovery
 from .link_callback_dispatcher import TestLinkPacketCallbackDispatcher
+from .discovery import TestCrossPlatformInterfaceDiscovery
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
