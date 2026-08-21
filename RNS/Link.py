@@ -236,6 +236,10 @@ class Link:
         self.establishment_rate = None
         self.expected_rate = None
         self.callbacks = LinkCallbacks()
+        # Applications can opt into routing packet callbacks through their own
+        # bounded executor. Leaving this unset preserves the historical
+        # thread-per-packet behaviour.
+        self.packet_callback_dispatcher = None
         self.resource_strategy = Link.ACCEPT_NONE
         self.last_resource_window = None
         self.last_resource_eifr = None
@@ -913,9 +917,10 @@ class Link:
 
         else:
             RNS.log("Incoming response resource failed with status: "+RNS.hexrep([resource.status]), RNS.LOG_DEBUG)
-            for pending_request in self.pending_requests:
+            for pending_request in list(self.pending_requests):
                 if pending_request.request_id == resource.request_id:
-                    pending_request.request_timed_out(None)
+                    pending_request._conclude_failed()
+                    break
 
     def get_channel(self):
         """
@@ -947,9 +952,14 @@ class Link:
                             self.__update_phy_stats(packet, query_shared=True)
 
                             if self.callbacks.packet != None:
-                                thread = threading.Thread(target=self.callbacks.packet, args=(plaintext, packet))
-                                thread.daemon = True
-                                thread.start()
+                                if self.packet_callback_dispatcher != None:
+                                    try:
+                                        self.packet_callback_dispatcher(self.callbacks.packet, plaintext, packet)
+                                    except Exception as e:
+                                        RNS.log("Packet callback dispatcher failed on "+str(self)+": "+str(e)+"; falling back to direct callback thread", RNS.LOG_ERROR)
+                                        threading.Thread(target=self.callbacks.packet, args=(plaintext, packet), daemon=True).start()
+                                else:
+                                    threading.Thread(target=self.callbacks.packet, args=(plaintext, packet), daemon=True).start()
                             
                             if self.destination.proof_strategy == RNS.Destination.PROVE_ALL:
                                 packet.prove()
@@ -1211,6 +1221,18 @@ class Link:
         """
         self.callbacks.packet = callback
 
+    def set_packet_callback_dispatcher(self, dispatcher):
+        """
+        Set an optional dispatcher for incoming packet callbacks. The
+        dispatcher is called as ``dispatcher(callback, data, packet)`` and can
+        enqueue work on an application-owned bounded executor.
+
+        Passing ``None`` restores the default thread-per-packet behaviour.
+        """
+        if dispatcher != None and not callable(dispatcher):
+            raise TypeError("Packet callback dispatcher must be callable or None")
+        self.packet_callback_dispatcher = dispatcher
+
     def set_resource_callback(self, callback):
         """
         Registers a function to be called when a resource has been
@@ -1346,6 +1368,7 @@ class RequestReceipt():
         self.concluded_at           = None
         self.response_concluded_at  = None
         self.max_response_size      = max_response_size
+        self.__conclusion_lock      = threading.Lock()
 
         if timeout != None:
             self.timeout        = timeout
@@ -1361,24 +1384,18 @@ class RequestReceipt():
 
     def request_resource_concluded(self, resource):
         if resource.status == RNS.Resource.COMPLETE:
-            RNS.log("Request "+RNS.prettyhexrep(self.request_id)+" successfully sent as resource.", RNS.LOG_DEBUG)
-            if self.started_at == None:
-                self.started_at = time.time()
-            self.status = RequestReceipt.DELIVERED
-            self.__resource_response_timeout = time.time()+self.timeout
-            response_timeout_thread = threading.Thread(target=self.__response_timeout_job)
-            response_timeout_thread.daemon = True
-            response_timeout_thread.start()
+            with self.__conclusion_lock:
+                if self.status in [RequestReceipt.FAILED, RequestReceipt.READY] or self not in self.link.pending_requests:
+                    return
+                RNS.log("Request "+RNS.prettyhexrep(self.request_id)+" successfully sent as resource.", RNS.LOG_DEBUG)
+                if self.started_at == None:
+                    self.started_at = time.time()
+                self.status = RequestReceipt.DELIVERED
+                self.__resource_response_timeout = time.time()+self.timeout
+            threading.Thread(target=self.__response_timeout_job, daemon=True).start()
         else:
             RNS.log("Sending request "+RNS.prettyhexrep(self.request_id)+" as resource failed with status: "+RNS.hexrep([resource.status]), RNS.LOG_DEBUG)
-            self.status = RequestReceipt.FAILED
-            self.concluded_at = time.time()
-            self.link.pending_requests.remove(self)
-
-            if self.callbacks.failed != None:
-                try: self.callbacks.failed(self)
-                except Exception as e:
-                    RNS.log("Error while executing request failed callback from "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
+            self._conclude_failed()
 
     def __response_timeout_job(self):
         while self.status == RequestReceipt.DELIVERED:
@@ -1390,47 +1407,65 @@ class RequestReceipt():
             time.sleep(0.1)
 
     def request_timed_out(self, packet_receipt):
-        if self in self.link.pending_requests and self.status == RequestReceipt.DELIVERED:
+        self._conclude_failed()
+
+    def _conclude_failed(self):
+        failed_callback = None
+        with self.__conclusion_lock:
+            if self.status in [RequestReceipt.FAILED, RequestReceipt.READY] or self not in self.link.pending_requests:
+                return False
             self.status = RequestReceipt.FAILED
             self.concluded_at = time.time()
             self.link.pending_requests.remove(self)
+            failed_callback = self.callbacks.failed
 
-            if self.callbacks.failed != None:
-                try: self.callbacks.failed(self)
-                except Exception as e: RNS.log("Error while executing request timed out callback from "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
+        if failed_callback != None:
+            try: failed_callback(self)
+            except Exception as e: RNS.log("Error while executing request failed callback from "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
+        return True
 
     def response_rejected(self):
-        if self in self.link.pending_requests and self.status == RequestReceipt.DELIVERED:
-            self.status = RequestReceipt.FAILED
-            self.concluded_at = time.time()
-            self.link.pending_requests.remove(self)
-
-            if self.callbacks.failed != None:
-                try: self.callbacks.failed(self)
-                except Exception as e: RNS.log("Error while executing request timed out callback from "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
+        self._conclude_failed()
 
     def response_resource_progress(self, resource):
         if resource != None:
-            if not self.status == RequestReceipt.FAILED:
-                self.status = RequestReceipt.RECEIVING
-                if self.packet_receipt != None:
-                    if self.packet_receipt.status != RNS.PacketReceipt.DELIVERED:
-                        self.packet_receipt.status = RNS.PacketReceipt.DELIVERED
-                        self.packet_receipt.proved = True
-                        self.packet_receipt.concluded_at = time.time()
-                        if self.packet_receipt.callbacks.delivery != None:
-                            self.packet_receipt.callbacks.delivery(self.packet_receipt)
+            delivery_callback = None
+            progress_callback = None
+            cancel_resource = False
+            with self.__conclusion_lock:
+                if self.status in [RequestReceipt.FAILED, RequestReceipt.READY] or self not in self.link.pending_requests:
+                    cancel_resource = True
+                else:
+                    self.status = RequestReceipt.RECEIVING
+                    if self.packet_receipt != None:
+                        if self.packet_receipt.status != RNS.PacketReceipt.DELIVERED:
+                            self.packet_receipt.status = RNS.PacketReceipt.DELIVERED
+                            self.packet_receipt.proved = True
+                            self.packet_receipt.concluded_at = time.time()
+                            delivery_callback = self.packet_receipt.callbacks.delivery
 
-                self.progress = resource.get_progress()
-                
-                if self.callbacks.progress != None:
-                    try: self.callbacks.progress(self)
-                    except Exception as e: RNS.log("Error while executing response progress callback from "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
-            
-            else: resource.cancel()
+                    self.progress = resource.get_progress()
+                    progress_callback = self.callbacks.progress
+
+            if cancel_resource:
+                resource.cancel()
+                return
+
+            if delivery_callback != None:
+                try: delivery_callback(self.packet_receipt)
+                except Exception as e: RNS.log("Error while executing request delivery callback from "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
+
+            if progress_callback != None:
+                try: progress_callback(self)
+                except Exception as e: RNS.log("Error while executing response progress callback from "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
     
     def response_received(self, response, metadata=None):
-        if not self.status == RequestReceipt.FAILED:
+        delivery_callback = None
+        progress_callback = None
+        response_callback = None
+        with self.__conclusion_lock:
+            if self.status in [RequestReceipt.FAILED, RequestReceipt.READY] or self not in self.link.pending_requests:
+                return
             self.progress = 1.0
             self.response = response
             self.metadata = metadata
@@ -1441,16 +1476,22 @@ class RequestReceipt():
                 self.packet_receipt.status = RNS.PacketReceipt.DELIVERED
                 self.packet_receipt.proved = True
                 self.packet_receipt.concluded_at = time.time()
-                if self.packet_receipt.callbacks.delivery != None:
-                    self.packet_receipt.callbacks.delivery(self.packet_receipt)
+                delivery_callback = self.packet_receipt.callbacks.delivery
 
-            if self.callbacks.progress != None:
-                try: self.callbacks.progress(self)
-                except Exception as e: RNS.log("Error while executing response progress callback from "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
+            progress_callback = self.callbacks.progress
+            response_callback = self.callbacks.response
 
-            if self.callbacks.response != None:
-                try: self.callbacks.response(self)
-                except Exception as e: RNS.log("Error while executing response received callback from "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
+        if delivery_callback != None:
+            try: delivery_callback(self.packet_receipt)
+            except Exception as e: RNS.log("Error while executing request delivery callback from "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
+
+        if progress_callback != None:
+            try: progress_callback(self)
+            except Exception as e: RNS.log("Error while executing response progress callback from "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
+
+        if response_callback != None:
+            try: response_callback(self)
+            except Exception as e: RNS.log("Error while executing response received callback from "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
 
     def get_request_id(self):
         """

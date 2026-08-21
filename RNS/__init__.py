@@ -95,6 +95,12 @@ _always_override_destination = False
 
 logging_lock = threading.Lock()
 
+def _print_log_fallback(lines):
+    if not threading.main_thread().is_alive(): return
+    for line in lines:
+        try: print(line)
+        except: pass
+
 def loglevelname(level):
     if (level == LOG_CRITICAL): return "[Critical]"
     if (level == LOG_ERROR):    return "[Error]   "
@@ -133,6 +139,7 @@ def log(msg, level=3, _override_destination = False, pt=False):
             if not compact_log_fmt: logstring = ("["+timestamp_str(time.time())+"] " if logtimestamps else "")+loglevelname(level)+" "+msg
             else:                   logstring = ("["+timestamp_str(time.time())+"] " if logtimestamps else "")+msg
 
+        fallback_lines = None
         with logging_lock:
             if (logdest == LOG_STDOUT or _always_override_destination or _override_destination):
                 if not threading.main_thread().is_alive(): return
@@ -150,17 +157,24 @@ def log(msg, level=3, _override_destination = False, pt=False):
 
                 except Exception as e:
                     _always_override_destination = True
-                    log("Exception occurred while writing log message to log file: "+str(e), LOG_CRITICAL)
-                    log("Dumping future log events to console!", LOG_CRITICAL)
-                    log(msg, level)
+                    fallback_lines = [
+                        loglevelname(LOG_CRITICAL)+" Exception occurred while writing log message to log file: "+str(e),
+                        loglevelname(LOG_CRITICAL)+" Dumping future log events to console!",
+                        logstring,
+                    ]
 
             elif logdest == LOG_CALLBACK:
                 try: logcall(logstring)
                 except Exception as e:
                     _always_override_destination = True
-                    log("Exception occurred while calling external log handler: "+str(e), LOG_CRITICAL)
-                    log("Dumping future log events to console!", LOG_CRITICAL)
-                    log(msg, level)
+                    fallback_lines = [
+                        loglevelname(LOG_CRITICAL)+" Exception occurred while calling external log handler: "+str(e),
+                        loglevelname(LOG_CRITICAL)+" Dumping future log events to console!",
+                        logstring,
+                    ]
+
+        if fallback_lines != None:
+            _print_log_fallback(fallback_lines)
                 
 
 def rand():
