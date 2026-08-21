@@ -335,6 +335,7 @@ class InterfaceAnnounceHandler:
                             info["reachable_on"] = unpacked[REACHABLE_ON]
                             info["port"]         = unpacked[PORT]
                             connection_interface = "BackboneInterface" if backbone_support else "TCPClientInterface"
+                            info["type"]         = connection_interface
                             remote_str           = "remote" if backbone_support else "target_host"
                             cfg_name             = info["name"]
                             cfg_remote           = info["reachable_on"]
@@ -427,7 +428,7 @@ class InterfaceDiscovery():
     STATUS_UNKNOWN     = 100
     STATUS_AVAILABLE   = 1000
     STATUS_CODE_MAP    = {"available": STATUS_AVAILABLE, "unknown": STATUS_UNKNOWN, "stale": STATUS_STALE}
-    AUTOCONNECT_TYPES  = ["BackboneInterface", "TCPServerInterface"]
+    AUTOCONNECT_TYPES  = ["BackboneInterface", "TCPServerInterface", "TCPClientInterface"]
     DISCOVERABLE_TYPES = ["BackboneInterface", "TCPServerInterface", "I2PInterface", "RNodeInterface", "WeaveInterface", "KISSInterface"]
 
     AC_TRANSPORT_MODE  = RNS.Interfaces.Interface.Interface.MODE_GATEWAY
@@ -706,12 +707,6 @@ class InterfaceDiscovery():
 
                         if exists: RNS.log(f"Discovered {interface_type} already exists, not auto-connecting", RNS.LOG_DEBUG)
                         else:
-                            if interface_type == "TCPClientInterface":
-                                RNS.log(f"Your operating system does not support the Backbone interface type, and must degrade to using TCPClientInterface instead", RNS.LOG_WARNING)
-                                RNS.log(f"Auto-connecting discovered TCPClient interfaces is not yet implemented, aborting auto-connect", RNS.LOG_WARNING)
-                                RNS.log(f"You can obtain the configuration entry and add this interface manually instead using rnstatus -D", RNS.LOG_WARNING)
-                                return
-
                             if interface_type == "I2PInterface":
                                 RNS.log(f"Auto-connecting discovered I2P interfaces is not yet implemented, aborting auto-connect", RNS.LOG_WARNING)
                                 RNS.log(f"You can obtain the configuration entry and add this interface manually instead using rnstatus -D", RNS.LOG_WARNING)
@@ -734,6 +729,12 @@ class InterfaceDiscovery():
                                 interface_config["target_host"] = info["reachable_on"]
                                 interface_config["target_port"] = info["port"]
                                 interface = BackboneInterface.BackboneClientInterface(RNS.Transport, interface_config)
+
+                            if interface_type == "TCPClientInterface":
+                                from RNS.Interfaces import TCPInterface
+                                interface_config["target_host"] = info["reachable_on"]
+                                interface_config["target_port"] = info["port"]
+                                interface = TCPInterface.TCPClientInterface(RNS.Transport, interface_config)
 
                             if interface:
                                 RNS.log(f"Auto-connecting discovered {interface_type} {interface_name}")
