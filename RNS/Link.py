@@ -239,6 +239,12 @@ class Link:
         self.establishment_rate = None
         self.expected_rate = None
         self.callbacks = LinkCallbacks()
+        # Applications that already own bounded worker queues can opt out of
+        # Link's historical thread-per-packet callback dispatch. The
+        # dispatcher must return quickly and accept ``(callback, message,
+        # packet)``. Reticulum's default remains unchanged for every Link that
+        # does not explicitly install one.
+        self.packet_callback_dispatcher = None
         self.resource_strategy = Link.ACCEPT_NONE
         self.last_resource_window = None
         self.last_resource_eifr = None
@@ -1029,9 +1035,23 @@ class Link:
                                         qortal_probe("callback_dispatch", self, packet, time.monotonic(), time.time())
                                 except Exception:
                                     pass
-                                thread = threading.Thread(target=self.callbacks.packet, args=(plaintext, packet))
-                                thread.daemon = True
-                                thread.start()
+                                if self.packet_callback_dispatcher != None:
+                                    try:
+                                        self.packet_callback_dispatcher(self.callbacks.packet, plaintext, packet)
+                                    except Exception as e:
+                                        RNS.log("Error while dispatching link packet callback from "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
+                                        # A faulty application dispatcher must
+                                        # not turn a valid encrypted packet
+                                        # into silent data loss. Fall back to
+                                        # the historical delivery behavior for
+                                        # this packet only.
+                                        thread = threading.Thread(target=self.callbacks.packet, args=(plaintext, packet))
+                                        thread.daemon = True
+                                        thread.start()
+                                else:
+                                    thread = threading.Thread(target=self.callbacks.packet, args=(plaintext, packet))
+                                    thread.daemon = True
+                                    thread.start()
                             else:
                                 try:
                                     qortal_probe = getattr(RNS, "_qortal_link_receive_probe", None)
@@ -1314,6 +1334,17 @@ class Link:
         :param callback: A function or method with the signature *callback(message, packet)* to be called.
         """
         self.callbacks.packet = callback
+
+    def set_packet_callback_dispatcher(self, dispatcher):
+        """
+        Registers an optional bounded dispatcher for packet callbacks.
+
+        The dispatcher is called with ``(callback, message, packet)`` and is
+        responsible for scheduling callback execution. If no dispatcher is
+        configured, each packet retains the traditional daemon-thread
+        behaviour.
+        """
+        self.packet_callback_dispatcher = dispatcher
 
     def set_resource_callback(self, callback):
         """
