@@ -66,6 +66,11 @@ class EventedSocketIO:
     wakeup_writer = None
     wakeup_fileno = None
     _backend_lock = threading.Lock()
+    # selectors.BaseSelector.modify() is implemented as unregister()+register()
+    # on platforms such as macOS. Keep complete selector state transitions
+    # serialised so producer threads cannot interleave with the event loop or
+    # with another producer and leave a live socket unregistered.
+    _selector_lock = threading.RLock()
     listener_filenos = {}
     spawned_interface_filenos = {}
     _job_active = False
@@ -263,45 +268,48 @@ class EventedSocketIO:
 
     @staticmethod
     def _register_or_recover_fileno(fileno, mask, owner=None):
-        try:
-            EventedSocketIO._register_fileno(fileno, mask)
-            return True
-        except Exception as e:
-            if not EventedSocketIO._fileno_already_registered_error(e):
-                raise e
-
+        with EventedSocketIO._selector_lock:
             try:
-                EventedSocketIO._modify_fileno(fileno, mask)
-                RNS.log(f"Recovered already registered local I/O file descriptor {fileno} for {owner}", RNS.LOG_DEBUG)
+                EventedSocketIO._register_fileno(fileno, mask)
                 return True
-            except Exception as modify_error:
-                RNS.log(f"Unable to recover already registered local I/O file descriptor {fileno} for {owner}: {modify_error}", RNS.LOG_DEBUG)
-                return False
+            except Exception as e:
+                if not EventedSocketIO._fileno_already_registered_error(e):
+                    raise e
+
+                try:
+                    EventedSocketIO._modify_fileno(fileno, mask)
+                    RNS.log(f"Recovered already registered local I/O file descriptor {fileno} for {owner}", RNS.LOG_DEBUG)
+                    return True
+                except Exception as modify_error:
+                    RNS.log(f"Unable to recover already registered local I/O file descriptor {fileno} for {owner}: {modify_error}", RNS.LOG_DEBUG)
+                    return False
 
     @staticmethod
     def _modify_or_recover_fileno(fileno, mask, owner=None):
-        try:
-            EventedSocketIO._modify_fileno(fileno, mask)
-            return True
-        except Exception as e:
-            if not EventedSocketIO._fileno_not_registered_error(e):
-                raise e
-
+        with EventedSocketIO._selector_lock:
             try:
-                if not EventedSocketIO._register_or_recover_fileno(fileno, mask, owner):
-                    return False
-                RNS.log(f"Recovered unregistered local I/O file descriptor {fileno} for {owner}", RNS.LOG_DEBUG)
+                EventedSocketIO._modify_fileno(fileno, mask)
                 return True
-            except Exception as register_error:
-                RNS.log(f"Unable to recover unregistered local I/O file descriptor {fileno} for {owner}: {register_error}", RNS.LOG_DEBUG)
-                return False
+            except Exception as e:
+                if not EventedSocketIO._fileno_not_registered_error(e):
+                    raise e
+
+                try:
+                    if not EventedSocketIO._register_or_recover_fileno(fileno, mask, owner):
+                        return False
+                    RNS.log(f"Recovered unregistered local I/O file descriptor {fileno} for {owner}", RNS.LOG_DEBUG)
+                    return True
+                except Exception as register_error:
+                    RNS.log(f"Unable to recover unregistered local I/O file descriptor {fileno} for {owner}: {register_error}", RNS.LOG_DEBUG)
+                    return False
 
     @staticmethod
     def _unregister_fileno(fileno):
-        if EventedSocketIO.event_backend == "epoll":
-            EventedSocketIO.epoll.unregister(fileno)
-        else:
-            EventedSocketIO.selector.unregister(fileno)
+        with EventedSocketIO._selector_lock:
+            if EventedSocketIO.event_backend == "epoll":
+                EventedSocketIO.epoll.unregister(fileno)
+            else:
+                EventedSocketIO.selector.unregister(fileno)
 
     @staticmethod
     def _poll(timeout):
@@ -336,19 +344,20 @@ class EventedSocketIO:
         server_socket.listen(64)
         server_socket.setblocking(0)
         fileno = server_socket.fileno()
-        EventedSocketIO.listener_filenos[fileno] = (interface, server_socket)
-        try:
-            registered = EventedSocketIO._register_or_recover_fileno(
-                fileno, EventedSocketIO._read_mask(), interface
-            )
-        except Exception:
-            EventedSocketIO.listener_filenos.pop(fileno, None)
-            server_socket.close()
-            raise
-        if not registered:
-            EventedSocketIO.listener_filenos.pop(fileno, None)
-            server_socket.close()
-            raise OSError(f"Unable to register local I/O listener for {interface}")
+        with EventedSocketIO._selector_lock:
+            EventedSocketIO.listener_filenos[fileno] = (interface, server_socket)
+            try:
+                registered = EventedSocketIO._register_or_recover_fileno(
+                    fileno, EventedSocketIO._read_mask(), interface
+                )
+            except Exception:
+                EventedSocketIO.listener_filenos.pop(fileno, None)
+                server_socket.close()
+                raise
+            if not registered:
+                EventedSocketIO.listener_filenos.pop(fileno, None)
+                server_socket.close()
+                raise OSError(f"Unable to register local I/O listener for {interface}")
         EventedSocketIO.start()
         EventedSocketIO.wake()
 
@@ -357,13 +366,14 @@ class EventedSocketIO:
         EventedSocketIO.ensure_backend()
         client_socket.setblocking(0)
         fileno = client_socket.fileno()
-        EventedSocketIO.spawned_interface_filenos[fileno] = interface
-        if not EventedSocketIO.register_in(fileno):
-            if EventedSocketIO.spawned_interface_filenos.get(fileno) is interface:
-                EventedSocketIO.spawned_interface_filenos.pop(fileno, None)
-            try: client_socket.close()
-            except Exception: pass
-            raise OSError(f"Unable to register local I/O client for {interface}")
+        with EventedSocketIO._selector_lock:
+            EventedSocketIO.spawned_interface_filenos[fileno] = interface
+            if not EventedSocketIO.register_in(fileno):
+                if EventedSocketIO.spawned_interface_filenos.get(fileno) is interface:
+                    EventedSocketIO.spawned_interface_filenos.pop(fileno, None)
+                try: client_socket.close()
+                except Exception: pass
+                raise OSError(f"Unable to register local I/O client for {interface}")
         EventedSocketIO.wake()
         EventedSocketIO.start()
 
@@ -396,31 +406,34 @@ class EventedSocketIO:
 
     @staticmethod
     def deregister_listeners():
-        for fileno in list(EventedSocketIO.listener_filenos):
-            owner_interface, server_socket = EventedSocketIO.listener_filenos[fileno]
-            fileno = server_socket.fileno()
-            EventedSocketIO.deregister_fileno(fileno)
-            server_socket.close()
-
-        EventedSocketIO.listener_filenos.clear()
+        with EventedSocketIO._selector_lock:
+            listeners = list(EventedSocketIO.listener_filenos.items())
+            EventedSocketIO.listener_filenos.clear()
+            for fileno, (_, server_socket) in listeners:
+                EventedSocketIO.deregister_fileno(fileno)
+                server_socket.close()
 
     @staticmethod
     def tx_ready(interface):
-        if interface.socket:
-            fileno = interface.socket.fileno()
+        with EventedSocketIO._selector_lock:
+            client_socket = interface.socket
+            if client_socket:
+                fileno = client_socket.fileno()
+            else:
+                return
             if fileno < 0:
                 EventedSocketIO._remove_spawned_interface_by_object(interface)
                 return
-            if EventedSocketIO.spawned_interface_filenos.get(fileno) is interface:
+            if EventedSocketIO.spawned_interface_filenos.get(fileno) is interface and interface.socket is client_socket:
                 EventedSocketIO._note_tx_buffer(EventedSocketIO._pending_length(interface))
                 try:
                     recovered = EventedSocketIO._modify_or_recover_fileno(fileno, EventedSocketIO._read_write_mask(), interface)
                     EventedSocketIO.wake()
                     if not recovered:
-                        EventedSocketIO._close_client_socket(fileno, interface, interface.socket, error=True)
+                        RNS.log(f"Deferred local I/O write interest update for {interface}; socket remains open", RNS.LOG_DEBUG)
                 except Exception as e:
                     RNS.log(f"Error occurred on {interface} while modifying local I/O state: {e}", RNS.LOG_WARNING)
-                    EventedSocketIO._close_client_socket(fileno, interface, interface.socket, error=True)
+                    EventedSocketIO.wake()
 
     @staticmethod
     def _set_client_interest(fileno, interface):
@@ -458,8 +471,9 @@ class EventedSocketIO:
     @staticmethod
     def _remove_spawned_interface(fileno, spawned_interface):
         try:
-            if EventedSocketIO.spawned_interface_filenos.get(fileno) is spawned_interface:
-                EventedSocketIO.spawned_interface_filenos.pop(fileno)
+            with EventedSocketIO._selector_lock:
+                if EventedSocketIO.spawned_interface_filenos.get(fileno) is spawned_interface:
+                    EventedSocketIO.spawned_interface_filenos.pop(fileno)
         except Exception as e:
             RNS.log(f"Error while removing spawned interface file descriptor from local I/O handler: {e}", RNS.LOG_ERROR)
 
@@ -475,40 +489,45 @@ class EventedSocketIO:
 
     @staticmethod
     def _remove_spawned_interface_by_object(spawned_interface):
-        for fileno, mapped_interface in list(EventedSocketIO.spawned_interface_filenos.items()):
-            if mapped_interface == spawned_interface:
-                EventedSocketIO.deregister_fileno(fileno)
-                EventedSocketIO._remove_spawned_interface(fileno, spawned_interface)
+        with EventedSocketIO._selector_lock:
+            for fileno, mapped_interface in list(EventedSocketIO.spawned_interface_filenos.items()):
+                if mapped_interface == spawned_interface:
+                    EventedSocketIO.deregister_fileno(fileno)
+                    EventedSocketIO._remove_spawned_interface(fileno, spawned_interface)
 
     @staticmethod
     def detach_client_interface(interface):
-        for fileno, mapped_interface in list(EventedSocketIO.spawned_interface_filenos.items()):
-            if mapped_interface is interface:
-                EventedSocketIO.deregister_fileno(fileno)
-                EventedSocketIO.spawned_interface_filenos.pop(fileno, None)
+        with EventedSocketIO._selector_lock:
+            for fileno, mapped_interface in list(EventedSocketIO.spawned_interface_filenos.items()):
+                if mapped_interface is interface:
+                    EventedSocketIO.deregister_fileno(fileno)
+                    EventedSocketIO.spawned_interface_filenos.pop(fileno, None)
         if hasattr(interface, "clear_transmit_buffer"):
             interface.clear_transmit_buffer()
 
     @staticmethod
     def detach_listener_interface(interface):
-        for fileno, listener in list(EventedSocketIO.listener_filenos.items()):
-            owner_interface, server_socket = listener
-            if owner_interface is interface:
-                EventedSocketIO.deregister_fileno(fileno)
-                EventedSocketIO.listener_filenos.pop(fileno, None)
-                try: server_socket.close()
-                except Exception: pass
+        with EventedSocketIO._selector_lock:
+            for fileno, listener in list(EventedSocketIO.listener_filenos.items()):
+                owner_interface, server_socket = listener
+                if owner_interface is interface:
+                    EventedSocketIO.deregister_fileno(fileno)
+                    EventedSocketIO.listener_filenos.pop(fileno, None)
+                    try: server_socket.close()
+                    except Exception: pass
 
     @staticmethod
     def _close_client_socket(fileno, spawned_interface, client_socket, error=False):
-        if EventedSocketIO.spawned_interface_filenos.get(fileno) is not spawned_interface or spawned_interface.socket is not client_socket:
-            return
+        with EventedSocketIO._selector_lock:
+            if EventedSocketIO.spawned_interface_filenos.get(fileno) is not spawned_interface or spawned_interface.socket is not client_socket:
+                return
+            EventedSocketIO.deregister_fileno(fileno)
+            EventedSocketIO.spawned_interface_filenos.pop(fileno, None)
         if error:
             EventedSocketIO._note_stat("socket_error_count")
         else:
             EventedSocketIO._note_stat("socket_close_count")
 
-        EventedSocketIO.deregister_fileno(fileno)
         EventedSocketIO._remove_spawned_interface(fileno, spawned_interface)
         if hasattr(spawned_interface, "clear_transmit_buffer"):
             spawned_interface.clear_transmit_buffer()
@@ -607,12 +626,11 @@ class EventedSocketIO:
         if not closed:
             try:
                 if not EventedSocketIO._set_client_interest(fileno, spawned_interface):
-                    EventedSocketIO._close_client_socket(fileno, spawned_interface, client_socket, error=True)
-                    closed = True
+                    RNS.log(f"Deferred local event I/O interest update for {spawned_interface}; socket remains open", RNS.LOG_DEBUG)
+                    EventedSocketIO.wake()
             except Exception as e:
-                RNS.log(f"Error while setting local event I/O interest on {spawned_interface}: {e}", RNS.LOG_ERROR)
-                EventedSocketIO._close_client_socket(fileno, spawned_interface, client_socket, error=True)
-                closed = True
+                RNS.log(f"Error while setting local event I/O interest on {spawned_interface}: {e}", RNS.LOG_WARNING)
+                EventedSocketIO.wake()
 
         return closed
 
@@ -652,8 +670,9 @@ class EventedSocketIO:
             EventedSocketIO._drain_wakeup()
             return
 
-        if fileno in EventedSocketIO.spawned_interface_filenos:
-            spawned_interface = EventedSocketIO.spawned_interface_filenos[fileno]
+        with EventedSocketIO._selector_lock:
+            spawned_interface = EventedSocketIO.spawned_interface_filenos.get(fileno)
+        if spawned_interface != None:
             client_socket = spawned_interface.socket
             socket_closed = False
             if client_socket and fileno == client_socket.fileno() and EventedSocketIO._is_read_event(event):
@@ -664,8 +683,10 @@ class EventedSocketIO:
                 EventedSocketIO._close_client_socket(fileno, spawned_interface, client_socket, error=bool(event & select.EPOLLERR))
             return
 
-        if fileno in EventedSocketIO.listener_filenos:
-            owner_interface, server_socket = EventedSocketIO.listener_filenos[fileno]
+        with EventedSocketIO._selector_lock:
+            listener = EventedSocketIO.listener_filenos.get(fileno)
+        if listener != None:
+            owner_interface, server_socket = listener
             if fileno == server_socket.fileno() and EventedSocketIO._is_read_event(event):
                 client_socket = None
                 try:

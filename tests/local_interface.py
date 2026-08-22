@@ -1,4 +1,5 @@
 import select
+import selectors
 import threading
 import time
 import unittest
@@ -31,6 +32,21 @@ class _FakeEpoll:
 
     def modify(self, fileno, interest):
         self.modifications.append((fileno, interest))
+
+
+class _ConcurrentModifyDetector:
+    def __init__(self):
+        self.active = 0
+        self.maximum_active = 0
+        self.lock = threading.Lock()
+
+    def modify(self, fileno, interest):
+        with self.lock:
+            self.active += 1
+            self.maximum_active = max(self.maximum_active, self.active)
+        time.sleep(0.01)
+        with self.lock:
+            self.active -= 1
 
 
 class TestLocalInterfaceIo(unittest.TestCase):
@@ -91,6 +107,71 @@ class TestLocalInterfaceIo(unittest.TestCase):
             BackboneInterface.tx_ready(interface)
 
         self.assertEqual(fake_epoll.modifications, [])
+
+    def test_selector_interest_updates_are_serialized(self):
+        selector = _ConcurrentModifyDetector()
+        start = threading.Barrier(9)
+        results = []
+
+        def update_interest():
+            start.wait()
+            results.append(EventedSocketIO._modify_or_recover_fileno(42, selectors.EVENT_READ))
+
+        with patch.object(EventedSocketIO, "event_backend", "KqueueSelector"), patch.object(
+            EventedSocketIO, "selector", selector
+        ):
+            threads = [threading.Thread(target=update_interest) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            start.wait()
+            for thread in threads:
+                thread.join()
+
+        self.assertEqual(results, [True] * 8)
+        self.assertEqual(selector.maximum_active, 1)
+
+    def test_tx_ready_does_not_close_socket_for_selector_state_failure(self):
+        fileno = 42
+        interface = type("Interface", (), {"socket": _FakeSocket(fileno), "transmit_buffer": b"queued"})()
+
+        with patch.object(
+            EventedSocketIO,
+            "spawned_interface_filenos",
+            {fileno: interface},
+        ), patch.object(
+            EventedSocketIO, "_modify_or_recover_fileno", return_value=False
+        ), patch.object(
+            EventedSocketIO, "_close_client_socket"
+        ) as close_socket, patch.object(EventedSocketIO, "wake"):
+            EventedSocketIO.tx_ready(interface)
+
+        close_socket.assert_not_called()
+        self.assertFalse(getattr(interface.socket, "closed", False))
+
+    def test_write_rearm_failure_does_not_close_healthy_socket(self):
+        fileno = 42
+        client_socket = _FakeSocket(fileno)
+        interface = type(
+            "Interface",
+            (),
+            {
+                "socket": client_socket,
+                "transmit_buffer": b"",
+                "detached": False,
+                "parent_interface": None,
+            },
+        )()
+
+        with patch.object(
+            EventedSocketIO, "_set_client_interest", return_value=False
+        ), patch.object(
+            EventedSocketIO, "_close_client_socket"
+        ) as close_socket, patch.object(EventedSocketIO, "wake"):
+            closed = EventedSocketIO._write_client_socket(fileno, interface, client_socket)
+
+        self.assertFalse(closed)
+        close_socket.assert_not_called()
+        self.assertFalse(getattr(client_socket, "closed", False))
 
     def test_transmit_queue_preserves_concurrent_appends(self):
         interface = LocalClientInterface.__new__(LocalClientInterface)
