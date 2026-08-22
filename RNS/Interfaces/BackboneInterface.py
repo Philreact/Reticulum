@@ -29,12 +29,11 @@
 # SOFTWARE.
 
 from RNS.Interfaces.Interface import Interface
+from RNS.Interfaces.EventedSocketIO import EventedSocketIO
+from collections import deque
 import threading
 import socket
-import select
 import time
-import sys
-import os
 import RNS
 
 class HDLC():
@@ -60,13 +59,6 @@ class BackboneInterface(Interface):
     FAST_FLAP_EXPIRY    = 12*60*60
     fast_flapping_lock  = threading.Lock()
     fast_flapping       = {}
-
-    epoll = None
-    listener_filenos = {}
-    spawned_interface_filenos = {}
-    epoll = None
-    _job_active = False
-    _job_lock = threading.Lock()
 
     @staticmethod
     def get_address_for_if(name, bind_port, prefer_ipv6=False):
@@ -223,204 +215,35 @@ class BackboneInterface(Interface):
 
     @staticmethod
     def start():
-        if not BackboneInterface._job_active: threading.Thread(target=BackboneInterface.__job, daemon=True).start()
+        EventedSocketIO.start()
 
     @staticmethod
     def ensure_epoll():
-        if not BackboneInterface.epoll: BackboneInterface.epoll = select.epoll()
+        EventedSocketIO.ensure_backend()
 
     @staticmethod
     def add_listener(interface, bind_address, socket_type=socket.AF_INET):
-        BackboneInterface.ensure_epoll()
-        if socket_type == socket.AF_INET:
-            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server_socket.bind(bind_address)
-        elif socket_type == socket.AF_INET6:
-            server_socket = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server_socket.bind(bind_address)
-        elif socket_type == socket.AF_UNIX:
-            server_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            server_socket.bind(bind_address)
-        else: raise TypeError(f"Invalid socket type {socket_type} for {interface}")
-
-        server_socket.listen(1)
-        server_socket.setblocking(0)
-        BackboneInterface.listener_filenos[server_socket.fileno()] = (interface, server_socket)
-        BackboneInterface.epoll.register(server_socket.fileno(), select.EPOLLIN)
-        BackboneInterface.start()
+        EventedSocketIO.add_listener(interface, bind_address, socket_type=socket_type)
 
     @staticmethod
     def add_client_socket(client_socket, interface):
-        BackboneInterface.ensure_epoll()
-        BackboneInterface.spawned_interface_filenos[client_socket.fileno()] = interface
-        BackboneInterface.register_in(client_socket.fileno())
-        BackboneInterface.start()
+        EventedSocketIO.add_client_socket(client_socket, interface)
 
     @staticmethod
     def register_in(fileno):
-        if fileno < 0:
-            RNS.log(f"Attempt to register invalid file descriptor {fileno}", RNS.LOG_WARNING)
-            return
-
-        try: BackboneInterface.epoll.register(fileno, select.EPOLLIN)
-        except Exception as e:
-            RNS.log(f"An error occurred while registering EPOLL_IN for file descriptor {fileno}: {e}", RNS.LOG_WARNING)
+        EventedSocketIO.register_in(fileno)
 
     @staticmethod
     def deregister_fileno(fileno):
-        if fileno < 0:
-            RNS.log(f"Attempt to deregister invalid file descriptor {fileno}", RNS.LOG_DEBUG)
-            return
-
-        try: BackboneInterface.epoll.unregister(fileno)
-        except Exception as e:
-            if   str(e).endswith("No such file or directory"): pass
-            elif str(e).endswith("Bad file descriptor"):       pass
-            else: RNS.log(f"An error occurred while deregistering file descriptor {fileno}: {e}", RNS.LOG_DEBUG)
+        EventedSocketIO.deregister_fileno(fileno)
 
     @staticmethod
     def deregister_listeners():
-        for fileno in BackboneInterface.listener_filenos:
-            owner_interface, server_socket = BackboneInterface.listener_filenos[fileno]
-            fileno = server_socket.fileno()
-            BackboneInterface.deregister_fileno(fileno)
-            server_socket.close()
-
-        BackboneInterface.listener_filenos.clear()
+        EventedSocketIO.deregister_listeners()
 
     @staticmethod
     def tx_ready(interface):
-        if interface.socket:
-            fileno = interface.socket.fileno()
-            if fileno in BackboneInterface.spawned_interface_filenos:
-                try: BackboneInterface.epoll.modify(fileno, select.EPOLLOUT)
-                except Exception as e:
-                    if   str(e).endswith("No such file or directory"): pass
-                    elif str(e).endswith("Bad file descriptor"):       pass
-                    else: RNS.log(f"Error occurred on {interface} while modifying socket EPOLL state: {e}", RNS.LOG_WARNING)
-                    raise e
-
-    @staticmethod
-    def __job():
-        with BackboneInterface._job_lock:
-            if BackboneInterface._job_active: return
-            else:
-                BackboneInterface._job_active = True
-                BackboneInterface.ensure_epoll()
-                try:
-                    while True:
-                        events = BackboneInterface.epoll.poll(1)
-                        for fileno, event in BackboneInterface.epoll.poll(1):
-                            if fileno in BackboneInterface.spawned_interface_filenos:
-                                spawned_interface = BackboneInterface.spawned_interface_filenos[fileno]
-                                client_socket = spawned_interface.socket
-                                if client_socket and fileno == client_socket.fileno() and (event & select.EPOLLIN):
-                                    try: received_bytes = client_socket.recv(spawned_interface.HW_MTU)
-                                    except Exception as e:
-                                        RNS.log(f"Error while reading from {spawned_interface}: {e}", RNS.LOG_PATHING) if RNS.sl(RNS.LOG_PATHING) else None
-                                        received_bytes = b""
-
-                                    if len(received_bytes): spawned_interface.receive(received_bytes)
-                                    else:
-                                        BackboneInterface.deregister_fileno(fileno); client_socket.close()
-                                        try:
-                                            if fileno in BackboneInterface.spawned_interface_filenos: BackboneInterface.spawned_interface_filenos.pop(fileno)
-                                        except Exception as e: RNS.log(f"Error while removing spawned interface file descriptor from BackboneInterface I/O handler: {e}", RNS.LOG_ERROR)
-
-                                        try:
-                                            if spawned_interface.parent_interface:
-                                                pif = spawned_interface.parent_interface
-                                                if pif.spawned_interfaces != None:
-                                                    while spawned_interface in pif.spawned_interfaces: pif.spawned_interfaces.remove(spawned_interface)
-                                        except Exception as e: RNS.log(f"Error while removing spawned interface from {pif}: {e}", RNS.LOG_ERROR)
-
-                                        spawned_interface.receive(received_bytes)
-                                
-                                elif client_socket and fileno == client_socket.fileno() and (event & select.EPOLLOUT):
-                                    try: written = client_socket.send(spawned_interface.transmit_buffer)
-                                    except Exception as e:
-                                        written = 0
-                                        if not spawned_interface.detached:
-                                            if RNS.sl(RNS.LOG_DEBUG):
-                                                if   str(e).endswith("Connection timed out"):     pass
-                                                elif str(e).endswith("Connection reset by peer"): pass
-                                                elif str(e).endswith("No route to host"):         pass
-                                                elif str(e).endswith("Broken pipe"):              pass
-                                                else: RNS.log(f"Error while writing to {spawned_interface}: {e}", RNS.LOG_DEBUG)
-                                        BackboneInterface.deregister_fileno(fileno)
-
-                                        try:
-                                            if fileno in BackboneInterface.spawned_interface_filenos: BackboneInterface.spawned_interface_filenos.pop(fileno)
-                                        except Exception as e: RNS.log(f"Error while removing spawned interface file descriptor from BackboneInterface I/O handler: {e}", RNS.LOG_ERROR)
-                                        
-                                        try:
-                                            if spawned_interface.parent_interface:
-                                                pif = spawned_interface.parent_interface
-                                                if pif.spawned_interfaces != None:
-                                                    while spawned_interface in pif.spawned_interfaces: pif.spawned_interfaces.remove(spawned_interface)
-                                        except Exception as e: RNS.log(f"Error while removing spawned interface from {pif}: {e}", RNS.LOG_ERROR)
-
-                                        try: client_socket.close()
-                                        except Exception as e: RNS.log(f"Error while closing socket for {spawned_interface}: {e}", RNS.LOG_WARNING)
-                                        spawned_interface.receive(b"")
-
-                                    spawned_interface.transmit_buffer = spawned_interface.transmit_buffer[written:]
-                                    try:
-                                        if len(spawned_interface.transmit_buffer) == 0: BackboneInterface.epoll.modify(fileno, select.EPOLLIN)
-                                    except Exception as e:
-                                        RNS.log(f"Error while setting EPOLLIN on {spawned_interface}: {e}", RNS.LOG_ERROR)
-
-                                    spawned_interface.txb += written
-                                    if spawned_interface.parent_interface: spawned_interface.parent_interface.txb += written
-                                
-                                elif client_socket and fileno == client_socket.fileno() and event & (select.EPOLLHUP):
-                                    BackboneInterface.deregister_fileno(fileno)
-                                    try:
-                                        if fileno in BackboneInterface.spawned_interface_filenos: BackboneInterface.spawned_interface_filenos.pop(fileno)
-                                    except Exception as e: RNS.log(f"Error while removing spawned interface file descriptor from BackboneInterface I/O handler: {e}", RNS.LOG_ERROR)
-
-                                    try:
-                                        if spawned_interface.parent_interface:
-                                            pif = spawned_interface.parent_interface
-                                            if pif.spawned_interfaces != None:
-                                                while spawned_interface in pif.spawned_interfaces: pif.spawned_interfaces.remove(spawned_interface)
-                                    except Exception as e: RNS.log(f"Error while removing spawned interface from {pif}: {e}", RNS.LOG_ERROR)
-
-                                    try: client_socket.close()
-                                    except Exception as e: RNS.log(f"Error while closing socket for {spawned_interface}: {e}", RNS.LOG_ERROR)
-                                    spawned_interface.receive(b"")
-
-                            elif fileno in BackboneInterface.listener_filenos:
-                                owner_interface, server_socket = BackboneInterface.listener_filenos[fileno]
-                                if fileno == server_socket.fileno() and (event & select.EPOLLIN):
-                                    try:
-                                        client_socket, address = server_socket.accept()
-                                        client_socket.setblocking(0)
-                                        if not owner_interface.incoming_connection(client_socket):
-                                            try: client_socket.close()
-                                            except Exception as e: RNS.log(f"Error while closing socket for failed incoming connection: {e}", RNS.LOG_WARNING)
-
-                                    except Exception as e:
-                                        RNS.log(f"Accepting socket failed for incoming connection: {e}", RNS.LOG_WARNING)
-                                        try: client_socket.close()
-                                        except Exception as e: RNS.log(f"Error while closing socket for failed incoming socket accept: {e}", RNS.LOG_WARNING)
-                                
-                                elif fileno == server_socket.fileno() and (event & select.EPOLLHUP):
-                                    try: BackboneInterface.deregister_fileno(fileno)
-                                    except Exception as e: RNS.log(f"Error while deregistering listener file descriptor {fileno}: {e}", RNS.LOG_ERROR)
-
-                                    try: server_socket.close()
-                                    except Exception as e: RNS.log(f"Error while closing listener socket for {server_socket}: {e}", RNS.LOG_WARNING)
-
-                except Exception as e:
-                    RNS.log(f"BackboneInterface error: {e}", RNS.LOG_ERROR)
-                    RNS.trace_exception(e)
-
-                finally:
-                    BackboneInterface.deregister_listeners()
-    
+        EventedSocketIO.tx_ready(interface)
     def incoming_connection(self, socket):
         try:
             remote_ip = socket.getpeername()[0]
@@ -516,17 +339,7 @@ class BackboneInterface(Interface):
     def detach(self):
         self.detached = True
         self.online = False
-        detached = []
-        for fileno in BackboneInterface.listener_filenos:
-            owner_interface, listener_socket = BackboneInterface.listener_filenos[fileno]
-            if owner_interface == self:
-                if hasattr(listener_socket, "shutdown"):
-                    if callable(listener_socket.shutdown):
-                        try: listener_socket.shutdown(socket.SHUT_RDWR)
-                        except Exception as e:
-                            if   str(e).endswith("Transport endpoint is not connected"): pass
-                            elif str(e).endswith("Bad file descriptor"): pass
-                            else: RNS.log("Error while shutting down socket for "+str(self)+": "+str(e), RNS.LOG_ERROR)
+        EventedSocketIO.detach_listener_interface(self)
 
     @property
     def blocked_ip_list(self):
@@ -610,7 +423,10 @@ class BackboneClientInterface(Interface):
         self.mode             = RNS.Interfaces.Interface.Interface.MODE_FULL
         self.bitrate          = BackboneClientInterface.BITRATE_GUESS
         self.frame_buffer     = b""
-        self.transmit_buffer  = b""
+        self.transmit_buffer_chunks = deque()
+        self.transmit_buffer_bytes = 0
+        self.transmit_buffer_head_offset = 0
+        self.transmit_buffer_lock = threading.Lock()
         
         if max_reconnect_tries == None:
             self.max_reconnect_tries = BackboneClientInterface.RECONNECT_MAX_TRIES
@@ -665,6 +481,7 @@ class BackboneClientInterface(Interface):
             if hasattr(self.socket, "close"):
                 if callable(self.socket.close):
                     self.detached = True
+                    EventedSocketIO.detach_client_interface(self)
                     
                     try:
                         if self.socket != None: self.socket.shutdown(socket.SHUT_RDWR)
@@ -764,13 +581,65 @@ class BackboneClientInterface(Interface):
     def process_outgoing(self, data):
         if self.online and not self.detached:
             try:
-                self.transmit_buffer += bytes([HDLC.FLAG])+HDLC.escape(data)+bytes([HDLC.FLAG])
+                self.queue_transmit_data(bytes([HDLC.FLAG])+HDLC.escape(data)+bytes([HDLC.FLAG]))
                 BackboneInterface.tx_ready(self)
 
             except Exception as e:
                 RNS.log("Exception occurred while transmitting via "+str(self)+", tearing down interface", RNS.LOG_ERROR)
                 RNS.log("The contained exception was: "+str(e), RNS.LOG_ERROR)
                 self.teardown()
+
+    def queue_transmit_data(self, data):
+        if not data:
+            return
+        with self.transmit_buffer_lock:
+            self.transmit_buffer_chunks.append(data)
+            self.transmit_buffer_bytes += len(data)
+
+    def transmit_buffer_len(self):
+        with self.transmit_buffer_lock:
+            return self.transmit_buffer_bytes
+
+    def peek_transmit_buffer(self, maximum_bytes=None):
+        with self.transmit_buffer_lock:
+            if not self.transmit_buffer_chunks:
+                return b""
+            data = memoryview(self.transmit_buffer_chunks[0])[self.transmit_buffer_head_offset:]
+            if maximum_bytes == None or len(data) >= maximum_bytes or len(self.transmit_buffer_chunks) == 1:
+                return data if maximum_bytes == None else data[:maximum_bytes]
+            parts = [bytes(data)]
+            remaining = maximum_bytes - len(data)
+            for chunk in list(self.transmit_buffer_chunks)[1:]:
+                if remaining <= 0:
+                    break
+                parts.append(chunk[:remaining])
+                remaining -= min(len(chunk), remaining)
+            return b"".join(parts)
+
+    def consume_transmit_buffer(self, byte_count):
+        if byte_count <= 0:
+            return
+        with self.transmit_buffer_lock:
+            consumed = min(byte_count, self.transmit_buffer_bytes)
+            remaining = consumed
+            while remaining > 0 and self.transmit_buffer_chunks:
+                head_remaining = len(self.transmit_buffer_chunks[0]) - self.transmit_buffer_head_offset
+                if remaining < head_remaining:
+                    self.transmit_buffer_head_offset += remaining
+                    remaining = 0
+                else:
+                    remaining -= head_remaining
+                    self.transmit_buffer_chunks.popleft()
+                    self.transmit_buffer_head_offset = 0
+            self.transmit_buffer_bytes -= consumed
+
+    def clear_transmit_buffer(self):
+        with self.transmit_buffer_lock:
+            discarded = self.transmit_buffer_bytes
+            self.transmit_buffer_chunks.clear()
+            self.transmit_buffer_bytes = 0
+            self.transmit_buffer_head_offset = 0
+            return discarded
 
     def check_frame_len(self, frame_len):
         if   frame_len <= RNS.Reticulum.HEADER_MINSIZE:        return False

@@ -9,6 +9,7 @@ from .request_receipt import TestRequestReceiptFailure
 from .logging import TestLoggingFailureRecovery
 from .link_callback_dispatcher import TestLinkPacketCallbackDispatcher
 from .discovery import TestCrossPlatformInterfaceDiscovery
+from .local_interface import TestLocalInterfaceIo
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

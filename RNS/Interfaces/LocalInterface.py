@@ -29,7 +29,8 @@
 # SOFTWARE.
 
 from RNS.Interfaces.Interface import Interface
-from RNS.Interfaces.BackboneInterface import BackboneInterface
+from RNS.Interfaces.EventedSocketIO import EventedSocketIO
+from collections import deque
 import socketserver
 import threading
 import socket
@@ -38,6 +39,9 @@ import sys
 import os
 import RNS
 from threading import Lock
+
+LOCAL_TX_REARM_SECONDS = 2.0
+LOCAL_TX_RECOVERY_SECONDS = 10.0
 
 class HDLC():
     FLAG              = 0x7E
@@ -77,16 +81,28 @@ class LocalClientInterface(Interface):
         self.IN               = True
         self.OUT              = False
         self.socket           = None
+        self.socket_generation = 0
         self.parent_interface = None
+        self.owner            = owner
         self.reconnecting     = False
         self.never_connected  = True
         self.detached         = False
         self.name             = name
         self.mode             = RNS.Interfaces.Interface.Interface.MODE_FULL
         self.frame_buffer     = b""
-        self.transmit_buffer  = b""
+        self.transmit_buffer_chunks = deque()
+        self.transmit_buffer_bytes = 0
+        self.transmit_buffer_head_offset = 0
+        self.transmit_buffer_lock = Lock()
+        self.transmit_buffer_first_enqueued_at = 0.0
+        self.transmit_buffer_last_progress_at = time.monotonic()
+        self.transmit_watchdog_started = False
+        self.transmit_recovery_active = False
+        self.transmit_recovery_lock = Lock()
 
-        if RNS.vendor.platformutils.use_epoll(): self.epoll_backend = True
+        # EventedSocketIO selects epoll on Linux/Android and the native
+        # DefaultSelector on macOS and Windows.
+        self.epoll_backend = True
 
         self.pause_on_client_sleep = False
 
@@ -95,6 +111,7 @@ class LocalClientInterface(Interface):
             self.target_ip   = None
             self.target_port = None
             self.socket      = connected_socket
+            self.socket_generation += 1
 
             if self.socket.family == socket.AF_INET:
                 self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -117,7 +134,6 @@ class LocalClientInterface(Interface):
             self.target_port = target_port
             self.connect()
 
-        self.owner   = owner
         self.bitrate = 1_000_000_000
         self.online  = True
         self.writing = False
@@ -134,6 +150,9 @@ class LocalClientInterface(Interface):
                 thread.daemon = True
                 thread.start()
 
+        if self.epoll_backend:
+            self._ensure_transmit_watchdog()
+
     def should_ingress_limit(self):
         return False
 
@@ -148,11 +167,12 @@ class LocalClientInterface(Interface):
             self.socket.connect((self.target_ip, self.target_port))
 
         self.online = True
+        self.socket_generation += 1
         self.is_connected_to_shared_instance = True
         self.never_connected = False
 
         if RNS.vendor.platformutils.is_android(): self.phy_keepalive = True
-        if self.epoll_backend: BackboneInterface.add_client_socket(self.socket, self)
+        if self.epoll_backend: EventedSocketIO.add_client_socket(self.socket, self)
 
         return True
 
@@ -191,19 +211,164 @@ class LocalClientInterface(Interface):
             RNS.log("Attempt to reconnect on a non-initiator shared local interface. This should not happen.", RNS.LOG_ERROR)
             raise IOError("Attempt to reconnect on a non-initiator local interface")
 
+    def queue_transmit_data(self, data):
+        if not data:
+            return
+        now = time.monotonic()
+        with self.transmit_buffer_lock:
+            if self.transmit_buffer_bytes == 0:
+                self.transmit_buffer_first_enqueued_at = now
+            self.transmit_buffer_chunks.append(data)
+            self.transmit_buffer_bytes += len(data)
+
+    def transmit_buffer_len(self):
+        with self.transmit_buffer_lock:
+            return self.transmit_buffer_bytes
+
+    def peek_transmit_buffer(self, maximum_bytes=None):
+        with self.transmit_buffer_lock:
+            if not self.transmit_buffer_chunks:
+                return b""
+            head = self.transmit_buffer_chunks[0]
+            data = memoryview(head)[self.transmit_buffer_head_offset:]
+            if maximum_bytes == None or len(data) >= maximum_bytes or len(self.transmit_buffer_chunks) == 1:
+                return data if maximum_bytes == None else data[:maximum_bytes]
+            parts = [bytes(data)]
+            remaining = maximum_bytes - len(data)
+            for chunk in list(self.transmit_buffer_chunks)[1:]:
+                if remaining <= 0:
+                    break
+                parts.append(chunk[:remaining])
+                remaining -= min(len(chunk), remaining)
+            return b"".join(parts)
+
+    def consume_transmit_buffer(self, byte_count):
+        if byte_count <= 0:
+            return
+        with self.transmit_buffer_lock:
+            consumed = min(byte_count, self.transmit_buffer_bytes)
+            remaining = consumed
+            while remaining > 0 and self.transmit_buffer_chunks:
+                head_remaining = len(self.transmit_buffer_chunks[0]) - self.transmit_buffer_head_offset
+                if remaining < head_remaining:
+                    self.transmit_buffer_head_offset += remaining
+                    remaining = 0
+                else:
+                    remaining -= head_remaining
+                    self.transmit_buffer_chunks.popleft()
+                    self.transmit_buffer_head_offset = 0
+            self.transmit_buffer_bytes -= consumed
+            self.transmit_buffer_last_progress_at = time.monotonic()
+            if self.transmit_buffer_bytes == 0:
+                self.transmit_buffer_first_enqueued_at = 0.0
+
+    def has_pending_transmit_data(self):
+        with self.transmit_buffer_lock:
+            return self.transmit_buffer_bytes > 0
+
+    def clear_transmit_buffer(self):
+        with self.transmit_buffer_lock:
+            discarded = self.transmit_buffer_bytes
+            self.transmit_buffer_chunks.clear()
+            self.transmit_buffer_bytes = 0
+            self.transmit_buffer_head_offset = 0
+            self.transmit_buffer_first_enqueued_at = 0.0
+            self.transmit_buffer_last_progress_at = time.monotonic()
+            return discarded
+
+    def _transmit_stalled_for(self):
+        now = time.monotonic()
+        with self.transmit_buffer_lock:
+            queued_bytes = self.transmit_buffer_bytes
+            first_enqueued_at = self.transmit_buffer_first_enqueued_at
+            last_progress_at = self.transmit_buffer_last_progress_at
+        if queued_bytes == 0 or first_enqueued_at <= 0:
+            return queued_bytes, 0.0
+        return queued_bytes, max(0.0, now - max(first_enqueued_at, last_progress_at))
+
+    def _ensure_transmit_watchdog(self):
+        if self.transmit_watchdog_started:
+            return
+        self.transmit_watchdog_started = True
+        threading.Thread(target=self._transmit_watchdog, daemon=True).start()
+
+    def _request_transmit_recovery(self):
+        with self.transmit_recovery_lock:
+            if self.transmit_recovery_active or self.detached:
+                return
+            self.transmit_recovery_active = True
+        threading.Thread(target=self._recover_stalled_transmit, daemon=True).start()
+
+    def _recover_stalled_transmit(self):
+        try:
+            queued_bytes, stalled_for = self._transmit_stalled_for()
+            if queued_bytes == 0 or stalled_for < LOCAL_TX_RECOVERY_SECONDS:
+                return
+            old_socket = self.socket
+            old_generation = self.socket_generation
+            if old_socket == None or not self.online:
+                return
+            RNS.log(
+                f"Recovering stalled local socket for {self}: queued_bytes={queued_bytes} "
+                f"stalled_for_ms={int(stalled_for*1000)}",
+                RNS.LOG_WARNING,
+            )
+            if self.socket is not old_socket or self.socket_generation != old_generation:
+                return
+            old_fileno = old_socket.fileno()
+            if EventedSocketIO.spawned_interface_filenos.get(old_fileno) is not self:
+                return
+            self.clear_transmit_buffer()
+            EventedSocketIO.deregister_fileno(old_fileno)
+            try: EventedSocketIO.spawned_interface_filenos.pop(old_fileno, None)
+            except Exception: pass
+            try: old_socket.shutdown(socket.SHUT_RDWR)
+            except Exception: pass
+            try: old_socket.close()
+            except Exception: pass
+            if self.socket is old_socket:
+                self.socket = None
+            self.online = False
+
+            if self.is_connected_to_shared_instance and not self.detached:
+                RNS.Transport.shared_connection_disappeared()
+                self.reconnect()
+            else:
+                self.teardown(nowarning=True)
+        except Exception as e:
+            RNS.log(f"Local socket recovery failed for {self}: {e}", RNS.LOG_ERROR)
+            RNS.trace_exception(e)
+        finally:
+            with self.transmit_recovery_lock:
+                self.transmit_recovery_active = False
+
+    def _transmit_watchdog(self):
+        while not self.detached:
+            time.sleep(1.0)
+            if not self.online or self.socket == None or self.reconnecting:
+                if not self.is_connected_to_shared_instance and not self.online:
+                    return
+                continue
+            queued_bytes, stalled_for = self._transmit_stalled_for()
+            if queued_bytes == 0:
+                continue
+            if stalled_for >= LOCAL_TX_RECOVERY_SECONDS:
+                self._request_transmit_recovery()
+            elif stalled_for >= LOCAL_TX_REARM_SECONDS:
+                EventedSocketIO.tx_ready(self)
+
 
     def send_keepalive(self):
         if self.online:
             RNS.log(f"Sending keepalive on {self}", RNS.LOG_DEBUG) # TODO: Remove
             try:
                 if self.epoll_backend:
-                    self.transmit_buffer += bytes([HDLC.FLAG])+bytes([HDLC.FLAG])
-                    BackboneInterface.tx_ready(self)
+                    self.queue_transmit_data(bytes([HDLC.FLAG])+bytes([HDLC.FLAG]))
+                    EventedSocketIO.tx_ready(self)
 
                 else:
                     self.writing = True
-                    data = bytes([HDLC.FLAG])+HDLC.escape(data)+bytes([HDLC.FLAG])
-                    self.socket.sendall(data)
+                    self.socket.sendall(bytes([HDLC.FLAG])+bytes([HDLC.FLAG]))
                     self.writing = False
 
             except Exception as e: RNS.log(f"Exception occurred while sending keepalive on {self}: {e}", RNS.LOG_ERROR)
@@ -225,8 +390,8 @@ class LocalClientInterface(Interface):
         if self.online:
             try:
                 if self.epoll_backend:
-                    self.transmit_buffer += bytes([HDLC.FLAG])+HDLC.escape(data)+bytes([HDLC.FLAG])
-                    BackboneInterface.tx_ready(self)
+                    self.queue_transmit_data(bytes([HDLC.FLAG])+HDLC.escape(data)+bytes([HDLC.FLAG]))
+                    EventedSocketIO.tx_ready(self)
 
                 else:
                     self.writing = True
@@ -327,6 +492,8 @@ class LocalClientInterface(Interface):
                 if callable(self.socket.close):
                     RNS.log("Detaching "+str(self), RNS.LOG_DEBUG)
                     self.detached = True
+                    if self.epoll_backend:
+                        EventedSocketIO.detach_client_interface(self)
                     
                     try:
                         if self.socket != None:
@@ -346,6 +513,8 @@ class LocalClientInterface(Interface):
         self.online = False
         self.OUT = False
         self.IN = False
+        if self.epoll_backend:
+            EventedSocketIO.detach_client_interface(self)
 
         RNS.Transport.remove_interface(self)
 
@@ -379,7 +548,9 @@ class LocalServerInterface(Interface):
 
     def __init__(self, owner, bindport=None, socket_path=None):
         super().__init__()
-        self.epoll_backend = False
+        # This legacy attribute means "evented" here. EventedSocketIO chooses
+        # epoll on Linux/Android and the native DefaultSelector elsewhere.
+        self.epoll_backend = True
         self.online = False
         self.clients = 0
         
@@ -391,9 +562,6 @@ class LocalServerInterface(Interface):
         self.name = "Reticulum"
         self.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
 
-        if RNS.vendor.platformutils.use_epoll():
-            self.epoll_backend = True
-
         if socket_path != None and self.epoll_backend:
             self.receives = True
             self.bind_ip = None
@@ -401,7 +569,7 @@ class LocalServerInterface(Interface):
 
             self.owner = owner
             self.is_local_shared_instance = True
-            BackboneInterface.add_listener(self, self.socket_path, socket_type=socket.AF_UNIX)
+            EventedSocketIO.add_listener(self, self.socket_path, socket_type=socket.AF_UNIX)
 
         elif bindport != None:
             self.receives = True
@@ -412,7 +580,7 @@ class LocalServerInterface(Interface):
             self.is_local_shared_instance = True
 
             address = (self.bind_ip, self.bind_port)
-            if self.epoll_backend: BackboneInterface.add_listener(self, address)
+            if self.epoll_backend: EventedSocketIO.add_listener(self, address)
             else:
                 def handlerFactory(callback):
                     def createHandler(*args, **keys):
@@ -459,7 +627,7 @@ class LocalServerInterface(Interface):
             if hasattr(self, "_force_bitrate"): spawned_interface._force_bitrate = self._force_bitrate
             RNS.Transport.add_interface(spawned_interface)
             RNS.Transport.local_client_interfaces.append(spawned_interface)
-            BackboneInterface.add_client_socket(client_socket, spawned_interface)
+            EventedSocketIO.add_client_socket(client_socket, spawned_interface)
             self.clients += 1
             return True
 
