@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from RNS._version import __version__
 from RNS.Utilities.rngit import APP_NAME
 from RNS.Utilities.rngit.pages import NomadNetworkNode
-from RNS.Utilities.rngit.util import san_ref, san_refs, san_sha
+from RNS.Utilities.rngit.util import san_ref, san_refs, san_sha, medium_path_timeout
 from RNS.vendor.configobj import ConfigObj
 from RNS.vendor import umsgpack as mp
 from RNS.Utilities.rnid import create_rsg, validate_rsg, get_rsg_hash
@@ -465,7 +465,7 @@ class ReticulumGitClient():
     def connect_remote(self, remote):
         destination_hash = self.parse_remote_destination_url(remote)
         print(f"Requesting path... ", end="")
-        if not RNS.Transport.await_path(destination_hash, timeout=self.path_timeout):
+        if not RNS.Transport.await_path(destination_hash, timeout=medium_path_timeout(self.path_timeout)):
             print(f"\n", end="")
             self.abort(f"Could not resolve path to {RNS.prettyhexrep(destination_hash)}")
         
@@ -479,6 +479,7 @@ class ReticulumGitClient():
         self.link = RNS.Link(self.destination)
         self.link.set_link_established_callback(self.link_established)
         self.link.set_link_closed_callback(self.link_closed)
+        self.link_timeout = max(self.link_timeout, self.link.establishment_timeout)
 
     def link_established(self, link):
         print(f"\rLink established     ", end="")
@@ -1998,6 +1999,7 @@ class ReticulumGitNode():
         self.active_links_lock   = Lock()
         self.stats_lock          = Lock()
         self.sync_lock           = Lock()
+        self.perms_lock          = Lock()
         self.stats_ignored       = {}
         self.stats_push_ignored  = {}
         self.node_name           = "Anonymous Git Node"
@@ -2506,6 +2508,22 @@ class ReticulumGitNode():
 
         return permissions
 
+    def load_allowed_permissions(self, allowed_path):
+        allowed_input = ""
+        dynamic_perms = False
+        if os.path.isfile(allowed_path):
+            if os.access(allowed_path, os.X_OK):
+                allowed_result = subprocess.run([allowed_path], stdout=subprocess.PIPE)
+                allowed_input  = allowed_result.stdout.decode("utf-8")
+                dynamic_perms  = True
+
+            else:
+                fh = open(allowed_path, "rb")
+                allowed_input = fh.read().decode("utf-8")
+                fh.close()
+
+        return self.permissions_from_allowed_input(allowed_input), dynamic_perms
+
     def load_repository_group(self, group_name, group_path):
         if not group_name in self.groups: self.groups[group_name] = { "path": group_path, "name": group_name, "repositories": {}, "dynamic_perms": False,
                                                                        "read": [], "write": [], "create": [], "stats": [], "release": [],
@@ -2531,8 +2549,8 @@ class ReticulumGitNode():
             RNS.log(f"Attempt to set group permissions for non-existing group {group_name}, aborting", RNS.LOG_WARNING)
             return
 
-        # Clear permissions before update
-        for perm in self.ALL_PERMS: self.groups[group_name][perm] = []
+        new_permissions = {}
+        for perm in self.ALL_PERMS: new_permissions[perm] = []
 
         # Apply permissions from allowed file if present
         group_path   = self.groups[group_name]["path"]
@@ -2540,21 +2558,13 @@ class ReticulumGitNode():
         if os.path.isfile(allowed_path):
             RNS.log(f"Applying group permissions for {group_name} from {allowed_path}", RNS.LOG_DEBUG)
             try:
-                allowed_input = ""
-                if os.access(allowed_path, os.X_OK):
-                    allowed_result = subprocess.run([allowed_path], stdout=subprocess.PIPE)
-                    allowed_input = allowed_result.stdout.decode("utf-8")
-                    self.groups[group_name]["dynamic_perms"] = True
-
-                else:
-                    fh = open(allowed_path, "rb")
-                    allowed_input = fh.read().decode("utf-8")
-                    fh.close()
-
-                group_permissions = self.permissions_from_allowed_input(allowed_input)
-                for perm in group_permissions: self.groups[group_name][perm] = group_permissions[perm]
+                group_permissions, dynamic_perms = self.load_allowed_permissions(allowed_path)
+                for perm in self.ALL_PERMS: new_permissions[perm] = group_permissions[perm]
+                self.groups[group_name]["dynamic_perms"] = dynamic_perms
 
             except Exception as e: RNS.log(f"Could not load group permissions from {allowed_path}: {e}", RNS.LOG_ERROR)
+
+        else: self.groups[group_name]["dynamic_perms"] = False
 
         # Apply permissions from config file if present
         if "access" in self.config:
@@ -2579,14 +2589,33 @@ class ReticulumGitNode():
                             if perm == self.PERM_PROPOSE:                              propose  = True
                             if perm == self.PERM_ADMIN:                                admin    = True
 
-                            if read     and not target in self.groups[group_name]["read"]:     self.groups[group_name]["read"].append(target)
-                            if write    and not target in self.groups[group_name]["write"]:    self.groups[group_name]["write"].append(target)
-                            if create   and not target in self.groups[group_name]["create"]:   self.groups[group_name]["create"].append(target)
-                            if stats    and not target in self.groups[group_name]["stats"]:    self.groups[group_name]["stats"].append(target)
-                            if release  and not target in self.groups[group_name]["release"]:  self.groups[group_name]["release"].append(target)
-                            if interact and not target in self.groups[group_name]["interact"]: self.groups[group_name]["interact"].append(target)
-                            if propose  and not target in self.groups[group_name]["propose"]:  self.groups[group_name]["propose"].append(target)
-                            if admin    and not target in self.groups[group_name]["admin"]:    self.groups[group_name]["admin"].append(target)
+                            if read     and not target in new_permissions["read"]:     new_permissions["read"].append(target)
+                            if write    and not target in new_permissions["write"]:    new_permissions["write"].append(target)
+                            if create   and not target in new_permissions["create"]:   new_permissions["create"].append(target)
+                            if stats    and not target in new_permissions["stats"]:    new_permissions["stats"].append(target)
+                            if release  and not target in new_permissions["release"]:  new_permissions["release"].append(target)
+                            if interact and not target in new_permissions["interact"]: new_permissions["interact"].append(target)
+                            if propose  and not target in new_permissions["propose"]:  new_permissions["propose"].append(target)
+                            if admin    and not target in new_permissions["admin"]:    new_permissions["admin"].append(target)
+
+        for perm in self.ALL_PERMS: self.groups[group_name][perm] = new_permissions[perm]
+
+    def update_repository_permissions(self, group_name, repository_name):
+        if not group_name in self.groups:
+            RNS.log(f"Attempt to update permissions for non-existing group {group_name}, aborting", RNS.LOG_WARNING)
+            return
+
+        if not repository_name in self.groups[group_name]["repositories"]:
+            RNS.log(f"Attempt to update permissions for non-existing repository {group_name}/{repository_name}, aborting", RNS.LOG_WARNING)
+            return
+
+        repo = self.groups[group_name]["repositories"][repository_name]
+        allowed_path = repo["path"]+".allowed"
+
+        try:
+            repo_permissions, dynamic_perms = self.load_allowed_permissions(allowed_path)
+            for perm in self.ALL_PERMS: repo[perm] = repo_permissions[perm] if perm in repo_permissions else []
+        except Exception as e: RNS.log(f"Could not update repository permissions for {group_name}/{repository_name} from {allowed_path}: {e}", RNS.LOG_ERROR)
 
     def load_repository(self, group, path):
         if not group or not path: return False
@@ -2600,27 +2629,15 @@ class ReticulumGitNode():
                     RNS.log(f"You can change it to a bare repository using \"git config --bool core.bare true\".", RNS.LOG_WARNING)
 
                 else:
-                    repository_name  = os.path.basename(path)
-                    allowed_path     = f"{path}.allowed"
-                    allowed_input    = ""
-                    dynamic_perms    = False
-                    if os.path.isfile(allowed_path):
-                        if os.access(allowed_path, os.X_OK):
-                            allowed_result = subprocess.run([allowed_path], stdout=subprocess.PIPE)
-                            allowed_input  = allowed_result.stdout.decode("utf-8")
-                            dynamic_perms  = True
-
-                        else:
-                            fh = open(allowed_path, "rb")
-                            allowed_input = fh.read().decode("utf-8")
-                            fh.close()
+                    repository_name                 = os.path.basename(path)
+                    allowed_path                    = f"{path}.allowed"
+                    repo_permissions, dynamic_perms = self.load_allowed_permissions(allowed_path)
 
                     fork   = self.__is_fork(path)
                     mirror = self.__is_mirror(path)
 
-                    p = self.permissions_from_allowed_input(allowed_input)
                     group["repositories"][repository_name] = { "name": repository_name, "group": group_name, "path": path, "fork": fork, "mirror": mirror }
-                    for perm in self.ALL_PERMS: group["repositories"][repository_name][perm] = p[perm] if perm in p else []
+                    for perm in self.ALL_PERMS: group["repositories"][repository_name][perm] = repo_permissions[perm] if perm in repo_permissions else []
 
                     return True
 
@@ -4230,6 +4247,7 @@ class ReticulumGitNode():
             return self.RES_REMOTE_FAIL.to_bytes(1, "big") + b"Remote error"
 
     def _work_complete(self, work_path, data, remote_identity):
+        group_name, repository_name = self.parse_request_repository_path(data[self.IDX_REPOSITORY])
         doc_id = data.get("doc_id")
         
         if doc_id is None: return self.RES_INVALID_REQ.to_bytes(1, "big") + b"No document ID specified"
@@ -4245,7 +4263,9 @@ class ReticulumGitNode():
         doc = self._work_load_document(root_path)
         if not doc: return self.RES_REMOTE_FAIL.to_bytes(1, "big") + b"Error loading document"
         
-        if doc.get("meta", {}).get("author") != remote_identity.hash: return self.RES_DISALLOWED.to_bytes(1, "big") + b"No access, not author"
+        is_author    = doc.get("meta", {}).get("author") == remote_identity.hash
+        admin_access = self.resolve_doc_permission(remote_identity, group_name, repository_name, doc_id, self.PERM_ADMIN)
+        if not is_author and not admin_access: return self.RES_DISALLOWED.to_bytes(1, "big") + b"Not allowed"
         
         try:
             completed_dir = os.path.join(completed_base, str(doc_id))
@@ -4259,26 +4279,35 @@ class ReticulumGitNode():
             return self.RES_REMOTE_FAIL.to_bytes(1, "big") + b"Remote error"
 
     def _work_activate(self, work_path, data, remote_identity):
+        group_name, repository_name = self.parse_request_repository_path(data[self.IDX_REPOSITORY])
         doc_id = data.get("doc_id")
         
         if doc_id is None: return self.RES_INVALID_REQ.to_bytes(1, "big") + b"No document ID specified"
         try: doc_id = int(doc_id)
         except: return self.RES_INVALID_REQ.to_bytes(1, "big") + b"Invalid document ID"
         
-        completed_dir = os.path.join(work_path, "completed", str(doc_id))
         active_base = os.path.join(work_path, "active")
         
-        if not os.path.isdir(completed_dir): return self.RES_NOT_FOUND.to_bytes(1, "big") + b"Document not found"
+        doc_dir = None
+        for scope in ["completed", "proposed"]:
+            d = os.path.join(work_path, scope, str(doc_id))
+            if os.path.isdir(d):
+                doc_dir = d
+                break
+
+        if not doc_dir: return self.RES_NOT_FOUND.to_bytes(1, "big") + b"Document not found"
         
-        root_path = os.path.join(completed_dir, "root")
+        root_path = os.path.join(doc_dir, "root")
         doc = self._work_load_document(root_path)
         if not doc: return self.RES_REMOTE_FAIL.to_bytes(1, "big") + b"Error loading document"
         
-        if doc.get("meta", {}).get("author") != remote_identity.hash: return self.RES_DISALLOWED.to_bytes(1, "big") + b"No access, not author"
+        is_author    = doc.get("meta", {}).get("author") == remote_identity.hash
+        admin_access = self.resolve_doc_permission(remote_identity, group_name, repository_name, doc_id, self.PERM_ADMIN)
+        if not is_author and not admin_access: return self.RES_DISALLOWED.to_bytes(1, "big") + b"Not allowed"
         
         try:
             active_dir = os.path.join(active_base, str(doc_id))
-            shutil.move(completed_dir, active_dir)
+            shutil.move(doc_dir, active_dir)
             
             RNS.log(f"Activated work document {doc_id} by {RNS.prettyhexrep(remote_identity.hash)}", RNS.LOG_VERBOSE)
             return b"\x00" + mp.packb({"id": doc_id, "scope": "active"})
@@ -4504,9 +4533,16 @@ class ReticulumGitNode():
         try:
             group_path = self.groups[group_name]["path"]
             allowed_path = group_path + ".allowed"
+
+            if os.access(allowed_path, os.X_OK): return self.RES_DISALLOWED.to_bytes(1, "big") + b"Executable permission resolvers can only be modified node-side"
+
             tmp_path = allowed_path + ".tmp"
             with open(tmp_path, "w", encoding="utf-8") as f: f.write(content)
             os.rename(tmp_path, allowed_path)
+
+            with self.perms_lock:
+                try: self.update_group_permissions(group_name)
+                except Exception as e: RNS.log(f"Error while refreshing permissions for group {group_name}: {e}", RNS.LOG_ERROR)
 
             RNS.log(f"Permissions for group {group_name} updated by {RNS.prettyhexrep(remote_identity.hash)}", RNS.LOG_VERBOSE)
             return b"\x00"
@@ -4579,9 +4615,16 @@ class ReticulumGitNode():
         try:
             repo_path = self.groups[group_name]["repositories"][repository_name]["path"]
             allowed_path = repo_path + ".allowed"
+
+            if os.access(allowed_path, os.X_OK): return self.RES_DISALLOWED.to_bytes(1, "big") + b"Executable permission resolvers can only be modified node-side"
+
             tmp_path = allowed_path + ".tmp"
             with open(tmp_path, "w", encoding="utf-8") as f: f.write(content)
             os.rename(tmp_path, allowed_path)
+
+            with self.perms_lock:
+                try: self.update_repository_permissions(group_name, repository_name)
+                except Exception as e: RNS.log(f"Error while refreshing permissions for repository {group_name}/{repository_name}: {e}", RNS.LOG_ERROR)
 
             RNS.log(f"Permissions for repository {group_name}/{repository_name} updated by {RNS.prettyhexrep(remote_identity.hash)}", RNS.LOG_VERBOSE)
             return b"\x00"
@@ -4896,6 +4939,11 @@ announce_interval = 360
 
 # blocked_identities = d31aeea49873006f13b3415520666a4e
 
+# To make it easier to handle scrapers, crawlers, slopware
+# and other annoyances, you can block unidentified peers by
+# adding the null_ident hash to to blocked identities.
+
+# blocked_identities = d7db22f63b453c23bb0688dde565b7c1
 
 [repositories]
 
@@ -4995,14 +5043,26 @@ internal = rw:9710b86ba12c42d1d8f30f74fe509286
 
 # serve_nomadnet = no
 
-# It is possible to  disable Nerd Font icons and instead
+# It is possible to disable Nerd Font icons and instead
 # use simpler (but more compatible) unicode icons.
 
 # unicode_icons = yes
 
+# You can configure whether the page server should try
+# to convert media files to WebP on the fly, for serving
+# to nomadnet clients. Enabled by default, but will
+# require an available encoding backend installed on
+# your system. Supported backends utilities are "magick",
+# "convert", "gm", "ffmpeg" and "avconv". If any one is
+# installed, rngit will auto-detect and use it, but you
+# can force a specific backend with the environment
+# variable RNGIT_MEDIA_BACKEND.
+
+# media_conversion = yes
+
 
 [logging]
-# Valid log levels are 0 through 7:
+# Valid log levels are 0 through 8:
 #   0: Log only critical information
 #   1: Log errors and lower log levels
 #   2: Log warnings and lower log levels
@@ -5010,7 +5070,8 @@ internal = rw:9710b86ba12c42d1d8f30f74fe509286
 #   4: Log info and lower (this is the default)
 #   5: Verbose logging
 #   6: Debug logging
-#   7: Extreme logging
+#   7: Pathing logging
+#   8: Extreme logging
 
 loglevel = 4
 

@@ -1,6 +1,6 @@
 # Reticulum License
 #
-# Copyright (c) 2016-2025 Mark Qvist
+# Copyright (c) 2016-2026 Mark Qvist
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -258,6 +258,7 @@ class RNodeInterface(Interface):
         self.r_stat_tx   = None
         self.r_stat_rssi = None
         self.r_stat_snr  = None
+        self.r_stat_q    = None
         self.r_st_alock  = None
         self.r_lt_alock  = None
         self.r_random    = None
@@ -278,6 +279,7 @@ class RNodeInterface(Interface):
         self.r_noise_floor        = None
         self.r_interference       = None
         self.r_interference_l     = None
+        self.reports_phy_stats    = True
 
         self.r_battery_state = RNodeInterface.BATTERY_STATE_UNKNOWN
         self.r_battery_percent = 0
@@ -294,6 +296,7 @@ class RNodeInterface(Interface):
 
         self.packet_queue    = []
         self.flow_control    = flow_control
+        self.shared_medium   = True
         self.interface_ready = False
         self.announce_rate_target = None
         self.supports_discovery = True
@@ -383,6 +386,7 @@ class RNodeInterface(Interface):
                 RNS.log(f"Opening BLE connection for {self}...")
                 self.timeout = 1250
                 if self.ble != None and self.ble.running == False:
+                    RNS.log(f"Cleaning up previous BLE connection for {self}...")
                     self.ble.close()
                     self.ble.cleanup()
                     self.ble = None
@@ -439,7 +443,11 @@ class RNodeInterface(Interface):
             ble_detect_timeout = 5.0
             detect_time = time.time()
             while not self.detected and time.time() < detect_time + ble_detect_timeout: time.sleep(0.1)
-            if not self.detected: RNS.log(f"RNode detect timed out over BLE", RNS.LOG_ERROR)
+            if not self.detected:
+                RNS.log(f"RNode detect timed out over BLE", RNS.LOG_ERROR)
+                if self.ble:
+                    self.ble.should_run = False
+                    self.ble.must_disconnect = True
         else:
             sleep(0.2)
         
@@ -477,8 +485,7 @@ class RNodeInterface(Interface):
         self.setLTALock()
         self.setRadioState(KISS.RADIO_STATE_ON)
 
-        if self.use_ble:
-            time.sleep(2)
+        if self.use_ble: time.sleep(2)
 
     def detect(self):
         kiss_command = bytes([KISS.FEND, KISS.CMD_DETECT, KISS.DETECT_REQ, KISS.FEND, KISS.CMD_FW_VERSION, 0x00, KISS.FEND, KISS.CMD_PLATFORM, 0x00, KISS.FEND, KISS.CMD_MCU, 0x00, KISS.FEND])
@@ -684,10 +691,8 @@ class RNodeInterface(Interface):
             RNS.log("Radio state mismatch", RNS.LOG_ERROR)
             self.validcfg = False
 
-        if (self.validcfg):
-            return True
-        else:
-            return False
+        if (self.validcfg): return True
+        else:               return False
 
 
     def updateBitrate(self):
@@ -699,11 +704,9 @@ class RNodeInterface(Interface):
             self.bitrate = 0
 
     def process_incoming(self, data):
+        if not data: return
         self.rxb += len(data)
         self.owner.inbound(data, self)
-        self.r_stat_rssi = None
-        self.r_stat_snr = None
-
 
     def process_outgoing(self,data):
         datalen = len(data)
@@ -1154,19 +1157,17 @@ class RNodeInterface(Interface):
 
         except Exception as e:
             self.online = False
-            RNS.log("A serial port error occurred, the contained exception was: "+str(e), RNS.LOG_ERROR)
-            RNS.log("The interface "+str(self)+" experienced an unrecoverable error and is now offline.", RNS.LOG_ERROR)
+            if not self.detached:
+                RNS.log("A serial port error occurred, the contained exception was: "+str(e), RNS.LOG_ERROR)
+                RNS.log("The interface "+str(self)+" experienced an unrecoverable error and is now offline.", RNS.LOG_ERROR)
 
-            if RNS.Reticulum.panic_on_interface_error:
-                RNS.panic()
+                if RNS.Reticulum.panic_on_interface_error: RNS.panic()
 
-            RNS.log("Reticulum will attempt to reconnect the interface periodically.", RNS.LOG_ERROR)
+                RNS.log("Reticulum will attempt to reconnect the interface periodically.", RNS.LOG_ERROR)
 
         self.online = False
-        try:
-            self.serial.close()
-        except Exception as e:
-            pass
+        try: self.serial.close()
+        except Exception as e: pass
 
         if not self.detached and not self.reconnecting:
             self.reconnect_port()
@@ -1192,14 +1193,20 @@ class RNodeInterface(Interface):
             self.disable_external_framebuffer()
             self.setRadioState(KISS.RADIO_STATE_OFF)
             self.leave()
+            self.serial.close()
 
         except Exception as e:
             RNS.log(f"An error occurred while detaching {self}: {e}", RNS.LOG_ERROR)
         
-        if self.use_ble: self.ble.close()
-        if self.use_tcp:
+        if self.use_ble:
+            self.ble.close()
+            self.ble.cleanup()
+            self.ble = None
+        elif self.use_tcp:
             time.sleep(0.5)
             self.tcp.close()
+        else:
+            self.serial.close()
 
     def should_ingress_limit(self):
         return False
@@ -1297,6 +1304,7 @@ class BLEConnection():
         self.must_disconnect = False
         self.connect_job_running = False
         self.device_disappeared = False
+        self._windows_paired_addrs = None
 
         import importlib.util
         if BLEConnection.bleak == None:
@@ -1307,8 +1315,8 @@ class BLEConnection():
                 import asyncio
                 BLEConnection.asyncio = asyncio
             else:
-                RNS.log("Using the RNode interface over BLE requires a the \"bleak\" module to be installed.", RNS.LOG_CRITICAL)
-                RNS.log("You can install one with the command: python3 -m pip install bleak", RNS.LOG_CRITICAL)
+                RNS.log("Using the RNode interface over BLE requires the \"bleak\" module to be installed.", RNS.LOG_CRITICAL)
+                RNS.log("You can install it with the command: python3 -m pip install bleak", RNS.LOG_CRITICAL)
                 RNS.panic()
 
         self.should_run = True
@@ -1324,6 +1332,7 @@ class BLEConnection():
         self.should_run = False
 
     def connection_job(self):
+        self.running = True
         while self.should_run:
             if self.ble_device == None:
                 self.ble_device = self.find_target_device()
@@ -1350,6 +1359,7 @@ class BLEConnection():
                             self.owner.ble_receive(data)
 
                     self.connected = True
+                    self.device_disappeared = False
                     self.ble_device = ble_client
                     self.last_client = ble_client
                     self.owner.port = str(f"ble://{ble_client.address}")
@@ -1384,6 +1394,8 @@ class BLEConnection():
 
     def find_target_device(self):
         RNS.log(f"Searching for attachable BLE device for {self.owner}...", RNS.LOG_EXTREME)
+        if RNS.vendor.platformutils.is_windows():
+            self._windows_paired_addrs = self._get_windows_paired_ble_addresses()
         def device_filter(device: self.bleak.backends.device.BLEDevice, adv: self.bleak.backends.scanner.AdvertisementData):
             if BLEConnection.UART_SERVICE_UUID.lower() in adv.service_uuids:
                 if self.device_bonded(device):
@@ -1415,6 +1427,9 @@ class BLEConnection():
 
     def device_bonded(self, device):
         try:
+            if self._windows_paired_addrs is not None:
+                return device.address is not None and device.address.lower() in self._windows_paired_addrs
+
             if hasattr(device, "details"):
                 if "props" in device.details and "Bonded" in device.details["props"]:
                     if device.details["props"]["Bonded"] == True:
@@ -1424,6 +1439,15 @@ class BLEConnection():
             RNS.log(f"Error while determining device bond status for {device}, the contained exception was: {e}", RNS.LOG_ERROR)
 
         return False
+
+    def _get_windows_paired_ble_addresses(self):
+        from winrt.windows.devices.bluetooth import BluetoothLEDevice
+        from winrt.windows.devices.enumeration import DeviceInformation
+        async def _query():
+            selector = BluetoothLEDevice.get_device_selector_from_pairing_state(True)
+            infos = await DeviceInformation.find_all_async_aqs_filter(selector)
+            return set(info.id.split("-")[-1].lower() for info in infos)
+        return self.asyncio.run(_query())
 
 class TCPConnection():
     TARGET_PORT = 7633

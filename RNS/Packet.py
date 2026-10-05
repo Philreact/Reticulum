@@ -118,6 +118,7 @@ class Packet:
     __slots__ += "transport_id", "data", "flags", "raw", "packed", "sent", "create_receipt", "receipt", "fromPacked", "MTU"
     __slots__ += "sent_at", "packet_hash", "ratchet_id", "attached_interface", "receiving_interface", "rssi", "snr", "q"
     __slots__ += "ciphertext", "plaintext", "destination_hash", "destination_type", "link", "map_hash", "is_outbound_pr"
+    __slots__ += "traffic_class", "announce_signature_validated"
 
     def __init__(self, destination, data, packet_type = DATA, context = NONE, transport_type = RNS.Transport.BROADCAST,
                  header_type = HEADER_1, transport_id = None, attached_interface = None, create_receipt = True, context_flag=FLAG_UNSET):
@@ -159,6 +160,8 @@ class Packet:
         self.packet_hash = None
         self.ratchet_id  = None
 
+        self.traffic_class = None
+        self.announce_signature_validated = None
         self.attached_interface = attached_interface
         self.receiving_interface = None
         self.is_outbound_pr = False
@@ -260,18 +263,23 @@ class Packet:
                 self.destination_hash = self.raw[DST_LEN+2:2*DST_LEN+2]
                 self.context = ord(self.raw[2*DST_LEN+2:2*DST_LEN+3])
                 self.data = self.raw[2*DST_LEN+3:]
+                if len(self.transport_id)     != DST_LEN: raise ValueError("Malformed Transport ID field")
+                if len(self.destination_hash) != DST_LEN: raise ValueError("Malformed destination hash field")
             else:
                 self.transport_id = None
                 self.destination_hash = self.raw[2:DST_LEN+2]
                 self.context = ord(self.raw[DST_LEN+2:DST_LEN+3])
                 self.data = self.raw[DST_LEN+3:]
+                if len(self.destination_hash) != DST_LEN: raise ValueError("Malformed destination hash field")
+
+            if len(self.data) == 0: raise ValueError("Zero-length data field")
 
             self.packed = False
             self.update_hash()
             return True
 
         except Exception as e:
-            RNS.log(f"Received malformed packet, dropping it. The contained exception was: {e}", RNS.LOG_EXTREME) if RNS.sl(RNS.LOG_EXTREME) else None
+            RNS.log(f"Received malformed packet, dropping it. The contained exception was: {e}", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
             return False
 
     def send(self):
@@ -281,6 +289,7 @@ class Packet:
         :returns: A :ref:`RNS.PacketReceipt<api-packetreceipt>` instance if *create_receipt* was set to *True* when the packet was instantiated, if not returns *None*. If the packet could not be sent *False* is returned.
         """
         if not self.sent:
+            if self.hops >= RNS.Transport.PATHFINDER_M: return False
             if not self.packed: self.pack()
             if self.destination.type == RNS.Destination.LINK:
                 if self.destination.status == RNS.Link.CLOSED:
@@ -296,7 +305,9 @@ class Packet:
 
             if RNS.Transport.outbound(self): return self.receipt
             else:
-                RNS.log("No interfaces could process the outbound packet", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+                if not self.attached_interface:
+                    RNS.log(f"No interfaces could process the outbound {self.hops} hop, type {self.packet_type} packet for {self.destination}", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+
                 self.sent = False
                 self.receipt = None
                 return False
@@ -345,6 +356,10 @@ class Packet:
 
     def getTruncatedHash(self): return RNS.Identity.truncated_hash(self.get_hashable_part())
 
+    @property
+    def truncated_packet_hash(self):
+        return self.packet_hash[:RNS.Reticulum.TRUNCATED_HASHLENGTH//8]
+
     def get_hashable_part(self):
         hashable_part = bytes([self.raw[0] & 0b00001111])
         if self.header_type == Packet.HEADER_2: hashable_part += self.raw[(RNS.Identity.TRUNCATED_HASHLENGTH//8)+2:]
@@ -357,25 +372,25 @@ class Packet:
         :returns: The physical layer *Received Signal Strength Indication* if available, otherwise ``None``.
         """
         if self.rssi != None: return self.rssi
-        else:                 return reticulum.get_packet_rssi(self.packet_hash)
+        else:                 return RNS.Reticulum.get_instance().get_packet_rssi(self.packet_hash)
             
     def get_snr(self):
         """
         :returns: The physical layer *Signal-to-Noise Ratio* if available, otherwise ``None``.
         """
         if self.snr != None: return self.snr
-        else:                return reticulum.get_packet_snr(self.packet_hash)
+        else:                return RNS.Reticulum.get_instance().get_packet_snr(self.packet_hash)
 
     def get_q(self):
         """
         :returns: The physical layer *Link Quality* if available, otherwise ``None``.
         """
         if self.q != None: return self.q
-        else:              return reticulum.get_packet_q(self.packet_hash)
+        else:              return RNS.Reticulum.get_instance().get_packet_q(self.packet_hash)
 
 class ProofDestination:
     def __init__(self, packet):
-        self.hash = packet.get_hash()[:RNS.Reticulum.TRUNCATED_HASHLENGTH//8];
+        self.hash = packet.truncated_packet_hash;
         self.type = RNS.Destination.SINGLE
 
     def encrypt(self, plaintext): return plaintext
@@ -400,8 +415,8 @@ class PacketReceipt:
 
     # Creates a new packet receipt from a sent packet
     def __init__(self, packet):
-        self.hash           = packet.get_hash()
-        self.truncated_hash = packet.getTruncatedHash()
+        self.hash           = packet.packet_hash
+        self.truncated_hash = packet.truncated_packet_hash
         self.sent           = True
         self.sent_at        = time.time()
         self.proved         = False

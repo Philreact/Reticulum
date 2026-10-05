@@ -1,6 +1,6 @@
 # Reticulum License
 #
-# Copyright (c) 2016-2025 Mark Qvist
+# Copyright (c) 2016-2026 Mark Qvist
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -108,8 +108,8 @@ class Reticulum:
     discovery significantly increases throughput over fast links.
     """
 
-    MAX_QUEUED_ANNOUNCES = 16384
-    QUEUED_ANNOUNCE_LIFE = 60*60*24
+    MAX_QUEUED_ANNOUNCES = 4096
+    QUEUED_ANNOUNCE_LIFE = 60*60*3
 
     ANNOUNCE_CAP = 2
     """
@@ -140,6 +140,9 @@ class Reticulum:
     # TODO: Let Reticulum somehow continously build a map of per-hop
     # latencies and use this map for global timeout calculation.
     DEFAULT_PER_HOP_TIMEOUT = 6
+    """
+    The default per-hop timeout value used in various timeout calculations.
+    """
 
     # Length of truncated hashes in bits.
     TRUNCATED_HASHLENGTH = 128
@@ -187,8 +190,6 @@ class Reticulum:
             RNS.Transport.exit_handler()
             RNS.Identity.exit_handler()
 
-            if RNS.Profiler.ran(): RNS.Profiler.results()
-
             RNS.loglevel = RNS.LOG_NONE
             RNS._detach_stdout()
 
@@ -207,7 +208,7 @@ class Reticulum:
     @staticmethod
     def get_instance():
         """
-        Return the currently running Reticulum instance
+        Returns the currently running Reticulum instance.
         """
         return Reticulum.__instance
 
@@ -256,11 +257,13 @@ class Reticulum:
         Reticulum.__local_hops_delta                  = False
         Reticulum.__link_mtu_discovery                = Reticulum.LINK_MTU_DISCOVERY
         Reticulum.__remote_management_enabled         = False
+        Reticulum.__interface_management_enabled      = True
         Reticulum.__use_implicit_proof                = True
         Reticulum.__allow_probes                      = False
         Reticulum.__discovery_enabled                 = False
         Reticulum.__discover_interfaces               = False
         Reticulum.__autoconnect_discovered_interfaces = False
+        Reticulum.__autoconnect_unverified            = False
         Reticulum.__autoconnect_interface_mode        = None
         Reticulum.__autoconnect_interface_gravity     = None
         Reticulum.__autoconnect_announces_to_internal = None
@@ -284,6 +287,10 @@ class Reticulum:
         Reticulum.__ic_held_release_interval          = None
         Reticulum.__ec_pr_freq                        = None
         Reticulum.__egress_control                    = None
+        Reticulum.__inbound_data_queue_length         = None
+        Reticulum.__inbound_announce_queue_length     = None
+        Reticulum.__inbound_pr_queue_length           = None
+        Reticulum.__inbound_il_queue_length           = None
 
         Reticulum.panic_on_interface_error = False
 
@@ -536,11 +543,17 @@ class Reticulum:
                 
                 if option == "link_mtu_discovery":
                     v = self.config["reticulum"].as_bool(option)
-                    if v == True: Reticulum.__link_mtu_discovery = True
+                    if   v == True:  Reticulum.__link_mtu_discovery = True
+                    elif v == False: Reticulum.__link_mtu_discovery = False
                 
                 if option == "enable_remote_management":
                     v = self.config["reticulum"].as_bool(option)
                     if v == True: Reticulum.__remote_management_enabled = True
+                
+                if option == "enable_interface_management":
+                    v = self.config["reticulum"].as_bool(option)
+                    if v == False: Reticulum.__interface_management_enabled = False
+                    else:          Reticulum.__interface_management_enabled = True
                 
                 if option == "remote_management_allowed":
                     v = self.config["reticulum"].as_list(option)
@@ -615,6 +628,10 @@ class Reticulum:
                 if option == "autoconnect_discovered_interfaces":
                     v = self.config["reticulum"].as_int(option)
                     if v > 0: Reticulum.__autoconnect_discovered_interfaces = v
+
+                if option == "autoconnect_unverified_implementations":
+                    v = self.config["reticulum"].as_bool(option)
+                    Reticulum.__autoconnect_unverified = v
 
                 if option == "autoconnect_interface_mode":
                     v = None; dmode = str(self.config["reticulum"]["autoconnect_interface_mode"]).lower()
@@ -696,6 +713,22 @@ class Reticulum:
                     v = self.config["reticulum"].as_float(option)
                     if v >= 0: Reticulum.__ic_held_release_interval = v
 
+                if option == "qlen_in_data":
+                    v = self.config["reticulum"].as_int(option)
+                    if v > 0: Reticulum.__inbound_data_queue_length = v
+
+                if option == "qlen_in_announce":
+                    v = self.config["reticulum"].as_int(option)
+                    if v > 0: Reticulum.__inbound_announce_queue_length = v
+
+                if option == "qlen_in_pr":
+                    v = self.config["reticulum"].as_int(option)
+                    if v > 0: Reticulum.__inbound_pr_queue_length = v
+
+                if option == "qlen_in_il":
+                    v = self.config["reticulum"].as_int(option)
+                    if v > 0: Reticulum.__inbound_il_queue_length = v
+
 
         if RNS.compiled: RNS.log("Reticulum running in compiled mode", RNS.LOG_DEBUG)
         else: RNS.log("Reticulum running in interpreted mode", RNS.LOG_DEBUG)
@@ -712,6 +745,11 @@ class Reticulum:
 
         if self.local_socket_path == None and self.use_af_unix:
             self.local_socket_path = "default"
+
+        dql = RNS.Reticulum.default_data_queue_length() or RNS.Transport.INBOUND_DA_QUEUE_LENGTH
+        BackboneInterface.BackboneInterface.DP_IC_HIGH_WM  = max(4, int((BackboneInterface.BackboneInterface.DP_IC_HIGH_WM_PCT/100.0) * dql))
+        BackboneInterface.BackboneInterface.DP_IC_MID_WM   = max(2, int((BackboneInterface.BackboneInterface.DP_IC_MID_WM_PCT/100.0)  * dql))
+        BackboneInterface.BackboneInterface.DP_IC_LOW_WM   = max(0, int((BackboneInterface.BackboneInterface.DP_IC_LOW_WM_PCT/100.0)  * dql))
 
         self.__start_local_interface()
 
@@ -730,7 +768,79 @@ class Reticulum:
 
             RNS.log("System interfaces are ready", RNS.LOG_VERBOSE)
 
-    def _synthesize_interface(self, config, name, instance_init=False):
+    def _attach_interface(self, name, internal_forced=False):
+        if not internal_forced and not Reticulum.__interface_management_enabled: return False
+        try:
+            interfaces = { iface.name: iface for iface in RNS.Transport.interfaces }
+            if name in interfaces:
+                RNS.log(f"Attempt to attach existing interface \"{name}\"", RNS.LOG_WARNING)
+                return False
+
+            else:
+                try: config = ConfigObj(self.configpath)
+                except Exception as e:
+                    RNS.log(f"Could not parse the configuration at {self.configpath} during interface attach", RNS.LOG_ERROR)
+                    return None
+
+                if "interfaces" in config:
+                    if not name in config["interfaces"]:
+                        RNS.log(f"Cannot attach interface \"{name}\", no configuration entry exists", RNS.LOG_ERROR)
+                        return None
+
+                    else:
+                        interface_config = config["interfaces"][name]
+                        self._synthesize_interface(interface_config, name, force_attach=True)
+                        RNS.log(f"Interface \"{name}\" was attached", RNS.LOG_NOTICE)
+                        return True
+
+        except Exception as e: RNS.log(f"Error while detaching interface \"{name}\": {e}", RNS.LOG_ERROR)
+        return False
+
+    def _detach_interface(self, name, internal_forced=False):
+        if not internal_forced and not Reticulum.__interface_management_enabled: return False
+        try:
+            interfaces = { iface.name: iface for iface in RNS.Transport.interfaces }
+            if not name in interfaces:
+                RNS.log(f"Attempt to detach non-existing interface \"{name}\"", RNS.LOG_WARNING)
+                return None
+
+            else:
+                interface = interfaces[name]
+                if isinstance(interface, I2PInterface.I2PInterface):           return False
+                if isinstance(interface, LocalInterface.LocalClientInterface): return False
+                if isinstance(interface, LocalInterface.LocalServerInterface): return False
+                if interface.spawned_interfaces:
+                    if   type(interface.spawned_interfaces) == dict: spawned = list(interface.spawned_interfaces.values())
+                    elif type(interface.spawned_interfaces) == list: spawned = interface.spawned_interfaces.copy()
+                    for s in spawned:
+                        s.detach()
+                        s.teardown()
+                        RNS.Transport.remove_interface(s)
+
+                interface.detach()
+                RNS.Transport.remove_interface(interface)
+                RNS.log(f"Interface \"{name}\" was detached", RNS.LOG_NOTICE)
+                return True
+
+        except Exception as e: RNS.log(f"Error while detaching interface \"{name}\": {e}", RNS.LOG_ERROR); RNS.trace_exception(e)
+        return False
+
+    def _reload_interface(self, name, internal_forced=False):
+        if not internal_forced and not Reticulum.__interface_management_enabled: return False
+        interfaces = { iface.name: iface for iface in RNS.Transport.interfaces }
+        if not name in interfaces:
+            RNS.log(f"Attempt to reload non-existing interface \"{name}\"", RNS.LOG_WARNING)
+            return None
+
+        if self._detach_interface(name, internal_forced=internal_forced) and self._attach_interface(name, internal_forced=internal_forced):
+            RNS.log(f"Interface \"{name}\" was reloaded", RNS.LOG_NOTICE)
+            return True
+
+        else:
+            RNS.log(f"Could not reload interface \"{name}\"", RNS.LOG_NOTICE)
+            return False
+
+    def _synthesize_interface(self, config, name, instance_init=False, force_attach=False):
         c = config
         interface_mode = Interface.Interface.MODE_FULL
         
@@ -777,15 +887,19 @@ class Reticulum:
                 
         ifac_netname = None
         if "networkname" in c:
-            if c["networkname"] != "": ifac_netname = c["networkname"]
+            if c["networkname"] == "None": RNS.log("Ambiguous IFAC network name \"None\", this value is ignored and an IFAC network name has NOT been set", RNS.LOG_WARNING)
+            if c["networkname"] != "" and c["networkname"] != "None": ifac_netname = c["networkname"]
         if "network_name" in c:
-            if c["network_name"] != "": ifac_netname = c["network_name"]
+            if c["network_name"] == "None": RNS.log("Ambiguous IFAC network name \"None\", this value is ignored and an IFAC network name has NOT been set", RNS.LOG_WARNING)
+            if c["network_name"] != "" and c["network_name"] != "None": ifac_netname = c["network_name"]
 
         ifac_netkey = None
         if "passphrase" in c:
-            if c["passphrase"] != "": ifac_netkey = c["passphrase"]
+            if c["passphrase"] == "None": RNS.log("Ambiguous IFAC passphrase \"None\", this value is ignored and an IFAC passphrase has NOT been set", RNS.LOG_WARNING)
+            if c["passphrase"] != "" and c["passphrase"] != "None": ifac_netkey = c["passphrase"]
         if "pass_phrase" in c:
-            if c["pass_phrase"] != "": ifac_netkey = c["pass_phrase"]
+            if c["pass_phrase"] == "None": RNS.log("Ambiguous IFAC passphrase \"None\", this value is ignored and an IFAC passphrase has NOT been set", RNS.LOG_WARNING)
+            if c["pass_phrase"] != "" and c["pass_phrase"] != "None": ifac_netkey = c["pass_phrase"]
                 
         ingress_control = True
         if "ingress_control" in c: ingress_control = c.as_bool("ingress_control")
@@ -860,6 +974,7 @@ class Reticulum:
         discovery_announce_interval = None
         discovery_stamp_value = None
         discovery_name = None
+        discovery_lxmf_address = None
         discovery_encrypt = False
         reachable_on = None
         publish_ifac = False
@@ -891,6 +1006,11 @@ class Reticulum:
                 if "discovery_frequency" in c: discovery_frequency = c.as_int("discovery_frequency")
                 if "discovery_bandwidth" in c: discovery_bandwidth = c.as_int("discovery_bandwidth")
                 if "discovery_modulation" in c: discovery_modulation = c.as_int("discovery_modulation")
+                if "discovery_lxmf_address" in c:
+                    if len(c["discovery_lxmf_address"]) == RNS.Identity.TRUNCATED_HASHLENGTH//8*2:
+                        try: discovery_lxmf_address = bytes.fromhex(c["discovery_lxmf_address"])
+                        except: RNS.log(f"Invalid interface discovery LXMF address: {c['discovery_lxmf_address']}", RNS.LOG_ERROR)
+                    else: RNS.log(f"Invalid length for interface discovery LXMF address: {c['discovery_lxmf_address']}", RNS.LOG_ERROR)
 
                 if not interface_mode in [Interface.Interface.MODE_GATEWAY, Interface.Interface.MODE_ACCESS_POINT, Interface.Interface.MODE_INTERNAL]:
                     if not ignore_config_warnings:
@@ -922,6 +1042,7 @@ class Reticulum:
                     interface.discovery_publish_ifac          = publish_ifac
                     interface.reachable_on                    = reachable_on
                     interface.discovery_name                  = discovery_name
+                    interface.discovery_lxmf_address          = discovery_lxmf_address
                     interface.discovery_encrypt               = discovery_encrypt
                     interface.discovery_stamp_value           = discovery_stamp_value
                     interface.discovery_location              = discovery_location
@@ -971,11 +1092,16 @@ class Reticulum:
                         interface.ifac_identity = RNS.Identity.from_bytes(interface.ifac_key)
                         interface.ifac_signature = interface.ifac_identity.sign(RNS.Identity.full_hash(interface.ifac_key))
 
+                    elif interface.discoverable and interface.discovery_publish_ifac:
+                        RNS.log(f"IFAC publishing was enabled for discoverable interface {interface}, but neither IFAC netname nor passphrase is configured", RNS.LOG_WARNING)
+                        RNS.log(f"Disabling IFAC publishing for {interface}", RNS.LOG_WARNING)
+                        interface.discovery_publish_ifac = False
+
                     RNS.Transport.add_interface(interface)
                     interface.final_init()
 
             interface = None
-            if (("interface_enabled" in c) and c.as_bool("interface_enabled") == True) or (("enabled" in c) and c.as_bool("enabled") == True):
+            if (("interface_enabled" in c) and c.as_bool("interface_enabled") == True) or (("enabled" in c) and c.as_bool("enabled") == True) or force_attach:
                 interface_config = c
                 interface_config["name"] = name
                 interface_config["selected_interface_mode"] = interface_mode
@@ -1079,7 +1205,6 @@ class Reticulum:
                         except Exception as e:
                             RNS.log(f"External interface initialisation failed for {interface_type} / {name}", RNS.LOG_ERROR)
                             RNS.trace_exception(e)
-
             else:
                 RNS.log("Skipping disabled interface \""+name+"\"", RNS.LOG_DEBUG)
 
@@ -1250,17 +1375,27 @@ class Reticulum:
                         mh = call["max_hops"]
                         self.rpc_return(conn, self.get_path_table(max_hops=mh))
 
-                    if path == "interface_stats":       self.rpc_return(conn, self.get_interface_stats())
-                    if path == "rate_table":            self.rpc_return(conn, self.get_rate_table())
-                    if path == "next_hop_if_name":      self.rpc_return(conn, self.get_next_hop_if_name(call["destination_hash"]))
-                    if path == "next_hop":              self.rpc_return(conn, self.get_next_hop(call["destination_hash"]))
-                    if path == "first_hop_timeout":     self.rpc_return(conn, self.get_first_hop_timeout(call["destination_hash"]))
-                    if path == "link_count":            self.rpc_return(conn, self.get_link_count())
-                    if path == "packet_rssi":           self.rpc_return(conn, self.get_packet_rssi(call["packet_hash"]))
-                    if path == "packet_snr":            self.rpc_return(conn, self.get_packet_snr(call["packet_hash"]))
-                    if path == "packet_q":              self.rpc_return(conn, self.get_packet_q(call["packet_hash"]))
-                    if path == "blackholed_identities": self.rpc_return(conn, self.get_blackholed_identities())
-                    if path == "is_blackholed":         self.rpc_return(conn, self.is_blackholed(call["identity_hash"]))
+                    if path == "interface_stats":          self.rpc_return(conn, self.get_interface_stats())
+                    if path == "rate_table":               self.rpc_return(conn, self.get_rate_table())
+                    if path == "next_hop_if_name":         self.rpc_return(conn, self.get_next_hop_if_name(call["destination_hash"]))
+                    if path == "next_hop":                 self.rpc_return(conn, self.get_next_hop(call["destination_hash"]))
+                    if path == "first_hop_timeout":        self.rpc_return(conn, self.get_first_hop_timeout(call["destination_hash"]))
+                    if path == "lowest_interface_bitrate": self.rpc_return(conn, self.get_lowest_interface_bitrate())
+                    if path == "medium_path_timeout":      self.rpc_return(conn, self.get_medium_path_timeout())
+                    if path == "link_count":               self.rpc_return(conn, self.get_link_count())
+                    if path == "active_link_count":        self.rpc_return(conn, self.get_active_link_count())
+                    if path == "packet_rssi":              self.rpc_return(conn, self.get_packet_rssi(call["packet_hash"]))
+                    if path == "packet_snr":               self.rpc_return(conn, self.get_packet_snr(call["packet_hash"]))
+                    if path == "packet_q":                 self.rpc_return(conn, self.get_packet_q(call["packet_hash"]))
+                    if path == "profiling_results":        self.rpc_return(conn, self.get_profiling_results())
+                    if path == "blackholed_identities":    self.rpc_return(conn, self.get_blackholed_identities())
+                    if path == "is_blackholed":            self.rpc_return(conn, self.is_blackholed(call["identity_hash"]))
+
+                if "manage" in call:
+                    path = call["manage"]
+                    if path == "attach_interface":         self.rpc_return(conn, self.attach_interface(call["name"]))
+                    if path == "detach_interface":         self.rpc_return(conn, self.detach_interface(call["name"]))
+                    if path == "reload_interface":         self.rpc_return(conn, self.reload_interface(call["name"]))
 
                 if "drop" in call:
                     path = call["drop"]
@@ -1440,6 +1575,26 @@ class Reticulum:
                     else:                                  ifstats["txs"] = 0
                 else:                                      ifstats["txs"] = 0
 
+                if hasattr(interface, "current_arx_speed"):
+                    if interface.current_arx_speed != None: ifstats["arxs"] = interface.current_arx_speed
+                    else:                                   ifstats["arxs"] = 0
+                else:                                       ifstats["arxs"] = 0
+
+                if hasattr(interface, "current_atx_speed"):
+                    if interface.current_atx_speed != None: ifstats["atxs"] = interface.current_atx_speed
+                    else:                                   ifstats["atxs"] = 0
+                else:                                       ifstats["atxs"] = 0
+
+                if hasattr(interface, "current_prx_speed"):
+                    if interface.current_prx_speed != None: ifstats["prxs"] = interface.current_prx_speed
+                    else:                                   ifstats["prxs"] = 0
+                else:                                       ifstats["prxs"] = 0
+
+                if hasattr(interface, "current_ptx_speed"):
+                    if interface.current_ptx_speed != None: ifstats["ptxs"] = interface.current_ptx_speed
+                    else:                                   ifstats["ptxs"] = 0
+                else:                                       ifstats["ptxs"] = 0
+
                 if hasattr(interface, "peers"):
                     if interface.peers != None: ifstats["peers"] = len(interface.peers)
                     else:                       ifstats["peers"] = None
@@ -1470,8 +1625,21 @@ class Reticulum:
                 ifstats["short_name"]                  = str(interface.name)
                 ifstats["hash"]                        = interface.get_hash()
                 ifstats["type"]                        = str(type(interface).__name__)
+                ifstats["mtu"]                         = interface.HW_MTU
                 ifstats["rxb"]                         = interface.rxb
                 ifstats["txb"]                         = interface.txb
+                ifstats["arxb"]                        = interface.arxb
+                ifstats["atxb"]                        = interface.atxb
+                ifstats["arxc"]                        = interface.arxc
+                ifstats["atxc"]                        = interface.atxc
+                ifstats["prxb"]                        = interface.prxb
+                ifstats["ptxb"]                        = interface.ptxb
+                ifstats["prxc"]                        = interface.prxc
+                ifstats["ptxc"]                        = interface.ptxc
+                ifstats["txdrp"]                       = interface.tx_drops
+                ifstats["txdrb"]                       = interface.tx_dropped_bytes
+                ifstats["txstalled"]                   = interface.tx_stalled
+                ifstats["txbuffered"]                  = len(interface.transmit_buffer) if interface.transmit_buffer else 0
                 ifstats["incoming_announce_frequency"] = interface.incoming_announce_frequency()
                 ifstats["outgoing_announce_frequency"] = interface.outgoing_announce_frequency()
                 ifstats["incoming_pr_frequency"]       = interface.incoming_pr_frequency()
@@ -1482,21 +1650,63 @@ class Reticulum:
                 ifstats["held_announces"]              = len(interface.held_announces)
                 ifstats["burst_active"]                = interface.ic_burst_active
                 ifstats["burst_activated"]             = interface.ic_burst_activated
+                ifstats["burst_count"]                 = interface.ic_burst_count
                 ifstats["pr_burst_active"]             = interface.ic_pr_burst_active
                 ifstats["pr_burst_activated"]          = interface.ic_pr_burst_activated
+                ifstats["pr_burst_count"]              = interface.ic_pr_burst_count
                 ifstats["status"]                      = interface.online
                 ifstats["mode"]                        = interface.mode
                 ifstats["gravity"]                     = interface.gravity
                 ifstats["announces_to_internal"]       = interface.announces_to_internal
+                ifstats["protocol_violations"]         = interface.protocol_violations
+                ifstats["ifac_violations"]             = interface.ifac_violations
+                ifstats["packet_filter_hits"]          = interface.packet_filter_hits
 
                 interfaces.append(ifstats)
 
-            stats               = {}
-            stats["interfaces"] = interfaces
-            stats["rxb"]        = RNS.Transport.traffic_rxb
-            stats["txb"]        = RNS.Transport.traffic_txb
-            stats["rxs"]        = RNS.Transport.speed_rx
-            stats["txs"]        = RNS.Transport.speed_tx
+            qsnapshot            = RNS.Transport.inbound_queues.snapshot()
+            dql                  = RNS.Transport.INBOUND_DA_QUEUE_LENGTH
+            aql                  = RNS.Transport.INBOUND_AN_QUEUE_LENGTH
+            pql                  = RNS.Transport.INBOUND_PR_QUEUE_LENGTH
+            ilql                 = RNS.Transport.INBOUND_IL_QUEUE_LENGTH
+            tql                  = dql+aql+pql+ilql
+
+            stats                = {}
+            stats["interfaces"]  = interfaces
+            stats["rxb"]         = RNS.Transport.traffic_rxb
+            stats["txb"]         = RNS.Transport.traffic_txb
+            stats["rxs"]         = RNS.Transport.speed_rx
+            stats["txs"]         = RNS.Transport.speed_tx
+            stats["arxb"]        = RNS.Transport.announce_rxb
+            stats["atxb"]        = RNS.Transport.announce_txb
+            stats["arxs"]        = RNS.Transport.announce_speed_rx
+            stats["atxs"]        = RNS.Transport.announce_speed_tx
+            stats["arxf"]        = RNS.Transport.announce_freq_rx
+            stats["atxf"]        = RNS.Transport.announce_freq_tx
+            stats["prxb"]        = RNS.Transport.pr_rxb
+            stats["ptxb"]        = RNS.Transport.pr_txb
+            stats["prxs"]        = RNS.Transport.pr_speed_rx
+            stats["ptxs"]        = RNS.Transport.pr_speed_tx
+            stats["prxf"]        = RNS.Transport.pr_freq_rx
+            stats["ptxf"]        = RNS.Transport.pr_freq_tx
+            stats["rxpps"]       = RNS.Transport.rx_pps
+            stats["txpps"]       = RNS.Transport.tx_pps
+            stats["rxqt"]        = qsnapshot[0]
+            stats["rxqd"]        = qsnapshot[1][0]
+            stats["rxqa"]        = qsnapshot[1][1]
+            stats["rxqp"]        = qsnapshot[1][2]
+            stats["rxqil"]       = qsnapshot[1][3]
+            stats["rxqtd"]       = qsnapshot[2][0]+qsnapshot[2][1]+qsnapshot[2][2]+qsnapshot[2][3]
+            stats["rxqdd"]       = qsnapshot[2][0]
+            stats["rxqad"]       = qsnapshot[2][1]
+            stats["rxqpd"]       = qsnapshot[2][2]
+            stats["rxqild"]      = qsnapshot[2][3]
+            stats["tqpressure"]  = qsnapshot[0]/tql     if qsnapshot[0]    else 0
+            stats["dqpressure"]  = qsnapshot[1][0]/dql  if qsnapshot[1][0] else 0
+            stats["aqpressure"]  = qsnapshot[1][1]/aql  if qsnapshot[1][1] else 0
+            stats["pqpressure"]  = qsnapshot[1][2]/pql  if qsnapshot[1][2] else 0
+            stats["ilqpressure"] = qsnapshot[1][3]/ilql if qsnapshot[1][3] else 0
+            stats["txq"]         = None
 
             if Reticulum.transport_enabled():
                 stats["transport_id"] = RNS.Transport.identity.hash
@@ -1602,6 +1812,16 @@ class Reticulum:
             return str(RNS.Transport.next_hop_interface(destination))
 
     def get_first_hop_timeout(self, destination):
+        """
+        Returns a best-effort estimate of a reasonable minimum
+        *first-hop* timeout value for a given destination hash.
+        If a path is known, this calculation takes the next-hop
+        interface's bitrate into account. If no path is currently
+        known, returns ``DEFAULT_PER_HOP_TIMEOUT``.
+
+        :param destination: A destination hash, as *bytes*.
+        :returns: First-hop timeout, in seconds.
+        """
         if self.is_connected_to_shared_instance:
             try:
                 rpc_connection = self.get_rpc_client()
@@ -1620,6 +1840,45 @@ class Reticulum:
 
         else:
             return RNS.Transport.first_hop_timeout(destination)
+
+    def get_lowest_interface_bitrate(self):
+        """
+        Returns the bitrate of the slowest currently online
+        interface, or None if no online interface bitrate
+
+        :returns: Lowest online interface bitrate in bits per second, or ``None``.
+        """
+        if self.is_connected_to_shared_instance:
+            try:
+                rpc_connection = self.get_rpc_client()
+                rpc_connection.send_bytes(mp.packb({"get": "lowest_interface_bitrate"}))
+                return mp.unpackb(rpc_connection.recv_bytes())
+            except Exception as e:
+                RNS.log("An error occurred while getting lowest interface bitrate from shared instance: "+str(e), RNS.LOG_ERROR)
+                return None
+
+        else:
+            return RNS.Transport.lowest_interface_bitrate
+
+    def get_medium_path_timeout(self):
+        """
+        Returns an estimate of a reasonable minimum path request timeout covering
+        a full round trip for an MTU on the slowest currently online interface
+        plus per hop grace
+
+        :returns: Timeout in seconds or 0 if it's unknown.
+        """
+        if self.is_connected_to_shared_instance:
+            try:
+                rpc_connection = self.get_rpc_client()
+                rpc_connection.send_bytes(mp.packb({"get": "medium_path_timeout"}))
+                return mp.unpackb(rpc_connection.recv_bytes())
+            except Exception as e:
+                RNS.log("An error occurred while getting medium path timeout from shared instance: "+str(e), RNS.LOG_ERROR)
+                return 0
+
+        else:
+            return RNS.Transport.medium_path_timeout()
 
     def get_next_hop(self, destination):
         if self.is_connected_to_shared_instance:
@@ -1640,7 +1899,17 @@ class Reticulum:
             return response
 
         else:
-            return len(RNS.Transport.link_table)
+            return RNS.Transport.link_count()
+
+    def get_active_link_count(self):
+        if self.is_connected_to_shared_instance:
+            rpc_connection = self.get_rpc_client()
+            rpc_connection.send_bytes(mp.packb({"get": "active_link_count"}))
+            response = mp.unpackb(rpc_connection.recv_bytes())
+            return response
+
+        else:
+            return RNS.Transport.active_link_count()
 
     def get_packet_rssi(self, packet_hash):
         if self.is_connected_to_shared_instance:
@@ -1684,21 +1953,50 @@ class Reticulum:
 
             return None
 
-    def halt_interface(self, interface):
-        pass
+    def get_profiling_results(self):
+        if self.is_connected_to_shared_instance:
+            rpc_connection = self.get_rpc_client()
+            rpc_connection.send_bytes(mp.packb({"get": "profiling_results"}))
+            response = mp.unpackb(rpc_connection.recv_bytes())
+            return response
 
-    def resume_interface(self, interface):
-        pass
+        else:
+            if RNS.Profiler.ran(): return RNS.Profiler.results()
+            else: return None
 
-    def reload_interface(self, interface):
-        pass
+    def attach_interface(self, interface_name):
+        if self.is_connected_to_shared_instance:
+            rpc_connection = self.get_rpc_client()
+            rpc_connection.send_bytes(mp.packb({"manage": "attach_interface", "name": interface_name}))
+            response = mp.unpackb(rpc_connection.recv_bytes())
+            return response
+            
+        else: return self._attach_interface(interface_name)
+
+    def detach_interface(self, interface_name):
+        if self.is_connected_to_shared_instance:
+            rpc_connection = self.get_rpc_client()
+            rpc_connection.send_bytes(mp.packb({"manage": "detach_interface", "name": interface_name}))
+            response = mp.unpackb(rpc_connection.recv_bytes())
+            return response
+            
+        else: return self._detach_interface(interface_name)
+
+    def reload_interface(self, interface_name):
+        if self.is_connected_to_shared_instance:
+            rpc_connection = self.get_rpc_client()
+            rpc_connection.send_bytes(mp.packb({"manage": "reload_interface", "name": interface_name}))
+            response = mp.unpackb(rpc_connection.recv_bytes())
+            return response
+            
+        else: return self._reload_interface(interface_name)
 
     def get_blackholed_identities(self):
         if self.is_connected_to_shared_instance:
-                rpc_connection = self.get_rpc_client()
-                rpc_connection.send_bytes(mp.packb({"get": "blackholed_identities"}))
-                response = mp.unpackb(rpc_connection.recv_bytes())
-                return response
+            rpc_connection = self.get_rpc_client()
+            rpc_connection.send_bytes(mp.packb({"get": "blackholed_identities"}))
+            response = mp.unpackb(rpc_connection.recv_bytes())
+            return response
             
         else: return RNS.Transport.blackholed_identities
 
@@ -1709,10 +2007,10 @@ class Reticulum:
         if len(identity_hash) != RNS.Reticulum.TRUNCATED_HASHLENGTH//8: raise ValueError("Invalid identity hash length for blackhole check")
 
         if self.is_connected_to_shared_instance:
-                rpc_connection = self.get_rpc_client()
-                rpc_connection.send_bytes(mp.packb({"get": "is_blackholed", "identity_hash": identity_hash}))
-                response = mp.unpackb(rpc_connection.recv_bytes())
-                return response
+            rpc_connection = self.get_rpc_client()
+            rpc_connection.send_bytes(mp.packb({"get": "is_blackholed", "identity_hash": identity_hash}))
+            response = mp.unpackb(rpc_connection.recv_bytes())
+            return response
 
         else: return identity_hash in RNS.Transport.blackholed_identities
 
@@ -1850,6 +2148,10 @@ class Reticulum:
         return Reticulum.__autoconnect_discovered_interfaces > 0
 
     @staticmethod
+    def should_autoconnect_unverified_implementations():
+        return Reticulum.__autoconnect_unverified
+
+    @staticmethod
     def autoconnect_interface_mode():
         return Reticulum.__autoconnect_interface_mode
 
@@ -1872,6 +2174,22 @@ class Reticulum:
     @staticmethod
     def local_hops_delta():
         return Reticulum.__local_hops_delta
+
+    @staticmethod
+    def default_data_queue_length():
+        return Reticulum.__inbound_data_queue_length
+
+    @staticmethod
+    def default_announce_queue_length():
+        return Reticulum.__inbound_announce_queue_length
+
+    @staticmethod
+    def default_pr_queue_length():
+        return Reticulum.__inbound_pr_queue_length
+
+    @staticmethod
+    def default_il_queue_length():
+        return Reticulum.__inbound_il_queue_length
 
 # Default configuration file:
 __default_rns_config__ = '''# This is the default Reticulum config file.

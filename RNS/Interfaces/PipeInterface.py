@@ -84,6 +84,7 @@ class PipeInterface(Interface):
         self.pipe_is_open = False
         self.bitrate  = PipeInterface.BITRATE_GUESS
         self.respawn_delay = respawn_delay
+        self.shared_medium = True
 
         try:
             self.open_pipe()
@@ -119,6 +120,7 @@ class PipeInterface(Interface):
 
 
     def process_incoming(self, data):
+        if not data: return
         self.rxb += len(data)            
         self.owner.inbound(data, self)
 

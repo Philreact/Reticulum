@@ -1,6 +1,6 @@
 # Reticulum License
 #
-# Copyright (c) 2016-2025 Mark Qvist
+# Copyright (c) 2016-2026 Mark Qvist
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -208,6 +208,7 @@ class TCPClientInterface(Interface):
         
     def detach(self):
         self.online = False
+        self.detached = True
         if self.socket != None:
             if hasattr(self.socket, "close"):
                 if callable(self.socket.close):
@@ -272,7 +273,7 @@ class TCPClientInterface(Interface):
             if not self.reconnecting:
                 self.reconnecting = True
                 attempts = 0
-                while not self.online:
+                while not self.online and not self.detached:
                     time.sleep(TCPClientInterface.RECONNECT_WAIT)
                     attempts += 1
 
@@ -302,6 +303,7 @@ class TCPClientInterface(Interface):
             raise IOError("Attempt to reconnect on a non-initiator TCP interface")
 
     def process_incoming(self, data):
+        if not data: return
         if self.online and not self.detached:
             self.rxb += len(data)
             if hasattr(self, "parent_interface") and self.parent_interface != None:
@@ -426,7 +428,7 @@ class TCPClientInterface(Interface):
             self.online = False
             RNS.log("An interface error occurred for "+str(self)+", the contained exception was: "+str(e), RNS.LOG_WARNING)
 
-            if self.initiator:
+            if self.initiator and not self.detached:
                 RNS.log("Attempting to reconnect...", RNS.LOG_WARNING)
                 self.reconnect()
             else:
@@ -452,12 +454,9 @@ class TCPClientInterface(Interface):
         if not self.initiator:
             RNS.Transport.remove_interface(self)
 
-
     def __str__(self):
-        if ":" in self.target_ip:
-            ip_str = f"[{self.target_ip}]"
-        else:
-            ip_str = f"{self.target_ip}"
+        if ":" in self.target_ip: ip_str = f"[{self.target_ip}]"
+        else:                     ip_str = f"{self.target_ip}"
 
         return "TCPInterface["+str(self.name)+"/"+ip_str+":"+str(self.target_port)+"]"
 
@@ -637,6 +636,10 @@ class TCPServerInterface(Interface):
         spawned_interface.announce_rate_penalty = self.announce_rate_penalty
         spawned_interface.mode = self.mode
         spawned_interface.gravity = self.gravity
+        spawned_interface.recursive_prs = self.recursive_prs
+        spawned_interface.announces_from_internal = self.announces_from_internal
+        spawned_interface.announces_to_internal = self.announces_to_internal
+        spawned_interface.announce_cap = self.announce_cap
         spawned_interface.HW_MTU = self.HW_MTU
         spawned_interface.online = True
         RNS.log("Spawned new TCPClient Interface: "+str(spawned_interface), RNS.LOG_VERBOSE)
@@ -646,17 +649,25 @@ class TCPServerInterface(Interface):
         self.spawned_interfaces.append(spawned_interface)
         spawned_interface.read_loop()
 
-    def received_announce(self, from_spawned=False):
-        if from_spawned: self.ia_freq_deque.append(time.time())
+    def received_announce(self, size=0, from_spawned=False):
+        if from_spawned:
+            self.ia_freq_deque.append(time.time())
+            self.arxb += size
 
-    def sent_announce(self, from_spawned=False):
-        if from_spawned: self.oa_freq_deque.append(time.time())
+    def sent_announce(self, size=0, from_spawned=False):
+        if from_spawned:
+            self.oa_freq_deque.append(time.time())
+            self.atxb += size
 
-    def received_path_request(self, from_spawned=False):
-        if from_spawned: self.ip_freq_deque.append(time.time())
+    def received_path_request(self, size=0, from_spawned=False):
+        if from_spawned:
+            self.ip_freq_deque.append(time.time())
+            self.prxb += size
 
-    def sent_path_request(self, from_spawned=False):
-        if from_spawned: self.op_freq_deque.append(time.time())
+    def sent_path_request(self, size=0, from_spawned=False):
+        if from_spawned:
+            self.op_freq_deque.append(time.time())
+            self.ptxb += size
 
     def process_outgoing(self, data):
         pass
@@ -678,10 +689,8 @@ class TCPServerInterface(Interface):
 
 
     def __str__(self):
-        if ":" in self.bind_ip:
-            ip_str = f"[{self.bind_ip}]"
-        else:
-            ip_str = f"{self.bind_ip}"
+        if ":" in self.bind_ip: ip_str = f"[{self.bind_ip}]"
+        else:                   ip_str = f"{self.bind_ip}"
 
         return "TCPServerInterface["+self.name+"/"+ip_str+":"+str(self.bind_port)+"]"
 

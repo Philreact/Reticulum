@@ -7,7 +7,7 @@
         <link rel="prefetch" href="_static/rns_logo_512.png" as="image">
 
     <!-- Generated with Sphinx 8.2.3 and Furo 2025.09.25.dev1 -->
-        <title>Using Reticulum on Your System - Reticulum Network Stack 1.4.2 documentation</title>
+        <title>Using Reticulum on Your System - Reticulum Network Stack 1.5.5 documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=d111a655" />
     <link rel="stylesheet" type="text/css" href="_static/styles/furo.css?v=580074bf" />
     <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
@@ -180,7 +180,7 @@
       </label>
     </div>
     <div class="header-center">
-      <a href="index.html"><div class="brand">Reticulum Network Stack 1.4.2 documentation</div></a>
+      <a href="index.html"><div class="brand">Reticulum Network Stack 1.5.5 documentation</div></a>
     </div>
     <div class="header-right">
       <div class="theme-toggle-container theme-toggle-header">
@@ -204,7 +204,7 @@
     <img class="sidebar-logo" src="_static/rns_logo_512.png" alt="Logo"/>
   </div>
   
-  <span class="sidebar-brand-text">Reticulum Network Stack 1.4.2 documentation</span>
+  <span class="sidebar-brand-text">Reticulum Network Stack 1.5.5 documentation</span>
   
 </a><form class="sidebar-search-container" method="get" action="search.html" role="search">
   <input class="sidebar-search" placeholder="Search" name="q" aria-label="Search">
@@ -227,6 +227,7 @@
 <li class="toctree-l1"><a class="reference internal" href="support.html">Support Reticulum</a></li>
 <li class="toctree-l1"><a class="reference internal" href="examples.html">Code Examples</a></li>
 <li class="toctree-l1"><a class="reference internal" href="license.html">Reticulum License</a></li>
+<li class="toctree-l1"><a class="reference internal" href="brandolinis.html">Brandolini’s Reference</a></li>
 </ul>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="reference.html">API Reference</a></li>
@@ -504,8 +505,7 @@ options:
 </section>
 <section id="the-rnstatus-utility">
 <h3>The rnstatus Utility<a class="headerlink" href="#the-rnstatus-utility" title="Link to this heading">¶</a></h3>
-<p>Using the <code class="docutils literal notranslate"><span class="pre">rnstatus</span></code> utility, you can view the status of configured Reticulum
-interfaces, similar to the <code class="docutils literal notranslate"><span class="pre">ifconfig</span></code> program.</p>
+<p>Using the <code class="docutils literal notranslate"><span class="pre">rnstatus</span></code> utility, you can view the status of and control configured Reticulum interfaces, similar to the <code class="docutils literal notranslate"><span class="pre">ifconfig</span></code> program.</p>
 <p><strong>Usage Examples</strong></p>
 <p>Run <code class="docutils literal notranslate"><span class="pre">rnstatus</span></code>:</p>
 <div class="highlight-text notranslate"><div class="highlight"><pre><span></span>$ rnstatus
@@ -558,8 +558,8 @@ Reticulum Transport Instance &lt;5245a8efe1788c6a1cd36144a270e13b&gt; running
 </pre></div>
 </div>
 <p><strong>All Command-Line Options</strong></p>
-<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>usage: rnstatus [-h] [--config CONFIG] [--version] [-a] [-A]
-                [-l] [-t] [-s SORT] [-r] [-j] [-R hash] [-i path]
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>usage: rnstatus [-h] [--config CONFIG] [--version] [-a] [-A] [-P] [-l]
+                [-B] [-b] [-t] [-q] [-s SORT] [-r] [-j] [-R hash] [-i path]
                 [-w seconds] [-d] [-D] [-m] [-I seconds] [-v] [filter]
 
 Reticulum Network Stack Status
@@ -571,12 +571,19 @@ options:
   -h, --help            show this help message and exit
   --config CONFIG       path to alternative Reticulum config directory
   --version             show program&#39;s version number and exit
+  --attach name         Attach interface by name
+  --detach name         Detach interface by name
+  --reload name         Reload interface by name
   -a, --all             show all interfaces
   -A, --announce-stats  show announce stats
+  -P, --pr-stats        show path request stats
   -l, --link-stats      show link stats
+  -B, --burst           only show interfaces with active bursts
+  -b, --blocked-ips     show blocked IPs per interface
   -t, --totals          display traffic totals
+  -q, --queues          display queue stats
   -s, --sort SORT       sort interfaces by [rate, traffic, rx, tx, rxs, txs,
-                                            announces, arx, atx, held]
+                        announces, arx, atx, prx, ptx, held]
   -r, --reverse         reverse sorting
   -j, --json            output in JSON format
   -R hash               transport identity hash of remote instance to get status from
@@ -584,6 +591,8 @@ options:
   -w seconds            timeout before giving up on remote queries
   -d, --discovered      list discovered interfaces
   -D                    show details and config entries for discovered interfaces
+  --show-stale          show stale discovery entries
+  --show-unknown        show discovery entries without version info
   -m, --monitor         continuously monitor status
   -I, --monitor-interval seconds
                         refresh interval for monitor mode (default: 1)
@@ -868,7 +877,7 @@ options:
 <p>The <code class="docutils literal notranslate"><span class="pre">rnx</span></code> utility is a basic remote command execution program. It allows you to
 execute commands on remote systems over Reticulum, and to view returned command
 output. For a fully interactive remote shell solution, be sure to also take a look
-at the <a class="reference external" href="https://github.com/acehoss/rnsh">rnsh</a> program.</p>
+at the <a class="reference internal" href="#using-rnsh"><span class="std std-ref">rnsh</span></a> program.</p>
 <p><strong>Usage Examples</strong></p>
 <p>Run rnx on the listening system, specifying which identities are allowed to execute commands:</p>
 <div class="highlight-text notranslate"><div class="highlight"><pre><span></span>$ rnx --listen -a 941bed5e228775e5a8079fc38b1ccf3f -a 1b03013c25f1c2ca068a4f080b844a10
@@ -923,7 +932,7 @@ optional arguments:
 </div>
 </section>
 <section id="the-rnsh-utility">
-<h3>The rnsh Utility<a class="headerlink" href="#the-rnsh-utility" title="Link to this heading">¶</a></h3>
+<span id="using-rnsh"></span><h3>The rnsh Utility<a class="headerlink" href="#the-rnsh-utility" title="Link to this heading">¶</a></h3>
 <p>The <code class="docutils literal notranslate"><span class="pre">rnsh</span></code> utility provides a fully interactive remote shell over Reticulum.
 It allows you to establish encrypted, authenticated shell sessions on remote
 systems, complete with terminal emulation, pipe support, and window resizing.</p>
@@ -1307,6 +1316,7 @@ network_identity = ~/.reticulum/storage/identities/my_network
 <ul class="simple">
 <li><p>The <code class="docutils literal notranslate"><span class="pre">autoconnect_interface_mode</span></code> options specifies which mode discovered interfaces should be created with when auto-connecting.</p></li>
 <li><p>The <code class="docutils literal notranslate"><span class="pre">autoconnect_announces_to_internal</span></code> option allows you to specify that auto-connected interfaces should propagate announces to <code class="docutils literal notranslate"><span class="pre">internal</span></code> mode interfaces, even if the auto-connected interface’s mode would normally not allow for this.</p></li>
+<li><p>The <code class="docutils literal notranslate"><span class="pre">autoconnect_unverified_implementations</span></code> option will allow the interface discovery system to auto-connect to <em>any</em> announced interface, even those coming from unverified, experimental or potentially broken implementations. Be very careful with this option.</p></li>
 </ul>
 </section>
 <section id="remote-management">
@@ -1640,7 +1650,7 @@ systemctl --user enable rnsd.service
       
     </aside>
   </div>
-</div><script src="_static/documentation_options.js?v=02f2166e"></script>
+</div><script src="_static/documentation_options.js?v=b8aeccfa"></script>
     <script src="_static/doctools.js?v=9bcbadda"></script>
     <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/scripts/furo.js?v=46bd48cc"></script>

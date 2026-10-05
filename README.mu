@@ -4,6 +4,8 @@ To understand the foundational philosophy and goals of this system, read the `_`
 
 Reticulum is the cryptography-based networking stack for building local and wide-area networks with readily available hardware. It can operate even with very high latency and extremely low bandwidth. Reticulum allows you to build wide-area networks with off-the-shelf tools, and offers end-to-end encryption and connectivity, initiator anonymity, autoconfiguring cryptographically backed multi-hop transport, efficient addressing, unforgeable delivery acknowledgements and more.
 
+`(RNS Logo`w=18`a=c`:/media/reticulum/reticulum/HEAD/docs/source/graphics/rns_logo_256.webp)
+
 The vision of Reticulum is to allow anyone to be their own network operator, and to make it cheap and easy to cover vast areas with a myriad of independent, inter-connectable and autonomous networks. Reticulum `!is not`! `*one`* network. It is `!a tool`! for building `*thousands of networks`*. Networks without kill-switches, surveillance, censorship and control. Networks that can freely interoperate, associate and disassociate with each other, and require no central oversight. Networks for human beings. `*Networks for the people`*.
 
 Reticulum is a complete networking stack, and does not rely on IP or higher layers, but it is possible to use IP as the underlying carrier for Reticulum. It is therefore trivial to tunnel Reticulum over the Internet or private IP networks.
@@ -170,9 +172,19 @@ Currently, the following built-in interfaces are supported:
 
 >> Performance
 
-Reticulum targets a `*very`* wide usable performance envelope, but prioritises functionality and performance on low-bandwidth mediums. The goal is to provide a dynamic performance envelope from 250 bits per second, to 1 gigabit per second on normal hardware.
+`*All performance numbers here assume `B333rnsd`b running in fully interpreted Python mode, limited to a single CPU core.`*
 
-Currently, the usable performance envelope is approximately 150 bits per second to 500 megabits per second, with physical mediums faster than that not being saturated. Performance beyond the current level is intended for future upgrades, but not highly prioritised at this point in time.
+Reticulum targets a `*very`* wide usable performance envelope, but prioritises functionality and performance on low-bandwidth mediums. The goal is to provide a dynamic performance envelope from 100 bits per second, to 10 gigabits per second on normal hardware.
+
+Currently, the on-network, usable performance envelope is approximately 150 bits per second to 1 gigabit per second on modest hardware. Real-world performance will vary widely with the speed of your system, availability of cryptographic hardware acceleration, and other factors.
+
+Raw routing throughput for a transport node hosted on a Raspberry Pi 5 is approximately 4 gigabits per second. Systems with modern crypto hardware acceleration can achieve transport throughput of 15 gigabits per second and higher.
+
+While the reference implementation is perfectly capable of reaching 100+ Gbps, by utilizing multiple CPU cores and vectorized transport, performance beyond the current level is not higly prioritised, since RNS is already able to saturate available physical medium bandwidth in almost all real-world situations.
+
+The primary objectives for RNS are `*reliability`*, `*correctness`*, `*security`*, `*proper traffic management`* and `*actually practical performance`*, not hollow on-paper "benchmarks" with little to no bearing on real-world usability.
+
+All alternative-implementation maintainers are `*highly`* encouraged to adopt a similar approach, and especially to focus on getting their implementations working properly before publishing empirically dubious or factually wrong performance claims.
 
 >> Current Status
 
@@ -256,7 +268,7 @@ Please note that by default, installing Reticulum will `!require`! OpenSSL and P
 
 If you want to use the internal pure-python primitives, it is `!highly advisable`! that you have a good understanding of the risks that this pose, and make an informed decision on whether those risks are acceptable to you.
 
-Reticulum is relatively young software, and should be considered as such. While it has been built with cryptography best-practices very foremost in mind, it _has not_ been externally security audited, and there could very well be privacy or security breaking bugs. If you want to help out, or help sponsor an audit, please do get in touch.
+Having been in development for ten, and wider deployment for around five years, Reticulum is relatively young software, and should be considered as such. While it has been carefully built with cryptography best-practices very foremost in mind, there could very well still be privacy or security breaking bugs.
 
 >> Acknowledgements & Credits
 

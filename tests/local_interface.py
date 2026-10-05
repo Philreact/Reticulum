@@ -5,13 +5,13 @@ import socket
 import threading
 import time
 import unittest
-from collections import deque
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from RNS.Interfaces.BackboneInterface import BackboneInterface
 from RNS.Interfaces.EventedSocketIO import EventedSocketIO
 from RNS.Interfaces.Interface import Interface
+from RNS.Interfaces.util.TransmitBuffer import TransmitBuffer
 from RNS.Interfaces.LocalInterface import LocalClientInterface, LocalServerInterface
 
 
@@ -256,7 +256,7 @@ class TestLocalInterfaceIo(unittest.TestCase):
 
         with patch.object(
             EventedSocketIO, "_modify_or_recover_fileno", return_value=True
-        ) as modify:
+        ) as modify, patch.object(EventedSocketIO, "spawned_interface_filenos", {fileno: interface}):
             self.assertTrue(EventedSocketIO._set_client_interest(fileno, interface))
 
         self.assertFalse(interface._evented_write_interest_armed)
@@ -347,45 +347,47 @@ class TestLocalInterfaceIo(unittest.TestCase):
 
     def test_transmit_queue_preserves_concurrent_appends(self):
         interface = LocalClientInterface.__new__(LocalClientInterface)
-        interface.transmit_buffer_chunks = deque()
-        interface.transmit_buffer_bytes = 0
-        interface.transmit_buffer_head_offset = 0
+        interface.transmit_buffer = TransmitBuffer()
         interface.transmit_buffer_lock = threading.Lock()
         interface.transmit_buffer_first_enqueued_at = 0.0
         interface.transmit_buffer_last_progress_at = time.monotonic()
+        sent = []
+
+        def send(data):
+            sent.append(bytes(data))
+            if len(sent) == 1:
+                interface.queue_transmit_data(b"second")
+            return len(data)
 
         interface.queue_transmit_data(b"first")
-        pending = interface.peek_transmit_buffer()
-        interface.queue_transmit_data(b"second")
-        interface.consume_transmit_buffer(len(pending))
-
-        self.assertEqual(interface.peek_transmit_buffer(), b"second")
-        self.assertTrue(interface.has_pending_transmit_data())
+        interface.transmit_buffer.drain_to(SimpleNamespace(send=send))
+        self.assertEqual(b"".join(sent), b"firstsecond")
+        self.assertFalse(interface.has_pending_transmit_data())
 
     def test_chunked_transmit_queue_preserves_partial_head(self):
         interface = LocalClientInterface.__new__(LocalClientInterface)
-        interface.transmit_buffer_chunks = deque()
-        interface.transmit_buffer_bytes = 0
-        interface.transmit_buffer_head_offset = 0
+        interface.transmit_buffer = TransmitBuffer()
         interface.transmit_buffer_lock = threading.Lock()
         interface.transmit_buffer_first_enqueued_at = 0.0
         interface.transmit_buffer_last_progress_at = time.monotonic()
+        sent = []
+
+        def send_partial(data):
+            sent.append(bytes(data[:2]))
+            return min(2, len(data))
 
         interface.queue_transmit_data(b"first")
         interface.queue_transmit_data(b"second")
-        interface.consume_transmit_buffer(2)
-        self.assertEqual(bytes(interface.peek_transmit_buffer()), b"rst")
+        self.assertEqual(interface.transmit_buffer.drain_to(SimpleNamespace(send=send_partial)), 2)
         self.assertEqual(interface.transmit_buffer_len(), 9)
-
-        interface.consume_transmit_buffer(3)
-        self.assertEqual(bytes(interface.peek_transmit_buffer()), b"second")
-        self.assertEqual(interface.transmit_buffer_len(), 6)
+        interface.transmit_buffer.drain_to(SimpleNamespace(send=lambda data: sent.append(bytes(data)) or len(data)))
+        self.assertEqual(b"".join(sent), b"firstsecond")
+        self.assertEqual(interface.transmit_buffer_len(), 0)
 
     def test_transmit_stall_requires_queued_data_without_progress(self):
         interface = LocalClientInterface.__new__(LocalClientInterface)
-        interface.transmit_buffer_chunks = deque([b"queued"])
-        interface.transmit_buffer_bytes = len(b"queued")
-        interface.transmit_buffer_head_offset = 0
+        interface.transmit_buffer = TransmitBuffer()
+        interface.transmit_buffer.append(b"queued")
         interface.transmit_buffer_lock = threading.Lock()
         interface.transmit_buffer_first_enqueued_at = time.monotonic() - 12.0
         interface.transmit_buffer_last_progress_at = time.monotonic() - 12.0

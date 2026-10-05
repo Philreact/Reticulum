@@ -256,8 +256,7 @@ You can easily add `rnsd` as an always-on service by [configuring a service](#us
 
 ### The rnstatus Utility
 
-Using the `rnstatus` utility, you can view the status of configured Reticulum
-interfaces, similar to the `ifconfig` program.
+Using the `rnstatus` utility, you can view the status of and control configured Reticulum interfaces, similar to the `ifconfig` program.
 
 **Usage Examples**
 
@@ -318,8 +317,8 @@ Reticulum Transport Instance <5245a8efe1788c6a1cd36144a270e13b> running
 **All Command-Line Options**
 
 ```text
-usage: rnstatus [-h] [--config CONFIG] [--version] [-a] [-A]
-                [-l] [-t] [-s SORT] [-r] [-j] [-R hash] [-i path]
+usage: rnstatus [-h] [--config CONFIG] [--version] [-a] [-A] [-P] [-l]
+                [-B] [-b] [-t] [-q] [-s SORT] [-r] [-j] [-R hash] [-i path]
                 [-w seconds] [-d] [-D] [-m] [-I seconds] [-v] [filter]
 
 Reticulum Network Stack Status
@@ -331,12 +330,19 @@ options:
   -h, --help            show this help message and exit
   --config CONFIG       path to alternative Reticulum config directory
   --version             show program's version number and exit
+  --attach name         Attach interface by name
+  --detach name         Detach interface by name
+  --reload name         Reload interface by name
   -a, --all             show all interfaces
   -A, --announce-stats  show announce stats
+  -P, --pr-stats        show path request stats
   -l, --link-stats      show link stats
+  -B, --burst           only show interfaces with active bursts
+  -b, --blocked-ips     show blocked IPs per interface
   -t, --totals          display traffic totals
+  -q, --queues          display queue stats
   -s, --sort SORT       sort interfaces by [rate, traffic, rx, tx, rxs, txs,
-                                            announces, arx, atx, held]
+                        announces, arx, atx, prx, ptx, held]
   -r, --reverse         reverse sorting
   -j, --json            output in JSON format
   -R hash               transport identity hash of remote instance to get status from
@@ -344,6 +350,8 @@ options:
   -w seconds            timeout before giving up on remote queries
   -d, --discovered      list discovered interfaces
   -D                    show details and config entries for discovered interfaces
+  --show-stale          show stale discovery entries
+  --show-unknown        show discovery entries without version info
   -m, --monitor         continuously monitor status
   -I, --monitor-interval seconds
                         refresh interval for monitor mode (default: 1)
@@ -670,7 +678,7 @@ For the full documentation on the rngit system, see the [Git Over Reticulum](git
 The `rnx` utility is a basic remote command execution program. It allows you to
 execute commands on remote systems over Reticulum, and to view returned command
 output. For a fully interactive remote shell solution, be sure to also take a look
-at the [rnsh](https://github.com/acehoss/rnsh) program.
+at the [rnsh](#using-rnsh) program.
 
 **Usage Examples**
 
@@ -1179,6 +1187,7 @@ For more fine-grained control over how discovered interfaces are auto-connected,
 
 * The `autoconnect_interface_mode` options specifies which mode discovered interfaces should be created with when auto-connecting.
 * The `autoconnect_announces_to_internal` option allows you to specify that auto-connected interfaces should propagate announces to `internal` mode interfaces, even if the auto-connected interface’s mode would normally not allow for this.
+* The `autoconnect_unverified_implementations` option will allow the interface discovery system to auto-connect to *any* announced interface, even those coming from unverified, experimental or potentially broken implementations. Be very careful with this option.
 
 ## Remote Management
 

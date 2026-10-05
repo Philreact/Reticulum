@@ -58,6 +58,25 @@ QORTAL_RNS_LOCAL_IO_STATS = os.environ.get("QORTAL_RNS_LOCAL_IO_STATS", "0") == 
 QORTAL_RNS_LOCAL_IO_BACKEND = os.environ.get("QORTAL_RNS_LOCAL_IO_BACKEND", "auto").strip().lower()
 
 
+class _BudgetedSocket:
+    """Bound an upstream TransmitBuffer drain without copying its chunks."""
+    def __init__(self, socket, maximum_bytes, deadline):
+        self.socket = socket
+        self.maximum_bytes = maximum_bytes
+        self.deadline = deadline
+        self.written = 0
+
+    def send(self, data):
+        remaining = self.maximum_bytes - self.written
+        if remaining <= 0 or time.monotonic() >= self.deadline:
+            raise BlockingIOError()
+        written = self.socket.send(data[:remaining])
+        if written <= 0:
+            raise OSError(errno.EPIPE, "Socket made no transmit progress")
+        self.written += written
+        return written
+
+
 class EventedSocketIO:
     epoll = None
     selector = None
@@ -433,7 +452,7 @@ class EventedSocketIO:
                 # Keep normal transmit retries enabled until success is known.
                 interface._evented_write_interest_armed = False
                 try:
-                    recovered = EventedSocketIO._modify_or_recover_fileno(fileno, EventedSocketIO._read_write_mask(), interface)
+                    recovered = EventedSocketIO._modify_or_recover_fileno(fileno, EventedSocketIO._client_mask(interface, writing=True), interface)
                     if recovered:
                         interface._evented_write_interest_armed = True
                     EventedSocketIO.wake()
@@ -444,25 +463,70 @@ class EventedSocketIO:
                     EventedSocketIO.wake()
 
     @staticmethod
+    def _client_mask(interface, writing=False):
+        mask = 0 if getattr(interface, "dp_ingress_gated", False) else EventedSocketIO._read_mask()
+        if writing:
+            mask |= EventedSocketIO._write_mask()
+        if mask == 0 and EventedSocketIO.event_backend == "epoll":
+            mask = EventedSocketIO._hup_mask()
+        return mask
+
+    @staticmethod
+    def _update_client_interest(fileno, mask, interface):
+        if mask == 0:
+            # Portable selectors reject zero-event registrations. Keep the
+            # socket's owner mapped while ingress control suspends polling.
+            try:
+                EventedSocketIO._unregister_fileno(fileno)
+            except Exception as error:
+                if not EventedSocketIO._fileno_not_registered_error(error):
+                    raise
+            return True
+        return EventedSocketIO._modify_or_recover_fileno(fileno, mask, interface)
+
+    @staticmethod
     def _set_client_interest(fileno, interface):
         with EventedSocketIO._selector_lock:
-            if EventedSocketIO._pending_length(interface) > 0:
-                mask = EventedSocketIO._read_write_mask()
-            else:
-                mask = EventedSocketIO._read_mask()
-
-            # Invalidate before modifying: some selectors unregister first,
-            # so an exception does not guarantee the old interest survived.
+            if (EventedSocketIO.spawned_interface_filenos.get(fileno) is not interface
+                or interface.socket is None or interface.socket.fileno() != fileno):
+                interface._evented_write_interest_armed = False
+                return False
+            writing = EventedSocketIO._pending_length(interface) > 0
+            mask = EventedSocketIO._client_mask(interface, writing)
+            # Some selectors unregister before modifying. Preserve retryability
+            # if the transition fails after removing the old registration.
             interface._evented_write_interest_armed = False
-            updated = EventedSocketIO._modify_or_recover_fileno(fileno, mask, interface)
-            interface._evented_write_interest_armed = bool(
-                updated and mask == EventedSocketIO._read_write_mask()
-            )
-            # Do not let a producer's write-ready update get overwritten by a
-            # concurrent transition back to read-only interest.
-            if updated and mask == EventedSocketIO._read_mask() and EventedSocketIO._pending_length(interface) > 0:
-                updated = EventedSocketIO._modify_or_recover_fileno(fileno, EventedSocketIO._read_write_mask(), interface)
+            updated = EventedSocketIO._update_client_interest(fileno, mask, interface)
+            interface._evented_write_interest_armed = bool(updated and writing)
+            # Producers may append without the selector lock, so check again
+            # before leaving a transition that disabled write interest.
+            if updated and not writing and EventedSocketIO._pending_length(interface) > 0:
+                updated = EventedSocketIO._update_client_interest(
+                    fileno, EventedSocketIO._client_mask(interface, writing=True), interface
+                )
                 interface._evented_write_interest_armed = bool(updated)
+            return updated
+
+    @staticmethod
+    def set_ingress_gated(interface, gated):
+        with EventedSocketIO._selector_lock:
+            client_socket = interface.socket
+            if client_socket is None:
+                return False
+            fileno = client_socket.fileno()
+            if EventedSocketIO.spawned_interface_filenos.get(fileno) is not interface:
+                return False
+            previous = interface.dp_ingress_gated
+            interface.dp_ingress_gated = gated
+            try:
+                updated = EventedSocketIO._set_client_interest(fileno, interface)
+            except Exception:
+                interface.dp_ingress_gated = previous
+                EventedSocketIO.wake()
+                raise
+            if not updated:
+                interface.dp_ingress_gated = previous
+            EventedSocketIO.wake()
             return updated
 
     @staticmethod
@@ -570,6 +634,8 @@ class EventedSocketIO:
 
         EventedSocketIO._note_stat("read_events")
         while read_total < QORTAL_RNS_EVENTED_IO_READ_BUDGET_BYTES:
+            if getattr(spawned_interface, "dp_ingress_gated", False):
+                break
             read_size = min(spawned_interface.HW_MTU, QORTAL_RNS_EVENTED_IO_READ_BUDGET_BYTES - read_total)
             try:
                 received_bytes = client_socket.recv(read_size)
@@ -587,6 +653,8 @@ class EventedSocketIO:
                 break
 
             read_total += len(received_bytes)
+            if hasattr(spawned_interface, "dp_ingress_bytes"):
+                spawned_interface.dp_ingress_bytes += len(received_bytes)
             spawned_interface.receive(received_bytes)
             if time.monotonic() - read_started >= QORTAL_RNS_EVENTED_IO_READ_BUDGET_SECONDS:
                 break
@@ -606,32 +674,52 @@ class EventedSocketIO:
         closed = False
 
         EventedSocketIO._note_stat("write_events")
-        while EventedSocketIO._pending_length(spawned_interface) > 0 and written_total < QORTAL_RNS_EVENTED_IO_WRITE_BUDGET_BYTES:
-            remaining_budget = QORTAL_RNS_EVENTED_IO_WRITE_BUDGET_BYTES - written_total
-            chunk = EventedSocketIO._peek_transmit(spawned_interface, remaining_budget)
+        transmit_buffer = spawned_interface.transmit_buffer
+        if hasattr(transmit_buffer, "drain_to"):
+            budgeted_socket = _BudgetedSocket(
+                client_socket, QORTAL_RNS_EVENTED_IO_WRITE_BUDGET_BYTES,
+                write_started + QORTAL_RNS_EVENTED_IO_WRITE_BUDGET_SECONDS,
+            )
             try:
-                written = client_socket.send(chunk)
-            except (BlockingIOError, InterruptedError):
-                break
+                transmit_buffer.drain_to(budgeted_socket)
             except Exception as e:
                 if not spawned_interface.detached:
                     RNS.log(f"Error while writing to {spawned_interface}: {e}", RNS.LOG_DEBUG)
                 EventedSocketIO._close_client_socket(fileno, spawned_interface, client_socket, error=True)
                 closed = True
-                break
-
-            if written <= 0:
-                EventedSocketIO._close_client_socket(fileno, spawned_interface, client_socket, error=True)
-                closed = True
-                break
-
-            written_total += written
-            EventedSocketIO._consume_transmit(spawned_interface, written)
-            spawned_interface.txb += written
+            written_total = budgeted_socket.written
+            spawned_interface.txb += written_total
             if spawned_interface.parent_interface:
-                spawned_interface.parent_interface.txb += written
-            if time.monotonic() - write_started >= QORTAL_RNS_EVENTED_IO_WRITE_BUDGET_SECONDS:
-                break
+                spawned_interface.parent_interface.txb += written_total
+            if written_total and hasattr(spawned_interface, "note_transmit_progress"):
+                spawned_interface.note_transmit_progress()
+        else:
+            while EventedSocketIO._pending_length(spawned_interface) > 0 and written_total < QORTAL_RNS_EVENTED_IO_WRITE_BUDGET_BYTES:
+                remaining_budget = QORTAL_RNS_EVENTED_IO_WRITE_BUDGET_BYTES - written_total
+                chunk = EventedSocketIO._peek_transmit(spawned_interface, remaining_budget)
+                try:
+                    written = client_socket.send(chunk)
+                except (BlockingIOError, InterruptedError):
+                    break
+                except Exception as e:
+                    if not spawned_interface.detached:
+                        RNS.log(f"Error while writing to {spawned_interface}: {e}", RNS.LOG_DEBUG)
+                    EventedSocketIO._close_client_socket(fileno, spawned_interface, client_socket, error=True)
+                    closed = True
+                    break
+
+                if written <= 0:
+                    EventedSocketIO._close_client_socket(fileno, spawned_interface, client_socket, error=True)
+                    closed = True
+                    break
+
+                written_total += written
+                EventedSocketIO._consume_transmit(spawned_interface, written)
+                spawned_interface.txb += written
+                if spawned_interface.parent_interface:
+                    spawned_interface.parent_interface.txb += written
+                if time.monotonic() - write_started >= QORTAL_RNS_EVENTED_IO_WRITE_BUDGET_SECONDS:
+                    break
 
         if written_total > 0:
             EventedSocketIO._note_stat("write_bytes", written_total)
@@ -710,6 +798,8 @@ class EventedSocketIO:
                 try:
                     client_socket, address = server_socket.accept()
                     client_socket.setblocking(False)
+                    if hasattr(owner_interface, "DP_IC_RCVBUF"):
+                        client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, owner_interface.DP_IC_RCVBUF)
                     if not owner_interface.incoming_connection(client_socket):
                         client_socket.close()
                 except (BlockingIOError, InterruptedError):

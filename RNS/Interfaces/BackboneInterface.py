@@ -30,28 +30,21 @@
 
 from RNS.Interfaces.Interface import Interface
 from RNS.Interfaces.EventedSocketIO import EventedSocketIO
-from collections import deque
+from RNS.Interfaces.util.TransmitBuffer import TransmitBuffer
+from RNS.Interfaces.util.HDLC import HDLC, ReceiveBuffer
 import threading
 import socket
+import select
 import time
+import sys
+import os
 import RNS
 
-class HDLC():
-    FLAG              = 0x7E
-    ESC               = 0x7D
-    ESC_MASK          = 0x20
-
-    @staticmethod
-    def escape(data):
-        data = data.replace(bytes([HDLC.ESC]), bytes([HDLC.ESC, HDLC.ESC^HDLC.ESC_MASK]))
-        data = data.replace(bytes([HDLC.FLAG]), bytes([HDLC.ESC, HDLC.FLAG^HDLC.ESC_MASK]))
-        return data
-
 class BackboneInterface(Interface):
-    HW_MTU            = 1048576
-    BITRATE_GUESS     = 1_000_000_000
-    DEFAULT_IFAC_SIZE = 16
-    AUTOCONFIGURE_MTU = True
+    HW_MTU              = 1048576
+    BITRATE_GUESS       = 100_000_000
+    DEFAULT_IFAC_SIZE   = 16
+    AUTOCONFIGURE_MTU   = True
 
     BLOCK_FAST_FLAPPING = True
     FAST_FLAP_THRESHOLD = 20
@@ -59,6 +52,35 @@ class BackboneInterface(Interface):
     FAST_FLAP_EXPIRY    = 12*60*60
     fast_flapping_lock  = threading.Lock()
     fast_flapping       = {}
+
+    DP_IC_HIGH_WM_PCT   = 90
+    DP_IC_MID_WM_PCT    = 68
+    DP_IC_LOW_WM_PCT    = 10
+    DP_IC_INTERVAL      = 0.250
+    DP_IC_TRIGGER       = 1.5
+    DP_IC_RCVBUF        = 32768
+    DP_IC_IF_HEADROOM   = 32
+    DP_IC_PENALTY       = 1.5
+    DP_EC_INTERVAL      = 1.0
+    DP_EC_MID_WM        = 128*1024
+    DP_EC_HIGH_WM       = 4*1024*1024
+    DP_EC_STALL_TICKS   = 3
+    DP_EC_MAX_ETA       = 10.0
+    DP_EC_RELEASE_ETA   = 5.0 # Gate release hysterisis
+    DP_EC_DEAD_TIME     = 12.0
+
+    epoll = None
+    listener_filenos = EventedSocketIO.listener_filenos
+    spawned_interface_filenos = EventedSocketIO.spawned_interface_filenos
+
+    _job_active     = False
+    _ic_job_active  = False
+    _ec_job_active  = False
+    _job_lock       = threading.Lock()
+    _ec_job_lock    = threading.Lock()
+    _ic_job_lock    = threading.Lock()
+    _dp_ic_lock     = threading.Lock()
+    _dp_ic_snapshot = 0
 
     @staticmethod
     def get_address_for_if(name, bind_port, prefer_ipv6=False):
@@ -161,13 +183,34 @@ class BackboneInterface(Interface):
         else:
             raise SystemError("Insufficient parameters to create listener")
 
+    __ic_burst_stats_throttle = 0.95
+    __last_ic_burst_count_check = 0
+    __last_ic_burst_count_state = 0
+    @property
+    def ic_burst_count(self):
+        if time.time() > self.__last_ic_burst_count_check + self.__ic_burst_stats_throttle:
+            self.__last_ic_burst_count_state = len([i.ic_burst_active for i in self.spawned_interfaces if i.ic_burst_active])
+            self.__last_ic_burst_count_check = time.time()
+
+        return self.__last_ic_burst_count_state
+
+    __last_ic_pr_burst_count_check = 0
+    __last_ic_pr_burst_count_state = 0
+    @property
+    def ic_pr_burst_count(self):
+        if time.time() > self.__last_ic_pr_burst_count_check + self.__ic_burst_stats_throttle:
+            self.__last_ic_pr_burst_count_state = len([i.ic_pr_burst_active for i in self.spawned_interfaces if i.ic_pr_burst_active])
+            self.__last_ic_pr_burst_count_check = time.time()
+
+        return self.__last_ic_pr_burst_count_state
 
     __last_ic_burst_check = 0
     __last_ic_burst_state = False
     @property
     def ic_burst_active(self):
-        if time.time() > self.__last_ic_burst_check + 2:
+        if time.time() > self.__last_ic_burst_check + self.__ic_burst_stats_throttle:
             self.__last_ic_burst_state = any(i.ic_burst_active for i in self.spawned_interfaces)
+            self.__last_ic_burst_check = time.time()
 
         return self.__last_ic_burst_state
 
@@ -178,9 +221,10 @@ class BackboneInterface(Interface):
     __ic_burst_activated       = 0
     @property
     def ic_burst_activated(self):
-        if time.time() > self.__ic_burst_activated_check + 2:
+        if time.time() > self.__ic_burst_activated_check + self.__ic_burst_stats_throttle:
             activated = [i.ic_burst_activated for i in self.spawned_interfaces if i.ic_burst_active]
             if activated: self.__ic_burst_activated = min(activated)
+            self.__ic_burst_activated_check = time.time()
 
         return self.__ic_burst_activated
 
@@ -192,8 +236,9 @@ class BackboneInterface(Interface):
     __last_ic_pr_burst_state = False
     @property
     def ic_pr_burst_active(self):
-        if time.time() > self.__last_ic_pr_burst_check + 2:
+        if time.time() > self.__last_ic_pr_burst_check + self.__ic_burst_stats_throttle:
             self.__last_ic_pr_burst_state = any(i.ic_pr_burst_active for i in self.spawned_interfaces)
+            self.__last_ic_pr_burst_check = time.time()
 
         return self.__last_ic_pr_burst_state
 
@@ -204,9 +249,10 @@ class BackboneInterface(Interface):
     __ic_pr_burst_activated       = 0
     @property
     def ic_pr_burst_activated(self):
-        if time.time() > self.__ic_pr_burst_activated_check + 2:
+        if time.time() > self.__ic_pr_burst_activated_check + self.__ic_burst_stats_throttle:
             activated = [i.ic_pr_burst_activated for i in self.spawned_interfaces if i.ic_pr_burst_active]
             if activated: self.__ic_pr_burst_activated = min(activated)
+            self.__ic_pr_burst_activated_check = time.time()
 
         return self.__ic_pr_burst_activated
 
@@ -216,6 +262,8 @@ class BackboneInterface(Interface):
     @staticmethod
     def start():
         EventedSocketIO.start()
+        if not BackboneInterface._ic_job_active: threading.Thread(target=BackboneInterface.__dp_ic_job, daemon=True).start()
+        if not BackboneInterface._ec_job_active: threading.Thread(target=BackboneInterface.__dp_ec_job, daemon=True).start()
 
     @staticmethod
     def ensure_epoll():
@@ -224,10 +272,12 @@ class BackboneInterface(Interface):
     @staticmethod
     def add_listener(interface, bind_address, socket_type=socket.AF_INET):
         EventedSocketIO.add_listener(interface, bind_address, socket_type=socket_type)
+        BackboneInterface.start()
 
     @staticmethod
     def add_client_socket(client_socket, interface):
         EventedSocketIO.add_client_socket(client_socket, interface)
+        BackboneInterface.start()
 
     @staticmethod
     def register_in(fileno):
@@ -244,6 +294,201 @@ class BackboneInterface(Interface):
     @staticmethod
     def tx_ready(interface):
         EventedSocketIO.tx_ready(interface)
+
+    @staticmethod
+    def __throttle_ingress(interface, hold=None):
+        if interface.dp_ingress_gated: return False
+        try:
+            if EventedSocketIO.set_ingress_gated(interface, True):
+                interface.dp_ingress_tcount += 1
+                if hold: interface.dp_ingress_hold = time.time() + hold
+                RNS.log(f"Ingress throttled on {interface}", RNS.LOG_NOTICE) if RNS.sl(RNS.LOG_NOTICE) else None
+                return True
+        except Exception as e: RNS.log(f"Error throttling {interface}: {e}", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+        return False
+
+    @staticmethod
+    def __release_ingress(interface):
+        if not interface.dp_ingress_gated: return False
+        try:
+            if EventedSocketIO.set_ingress_gated(interface, False):
+                RNS.log(f"Released ingress throttle on {interface}", RNS.LOG_NOTICE) if RNS.sl(RNS.LOG_NOTICE) else None
+                return True
+        except Exception as e: RNS.log(f"Error releasing throttle on {interface}: {e}", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+        return False
+
+    @staticmethod
+    def _throttle_immediate(q_depth):
+        with BackboneInterface._dp_ic_lock:
+            st = time.time()
+            with EventedSocketIO._selector_lock:
+                interfaces = list(BackboneInterface.spawned_interface_filenos.values())
+            producers = [iface for iface in interfaces if iface.dp_ingress_packets > 0 and not isinstance(iface, RNS.Interfaces.LocalInterface.LocalClientInterface)]
+
+            if producers:
+                producers.sort(key=lambda p: p.dp_ingress_packets, reverse=True)
+                selected = producers[0]
+
+                now   = time.time()
+                span  = max(now - BackboneInterface._dp_ic_snapshot, 0.001)
+                total = sum(iface.dp_ingress_packets for iface in producers)
+                avail = sum(iface.dp_ingress_bytes for iface in interfaces) / span
+                share = selected.dp_ingress_packets / total
+                rate  = selected.dp_ingress_packets / span
+                speed = selected.dp_ingress_bytes   / span
+                data  = selected.dp_ingress_bytes
+                pkts  = selected.dp_ingress_packets
+                alloc = 1/((max(len(interfaces), BackboneInterface.DP_IC_IF_HEADROOM))*BackboneInterface.DP_IC_PENALTY)
+                hold = (avail/max(avail*alloc, 1))*span
+
+                if BackboneInterface.__throttle_ingress(selected, hold=hold):
+                    taken = time.time()-st
+                    if RNS.sl(RNS.LOG_DEBUG):
+                        RNS.log(f"Throttled producer with {pkts} packets at {RNS.prettysize(rate, suffix='pps')} / {RNS.prettyspeed(speed*8)}, {round(share*100.0, 2)}% ingress share", RNS.LOG_DEBUG)
+                        RNS.log(f"Available ingress budget {RNS.prettyspeed(avail*8)}, hard-allocated {round(alloc*100.0, 2)}% ({RNS.prettyspeed(avail*alloc*8)}), handled in {RNS.prettyshorttime(taken, compact=True, tight=True)}", RNS.LOG_DEBUG)
+                        RNS.log(f"Holding for {RNS.prettyshorttime(hold, compact=True, tight=True)}, throttling handled in {RNS.prettyshorttime(taken, compact=True, tight=True)} at depth {q_depth}", RNS.LOG_DEBUG)
+
+    @staticmethod
+    def _dp_ec_evaluate(interface, now):
+        tb = interface.transmit_buffer
+        drained = tb._tx_sent - interface._dp_ec_prev_sent
+        interface._dp_ec_prev_sent = tb._tx_sent
+
+        sendable = tb.sendable
+        buffered = len(tb)
+
+        if buffered == 0 or sendable == 0:
+            interface._dp_ec_zero_ticks = 0
+            interface._dp_ec_last_drain = now
+            interface.tx_stalled = False
+            return False
+
+        if now - interface._dp_ec_last_drain >= BackboneInterface.DP_EC_DEAD_TIME:
+            RNS.log(f"No egress control drain progress for {RNS.prettyshorttime(BackboneInterface.DP_EC_DEAD_TIME, compact=True)} on {interface}, tearing down", RNS.LOG_NOTICE)
+            try:
+                if interface.socket:
+                    EventedSocketIO._close_client_socket(interface.socket.fileno(), interface, interface.socket, error=True)
+            except Exception as e: RNS.log(f"Egress control cleanup error for {interface}: {e}", RNS.LOG_ERROR)
+
+            return True
+
+        if drained > 0:
+            interface._dp_ec_last_drain = now
+            interface._dp_ec_zero_ticks = 0
+            drain_rate = drained / BackboneInterface.DP_EC_INTERVAL
+            clear_eta  = buffered / drain_rate if drain_rate > 0 else float("inf")
+
+            if buffered > BackboneInterface.DP_EC_MID_WM and clear_eta > BackboneInterface.DP_EC_MAX_ETA:
+                if not interface.tx_stalled: RNS.log(f"Egress control drain ETA of {RNS.prettyshorttime(clear_eta, compact=True)} exceeds maximum on {interface}, gating outbound", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+                interface.tx_stalled = True
+
+            elif clear_eta < BackboneInterface.DP_EC_RELEASE_ETA or buffered <= BackboneInterface.DP_EC_MID_WM:
+                if interface.tx_stalled: RNS.log(f"Egress control drain recovered on {interface}, resuming outbound", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+                interface.tx_stalled = False
+
+        else:
+            # No drain progress on this tick
+            if buffered > BackboneInterface.DP_EC_MID_WM:
+                interface._dp_ec_zero_ticks += 1
+                if interface._dp_ec_zero_ticks >= BackboneInterface.DP_EC_STALL_TICKS:
+                    if not interface.tx_stalled: RNS.log(f"No egress control drain progress on {interface}, gating outbound", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+                    interface.tx_stalled = True
+            else:
+                interface._dp_ec_zero_ticks = 0
+                interface.tx_stalled = False
+
+        return False
+
+    @staticmethod
+    def __dp_ec_job():
+        with BackboneInterface._ec_job_lock:
+            if BackboneInterface._ec_job_active: return
+            else:
+                BackboneInterface._ec_job_active = True
+                RNS.log(f"Started dataplane egress control", RNS.LOG_DEBUG)
+                try:
+                    while True:
+                        time.sleep(BackboneInterface.DP_EC_INTERVAL)
+                        now = time.time()
+                        try:
+                            with EventedSocketIO._selector_lock:
+                                interfaces = list(BackboneInterface.spawned_interface_filenos.values())
+                        except RuntimeError as e:
+                            RNS.log(f"Deferring egress control evaluation due to error: {e}", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+                            continue
+
+                        for interface in interfaces:
+                            if interface.detached: continue
+                            if isinstance(interface, RNS.Interfaces.LocalInterface.LocalClientInterface): continue
+                            BackboneInterface._dp_ec_evaluate(interface, now)
+
+                except Exception as e:
+                    RNS.log(f"BackboneInterface egress control error: {e}", RNS.LOG_ERROR)
+                    RNS.trace_exception(e)
+
+    @staticmethod
+    def __dp_ic_job():
+        with BackboneInterface._ic_job_lock:
+            if BackboneInterface._ic_job_active: return
+            else:
+                BackboneInterface._ic_job_active = True
+                RNS.log(f"Started dataplane ingress control: High/mid/low water marks are {BackboneInterface.DP_IC_HIGH_WM}/{BackboneInterface.DP_IC_MID_WM}/{BackboneInterface.DP_IC_LOW_WM} packets", RNS.LOG_DEBUG)
+                try:
+                    while True:
+                        time.sleep(BackboneInterface.DP_IC_INTERVAL)
+                        try:
+                            if RNS.Transport.inbound_queues != None: q_depth = RNS.Transport.inbound_queues.qsize(RNS.Transport.TC_DATA)
+                            else: continue
+                        except Exception: continue
+
+                        with BackboneInterface._dp_ic_lock:
+                            st = time.time()
+                            with EventedSocketIO._selector_lock:
+                                interfaces = list(BackboneInterface.spawned_interface_filenos.values())
+
+                            if q_depth > BackboneInterface.DP_IC_MID_WM:
+                                producers = [iface for iface in interfaces if iface.dp_ingress_packets > 0 and not isinstance(iface, RNS.Interfaces.LocalInterface.LocalClientInterface)]
+                                if producers:
+                                    producers.sort(key=lambda p: p.dp_ingress_packets, reverse=True)
+                                    selected = producers[0]
+
+                                    now   = time.time()
+                                    span  = max(now - BackboneInterface._dp_ic_snapshot, 0.001)
+                                    total = sum(iface.dp_ingress_packets for iface in producers)
+                                    avail = sum(iface.dp_ingress_bytes for iface in interfaces) / span
+                                    mean  = total / max(len(producers), 2)
+                                    share = selected.dp_ingress_packets / total
+                                    rate  = selected.dp_ingress_packets / span
+                                    speed = selected.dp_ingress_bytes   / span
+                                    data  = selected.dp_ingress_bytes
+                                    pkts  = selected.dp_ingress_packets
+                                    alloc = 1/((max(len(interfaces), BackboneInterface.DP_IC_IF_HEADROOM))*BackboneInterface.DP_IC_PENALTY)
+                                    hold = (avail/max(avail*alloc, 1))*span
+
+                                    if BackboneInterface.__throttle_ingress(selected, hold=hold):
+                                        taken = time.time()-st
+                                        if RNS.sl(RNS.LOG_DEBUG):
+                                            RNS.log(f"Throttled producer with {pkts} packets at {RNS.prettysize(rate, suffix='pps')} / {RNS.prettyspeed(speed*8)}, {round(share*100.0, 2)}% ingress share", RNS.LOG_DEBUG)
+                                            RNS.log(f"Available ingress budget {RNS.prettyspeed(avail*8)}, hard-allocated {round(alloc*100.0, 2)}% ({RNS.prettyspeed(avail*alloc*8)}), handled in {RNS.prettyshorttime(taken, compact=True, tight=True)}", RNS.LOG_DEBUG)
+                                            RNS.log(f"Holding for {RNS.prettyshorttime(hold, compact=True, tight=True)}, throttling handled in {RNS.prettyshorttime(taken, compact=True, tight=True)}", RNS.LOG_DEBUG)
+
+                            elif q_depth < BackboneInterface.DP_IC_LOW_WM:
+                                now = time.time()
+                                for iface in interfaces:
+                                    if iface.dp_ingress_gated:
+                                        if iface.dp_ingress_hold and now < iface.dp_ingress_hold: continue
+                                        BackboneInterface.__release_ingress(iface)
+                                        break
+
+                            BackboneInterface._dp_ic_snapshot = time.time()
+                            for iface in interfaces:
+                                iface.dp_ingress_bytes   = 0
+                                iface.dp_ingress_packets = 0
+
+                except Exception as e:
+                    RNS.log(f"BackboneInterface ingress control error: {e}", RNS.LOG_ERROR)
+                    RNS.trace_exception(e)
+
     def incoming_connection(self, socket):
         try:
             remote_ip = socket.getpeername()[0]
@@ -306,6 +551,10 @@ class BackboneInterface(Interface):
             spawned_interface.announce_rate_penalty = self.announce_rate_penalty
             spawned_interface.mode = self.mode
             spawned_interface.gravity = self.gravity
+            spawned_interface.recursive_prs = self.recursive_prs
+            spawned_interface.announces_from_internal = self.announces_from_internal
+            spawned_interface.announces_to_internal = self.announces_to_internal
+            spawned_interface.announce_cap = self.announce_cap
             spawned_interface.HW_MTU = self.HW_MTU
             RNS.log("Spawned new BackboneClient Interface: "+str(spawned_interface), RNS.LOG_PATHING) if RNS.sl(RNS.LOG_PATHING) else None
             RNS.Transport.add_interface(spawned_interface)
@@ -321,17 +570,25 @@ class BackboneInterface(Interface):
 
         return True
 
-    def received_announce(self, from_spawned=False):
-        if from_spawned: self.ia_freq_deque.append(time.time())
+    def received_announce(self, size=0, from_spawned=False):
+        if from_spawned:
+            self.ia_freq_deque.append(time.time())
+            self.arxb += size
 
-    def sent_announce(self, from_spawned=False):
-        if from_spawned: self.oa_freq_deque.append(time.time())
+    def sent_announce(self, size=0, from_spawned=False):
+        if from_spawned:
+            self.oa_freq_deque.append(time.time())
+            self.atxb += size
 
-    def received_path_request(self, from_spawned=False):
-        if from_spawned: self.ip_freq_deque.append(time.time())
+    def received_path_request(self, size=0, from_spawned=False):
+        if from_spawned:
+            self.ip_freq_deque.append(time.time())
+            self.prxb += size
 
-    def sent_path_request(self, from_spawned=False):
-        if from_spawned: self.op_freq_deque.append(time.time())
+    def sent_path_request(self, size=0, from_spawned=False):
+        if from_spawned:
+            self.op_freq_deque.append(time.time())
+            self.ptxb += size
 
     def process_outgoing(self, data):
         pass
@@ -339,12 +596,22 @@ class BackboneInterface(Interface):
     def detach(self):
         self.detached = True
         self.online = False
-        EventedSocketIO.detach_listener_interface(self)
+        detached = []
+        for fileno in BackboneInterface.listener_filenos:
+            owner_interface, listener_socket = BackboneInterface.listener_filenos[fileno]
+            if owner_interface == self:
+                if hasattr(listener_socket, "shutdown"):
+                    if callable(listener_socket.shutdown):
+                        try: listener_socket.shutdown(socket.SHUT_RDWR)
+                        except Exception as e:
+                            if   str(e).endswith("Transport endpoint is not connected"): pass
+                            elif str(e).endswith("Bad file descriptor"): pass
+                            else: RNS.log("Error while shutting down socket for "+str(self)+": "+str(e), RNS.LOG_ERROR)
 
     @property
     def blocked_ip_list(self):
         if not self.block_fast_flapping: return []
-        else: return list(self.fast_flapping.keys())
+        else: return [ip for ip in self.fast_flapping if self.fast_flapping[ip][2] > self.fast_flap_grace]
 
     @property
     def blocked_ip_count(self):
@@ -422,11 +689,10 @@ class BackboneClientInterface(Interface):
         self.i2p_tunneled     = i2p_tunneled
         self.mode             = RNS.Interfaces.Interface.Interface.MODE_FULL
         self.bitrate          = BackboneClientInterface.BITRATE_GUESS
-        self.frame_buffer     = b""
-        self.transmit_buffer_chunks = deque()
-        self.transmit_buffer_bytes = 0
-        self.transmit_buffer_head_offset = 0
-        self.transmit_buffer_lock = threading.Lock()
+        self.transmit_buffer  = TransmitBuffer()
+        self.receive_buffer   = ReceiveBuffer(mtu=lambda: self.HW_MTU, min_frame_len=RNS.Reticulum.HEADER_MINSIZE,
+                                              max_frame_len=lambda: self.HW_MTU+(getattr(self, "ifac_size", None) or 0),
+                                              on_frame=self.process_incoming, on_invalid=self.invalid_frame)
         
         if max_reconnect_tries == None:
             self.max_reconnect_tries = BackboneClientInterface.RECONNECT_MAX_TRIES
@@ -477,12 +743,12 @@ class BackboneClientInterface(Interface):
 
     def detach(self):
         self.online = False
+        self.detached = True
         if self.socket != None:
             if hasattr(self.socket, "close"):
                 if callable(self.socket.close):
                     self.detached = True
                     EventedSocketIO.detach_client_interface(self)
-                    
                     try:
                         if self.socket != None: self.socket.shutdown(socket.SHUT_RDWR)
                     except Exception as e:
@@ -516,6 +782,7 @@ class BackboneClientInterface(Interface):
             self.socket.settimeout(BackboneClientInterface.INITIAL_CONNECT_TIMEOUT)
             self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self.socket.connect(target_address)
+            # TODO: Check missing setblocking(0)
             self.socket.settimeout(None)
 
             BackboneInterface.add_client_socket(self.socket, self)
@@ -575,107 +842,40 @@ class BackboneClientInterface(Interface):
             self.rxb += len(data)
             if hasattr(self, "parent_interface") and self.parent_interface != None:
                 self.parent_interface.rxb += len(data)
-                        
+
+            self.dp_ingress_packets += 1
             self.owner.inbound(data, self)
 
     def process_outgoing(self, data):
         if self.online and not self.detached:
             try:
-                self.queue_transmit_data(bytes([HDLC.FLAG])+HDLC.escape(data)+bytes([HDLC.FLAG]))
-                BackboneInterface.tx_ready(self)
+                frame = HDLC.frame(data)
+                if self.tx_stalled or not self.transmit_buffer.append(frame, self.tx_hwm):
+                    self.tx_drops += 1
+                    self.tx_dropped_bytes += len(frame)
+                    RNS.log(f"Egress control dropping outbound frame of {RNS.prettysize(len(frame))} on {self}", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+                else: BackboneInterface.tx_ready(self)
 
             except Exception as e:
                 RNS.log("Exception occurred while transmitting via "+str(self)+", tearing down interface", RNS.LOG_ERROR)
                 RNS.log("The contained exception was: "+str(e), RNS.LOG_ERROR)
                 self.teardown()
 
-    def queue_transmit_data(self, data):
-        if not data:
-            return
-        with self.transmit_buffer_lock:
-            self.transmit_buffer_chunks.append(data)
-            self.transmit_buffer_bytes += len(data)
-
-    def transmit_buffer_len(self):
-        with self.transmit_buffer_lock:
-            return self.transmit_buffer_bytes
-
-    def peek_transmit_buffer(self, maximum_bytes=None):
-        with self.transmit_buffer_lock:
-            if not self.transmit_buffer_chunks:
-                return b""
-            data = memoryview(self.transmit_buffer_chunks[0])[self.transmit_buffer_head_offset:]
-            if maximum_bytes == None or len(data) >= maximum_bytes or len(self.transmit_buffer_chunks) == 1:
-                return data if maximum_bytes == None else data[:maximum_bytes]
-            parts = [bytes(data)]
-            remaining = maximum_bytes - len(data)
-            for chunk in list(self.transmit_buffer_chunks)[1:]:
-                if remaining <= 0:
-                    break
-                parts.append(chunk[:remaining])
-                remaining -= min(len(chunk), remaining)
-            return b"".join(parts)
-
-    def consume_transmit_buffer(self, byte_count):
-        if byte_count <= 0:
-            return
-        with self.transmit_buffer_lock:
-            consumed = min(byte_count, self.transmit_buffer_bytes)
-            remaining = consumed
-            while remaining > 0 and self.transmit_buffer_chunks:
-                head_remaining = len(self.transmit_buffer_chunks[0]) - self.transmit_buffer_head_offset
-                if remaining < head_remaining:
-                    self.transmit_buffer_head_offset += remaining
-                    remaining = 0
-                else:
-                    remaining -= head_remaining
-                    self.transmit_buffer_chunks.popleft()
-                    self.transmit_buffer_head_offset = 0
-            self.transmit_buffer_bytes -= consumed
-
     def clear_transmit_buffer(self):
-        with self.transmit_buffer_lock:
-            discarded = self.transmit_buffer_bytes
-            self.transmit_buffer_chunks.clear()
-            self.transmit_buffer_bytes = 0
-            self.transmit_buffer_head_offset = 0
-            return discarded
-
-    def check_frame_len(self, frame_len):
-        if   frame_len <= RNS.Reticulum.HEADER_MINSIZE:        return False
-        elif frame_len >  self.HW_MTU + (self.ifac_size or 0): return False
-        else:                                                  return True
+        discarded = len(self.transmit_buffer)
+        self.transmit_buffer = TransmitBuffer()
+        self._dp_ec_prev_sent = 0
+        self._dp_ec_zero_ticks = 0
+        self._dp_ec_last_drain = time.time()
+        self.tx_stalled = False
+        return discarded
 
     def invalid_frame(self, frame_len):
         RNS.log(f"Invalid HDLC frame of {RNS.prettysize(frame_len)} received on {self}, dropping frame", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
 
     def receive(self, data_in):
         try:
-            if len(data_in) > 0:
-                self.frame_buffer += data_in
-                flags_remaining = True
-                while flags_remaining:
-                    frame_start = self.frame_buffer.find(HDLC.FLAG)
-                    if frame_start != -1:
-                        frame_end = self.frame_buffer.find(HDLC.FLAG, frame_start+1)
-                        if frame_end != -1:
-                            frame = self.frame_buffer[frame_start+1:frame_end]
-                            frame = frame.replace(bytes([HDLC.ESC, HDLC.FLAG ^ HDLC.ESC_MASK]), bytes([HDLC.FLAG]))
-                            frame = frame.replace(bytes([HDLC.ESC, HDLC.ESC  ^ HDLC.ESC_MASK]), bytes([HDLC.ESC]))
-                            frame_len = len(frame)
-                            if frame_len != 0:
-                                if self.check_frame_len(frame_len): self.process_incoming(frame)
-                                else:                               self.invalid_frame(len(frame))
-
-                            self.frame_buffer = self.frame_buffer[frame_end:]
-
-                        else:
-                            if len(self.frame_buffer) > self.HW_MTU*2: self.frame_buffer = b""
-                            flags_remaining = False
-                    else:
-                        self.frame_buffer = b""
-                        flags_remaining = False
-
+            if len(data_in) > 0: self.receive_buffer.feed(data_in)
             else:
                 self.online = False
                 if self.initiator and not self.detached:
@@ -694,8 +894,7 @@ class BackboneClientInterface(Interface):
                 RNS.log("Attempting to reconnect...", RNS.LOG_WARNING)
                 def job(): self.reconnect()
                 threading.Thread(target=job, daemon=True).start()
-            else:
-                self.teardown()
+            else: self.teardown()
 
     def teardown(self):
         if self.initiator and not self.detached:

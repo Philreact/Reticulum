@@ -32,13 +32,14 @@ import os
 import time
 import threading
 import subprocess
+import tempfile
 import urllib.parse
 import RNS
 import struct
 import base64
 from collections import deque
 from datetime import datetime
-from RNS.Utilities.rngit import APP_NAME
+from RNS.Utilities.rngit import APP_NAME, media
 from RNS.Utilities.rngit.util import MarkdownToMicron, san_sha
 from RNS.Utilities.rngit.highlight import SyntaxHighlighter
 from RNS.vendor.configobj import ConfigObj
@@ -50,6 +51,7 @@ from RNS.Utilities.rngit.commitsigs import unarmor_ssh_signature, parse_ssh_sign
 class NomadNetworkNode():
     APP_NAME              = "nomadnetwork"
     JOBS_INTERVAL         = 5
+    LINK_CLEAN_INTERVAL   = 60
 
     PATH_INDEX            = "/page/index.mu"
     PATH_GROUP            = "/page/group.mu"
@@ -64,6 +66,7 @@ class NomadNetworkNode():
     PATH_RELEASE          = "/page/release.mu"
     PATH_WORK             = "/page/work.mu"
     PATH_WORK_DOC         = "/page/work_doc.mu"
+    PATH_MEDIA            = "/media"
     FILE_ARTIFACT         = "/file/artifact"
     FILE_DOWNLOAD         = "/file/download"
     FILE_WORKDOC          = "/file/workdoc"
@@ -120,8 +123,10 @@ class NomadNetworkNode():
     # want to use tabs, three spaces is all you get.
     TAB_WIDTH       = "   "
 
-    RENDERABLE_EXTS = [".md", ".mu"]
-    RENDER_DEFAULT  = [".md", ".mu"]
+    CONVERTABLE_EXTS = [".md"]
+    RENDERABLE_EXTS  = [".md", ".mu"]
+    RENDER_DEFAULT   = [".md", ".mu"]
+    IMAGE_EXTS       = [".webp", ".png", ".jpg", ".jpeg", ".gif", ".tiff", ".tif", ".bmp"]
 
     def __init__(self, owner=None):
         if not owner: raise TypeError(f"Invalid owner {owner} for {self}")
@@ -150,12 +155,16 @@ class NomadNetworkNode():
         self.templates["stats"]    = DEFAULT_STATS_TEMPLATE
         self.templates["work"]     = DEFAULT_WORK_TEMPLATE
         self.templates["work_doc"] = DEFAULT_WORK_DOC_TEMPLATE
+        self.templates["no_ident"] = DEFAULT_NO_IDENT_TEMPLATE
         self.templatesdir          = self.owner.configdir+"/templates"
         self.use_nerdfonts         = self.USE_NERDFONTS
+        self.media_conversion      = True
         self.highlight_syntax      = True
         self.highlighter           = SyntaxHighlighter()
         self.mdc                   = MarkdownToMicron(max_width=self.MAX_RENDER_WIDTH, syntax_highlighter=self.highlighter)
         self.thanks_deque          = deque(maxlen=256)
+        self.active_links          = {}
+        self.last_link_clean       = 0
 
         if not os.path.isdir(self.templatesdir):
             try: os.makedirs(self.templatesdir)
@@ -164,6 +173,8 @@ class NomadNetworkNode():
         if "pages" in self.owner.config:
             if "unicode_icons" in self.owner.config["pages"]:
                 if self.owner.config["pages"].as_bool("unicode_icons"): self.use_nerdfonts = False
+            if "media_conversion" in self.owner.config["pages"]:
+                self.media_conversion = self.owner.config["pages"].as_bool("media_conversion")
 
         self.destination = RNS.Destination(self.identity, RNS.Destination.IN, RNS.Destination.SINGLE, self.APP_NAME, "node")
         self.destination.set_link_established_callback(self.remote_connected)
@@ -210,6 +221,10 @@ class NomadNetworkNode():
             try:
                 if self.announce_interval and time.time() > self.last_announce + self.announce_interval: self.announce()
 
+                if time.time() > self.last_link_clean + self.LINK_CLEAN_INTERVAL:
+                    self.clean_links()
+                    self.last_link_clean = time.time()
+
             except Exception as e: RNS.log(f"Error while running periodic jobs: {e}", RNS.LOG_ERROR)
 
     def get_announce_app_data(self): return self.node_name.encode("utf-8")
@@ -246,6 +261,7 @@ class NomadNetworkNode():
         self.destination.register_request_handler(self.PATH_RELEASE,  response_generator=self.serve_release_page,  allow=RNS.Destination.ALLOW_ALL)
         self.destination.register_request_handler(self.PATH_WORK,     response_generator=self.serve_work_page,     allow=RNS.Destination.ALLOW_ALL)
         self.destination.register_request_handler(self.PATH_WORK_DOC, response_generator=self.serve_work_doc_page, allow=RNS.Destination.ALLOW_ALL)
+        self.destination.register_request_handler(self.PATH_MEDIA,    response_generator=self.serve_media,         allow=RNS.Destination.ALLOW_ALL, auto_compress=False)
         self.destination.register_request_handler(self.FILE_ARTIFACT, response_generator=self.serve_artifact,      allow=RNS.Destination.ALLOW_ALL)
         self.destination.register_request_handler(self.FILE_DOWNLOAD, response_generator=self.serve_download,      allow=RNS.Destination.ALLOW_ALL)
         self.destination.register_request_handler(self.FILE_WORKDOC,  response_generator=self.serve_wd_download,   allow=RNS.Destination.ALLOW_ALL)
@@ -372,6 +388,10 @@ class NomadNetworkNode():
         self.owner.view_succeeded(None, None, remote_identity)
         page_content = "".join(content_parts)
         nav_content = "".join(nav_parts)
+
+        if not remote_identity and self.null_ident.hash in self.owner.blocked_identities:
+            return self.render_template("", template="no_ident", nav_content=nav_content, st=st)
+
         return self.render_template(page_content, nav_content=nav_content, template="front", st=st)
 
     def serve_group_page(self, path, data, request_id, link_id, remote_identity, requested_at):
@@ -391,6 +411,9 @@ class NomadNetworkNode():
         breadcrumb = f">>\n{self.m_link('Node', self.PATH_INDEX)} / {group_name}"
         nav_parts.append(breadcrumb + "\n")
         nav_content = "".join(nav_parts)
+
+        if not remote_identity and self.null_ident.hash in self.owner.blocked_identities:
+            return self.render_template("", template="no_ident", nav_content=nav_content, st=st)
 
         accessible_repos = self.get_accessible_repositories(remote_identity, group_name)
         
@@ -440,6 +463,9 @@ class NomadNetworkNode():
         nav_parts.append(breadcrumb + "\n")
 
         repo = self.get_accessible_repository(remote_identity, group_name, repo_name)
+
+        if not remote_identity and self.null_ident.hash in self.owner.blocked_identities:
+            return self.render_template("", template="no_ident", nav_content="".join(nav_parts), st=st)
 
         if not repo:
             content = self.m_heading("Not Found", 1) + "\nThe requested repository was not found.\n"
@@ -553,6 +579,9 @@ class NomadNetworkNode():
             page_num = max(0, int(page_str))
         
         except (ValueError, TypeError): page_num = 0
+
+        if not remote_identity and self.null_ident.hash in self.owner.blocked_identities:
+            return self.render_template("", template="no_ident", st=st)
 
         repo = self.get_accessible_repository(remote_identity, group_name, repo_name)
         if not repo:
@@ -691,6 +720,9 @@ class NomadNetworkNode():
         render = True if render else False
         raw = True if raw else False
 
+        if not remote_identity and self.null_ident.hash in self.owner.blocked_identities:
+            return self.render_template("", template="no_ident", st=st)
+
         repo = self.get_accessible_repository(remote_identity, group_name, repo_name)
         if not repo:
             content = self.m_heading("Not Found", 1) + "\n\nThe requested repository does not exist or you do not have access to it.\n"
@@ -709,9 +741,10 @@ class NomadNetworkNode():
             content = self.m_heading("Invalid Path", 1) + "\n\nNo file path specified.\n"
             return self.render_template(content, st=st)
 
-        file_path = file_path.lstrip("./").replace("/./", "/")
+        file_path = file_path.removeprefix("./").replace("/./", "/")
         file_ext = os.path.splitext(file_path)[1].lower()
         renderable = file_ext in self.RENDERABLE_EXTS
+        convertable = file_ext in self.CONVERTABLE_EXTS
         if not renderable: raw = True; render = False
         else:
             if raw: render = False
@@ -738,14 +771,16 @@ class NomadNetworkNode():
         nav_parts.append(">>\n" + breadcrumb + "\n")
         sep = self.icon("sep")
 
-        dl_link  = self.m_link("Download", self.FILE_DOWNLOAD, g=group_name, r=repo_name, ref=ref, path=file_path)
+        dl_link = self.m_link("Download", self.FILE_DOWNLOAD, g=group_name, r=repo_name, ref=ref, path=file_path)
         if not renderable: nav_parts.append(f"\nDisplaying Raw {sep} {dl_link}\n")
         else:
             rnd_link = self.m_link("View rendered", self.PATH_BLOB, g=group_name, r=repo_name, ref=ref, path=file_path, render="y")
             raw_link = self.m_link("View raw", self.PATH_BLOB, g=group_name, r=repo_name, ref=ref, path=file_path, raw="y")
+            mu_link = self.m_link("as micron", self.FILE_DOWNLOAD, g=group_name, r=repo_name, ref=ref, path=file_path, fmt="mu")
             if render: render_controls = f"Displaying Rendered {sep} {raw_link}"
             else:      render_controls = f"Displaying Raw {sep} {rnd_link}"
-            nav_parts.append(f"\n{render_controls} {sep} {dl_link}\n")
+            if convertable: nav_parts.append(f"\n{render_controls} {sep} {dl_link} {self.CLR_DIM}{mu_link}`f\n")
+            else:           nav_parts.append(f"\n{render_controls} {sep} {dl_link}\n")
 
         # Get blob info
         blob_info = self.get_blob_info(repo_path, resolved_ref, file_path)
@@ -771,8 +806,9 @@ class NomadNetworkNode():
                 content_parts.append(f"`*{self.m_escape(symlink_target or 'unknown')}`*\n")
 
             elif is_binary:
-                content_parts.append("This file appears to be binary and cannot be displayed as text.\n")
-                # TODO: Implement raw file downloads
+                if file_ext in self.IMAGE_EXTS:
+                    content_parts.append(f"`(Image file`w=n`a=c`:/media/{group_name}/{repo_name}/{ref}/{urllib.parse.quote_plus(file_path)})\n")
+                else: content_parts.append("This file appears to be binary and cannot be displayed as text.\n")
 
             elif size > self.BLOB_SIZE_LIMIT:
                 content_parts.append(f"This file is {RNS.prettysize(size)}, which exceeds the display limit of {RNS.prettysize(self.BLOB_SIZE_LIMIT)}.\n")
@@ -822,6 +858,9 @@ class NomadNetworkNode():
             page_num = max(0, int(page_str))
         
         except (ValueError, TypeError): page_num = 0
+
+        if not remote_identity and self.null_ident.hash in self.owner.blocked_identities:
+            return self.render_template("", template="no_ident", st=st)
 
         repo = self.get_accessible_repository(remote_identity, group_name, repo_name)
         if not repo:
@@ -901,6 +940,9 @@ class NomadNetworkNode():
         if not group_name or not repo_name:
             content = self.m_heading("Error", 2) + "\nInvalid request\n"
             return self.render_template(content, st=st)
+
+        if not remote_identity and self.null_ident.hash in self.owner.blocked_identities:
+            return self.render_template("", template="no_ident", st=st)
 
         repo = self.get_accessible_repository(remote_identity, group_name, repo_name)
         if not repo:
@@ -1057,6 +1099,9 @@ class NomadNetworkNode():
         nav_parts.append(">>\n" + breadcrumb + "\n")
         nav_content = "".join(nav_parts)
 
+        if not remote_identity and self.null_ident.hash in self.owner.blocked_identities:
+            return self.render_template("", template="no_ident", st=st)
+
         if not group_name or not repo_name:
             content = self.m_heading("Error", 2) + "\nInvalid request\n"
             return self.render_template(content, st=st)
@@ -1155,6 +1200,9 @@ class NomadNetworkNode():
         if not group_name or not repo_name:
             content = self.m_heading("Error", 2) + "\nInvalid request\n"
             return self.render_template(content, st=st)
+
+        if not remote_identity and self.null_ident.hash in self.owner.blocked_identities:
+            return self.render_template("", template="no_ident", st=st)
         
         content_parts = []
         nav_parts = []
@@ -1256,6 +1304,9 @@ class NomadNetworkNode():
             content = self.m_heading("Error", 2) + "\nInvalid request\n"
             return self.render_template(content, st=st)
 
+        if not remote_identity and self.null_ident.hash in self.owner.blocked_identities:
+            return self.render_template("", template="no_ident", st=st)
+
         repo = self.get_accessible_repository(remote_identity, group_name, repo_name)
         if not repo:
             content = self.m_heading("Error", 2) + "\nThe requested repository was not found.\n"
@@ -1320,10 +1371,21 @@ class NomadNetworkNode():
             content = self.m_heading("Error", 2) + "\nInvalid request\n"
             return self.render_template(content, st=st)
 
+        if not remote_identity and self.null_ident.hash in self.owner.blocked_identities:
+            return self.render_template("", template="no_ident", st=st)
+
         repo = self.get_accessible_repository(remote_identity, group_name, repo_name)
         if not repo:
             content = self.m_heading("Error", 2) + "\nThe requested repository was not found.\n"
             return self.render_template(content, st=st)
+
+        content_parts = []
+        nav_parts = []
+
+        # Breadcrumb navigation
+        breadcrumb = f">>\n{self.m_link('Node', self.PATH_INDEX)} / {self.m_link(group_name, self.PATH_GROUP, g=group_name)} / {self.m_link(repo_name, self.PATH_REPO, g=group_name, r=repo_name)} / {self.m_link('releases', self.PATH_RELEASES, g=group_name, r=repo_name)} / {tag}"
+        nav_parts.append(breadcrumb + "\n")
+        nav_content = "".join(nav_parts)
 
         releases_path = f"{repo['path']}.releases"
         if tag == "latest":
@@ -1337,14 +1399,6 @@ class NomadNetworkNode():
                 tag = recent_releases[0]["tag"]
 
             else: tag = latest_release
-
-        content_parts = []
-        nav_parts = []
-
-        # Breadcrumb navigation
-        breadcrumb = f">>\n{self.m_link('Node', self.PATH_INDEX)} / {self.m_link(group_name, self.PATH_GROUP, g=group_name)} / {self.m_link(repo_name, self.PATH_REPO, g=group_name, r=repo_name)} / {self.m_link('releases', self.PATH_RELEASES, g=group_name, r=repo_name)} / {tag}"
-        nav_parts.append(breadcrumb + "\n")
-        nav_content = "".join(nav_parts)
 
         release_dir = os.path.join(releases_path, tag)
         
@@ -1422,10 +1476,16 @@ class NomadNetworkNode():
             content = self.m_heading("Error", 2) + "\nInvalid request\n"
             return self.render_template(content, st=st)
 
+        if not remote_identity and self.null_ident.hash in self.owner.blocked_identities:
+            return self.render_template("", template="no_ident", st=st)
+
         repo = self.get_accessible_repository(remote_identity, group_name, repo_name)
         if not repo:
             content = self.m_heading("Error", 2) + "\nThe requested repository was not found.\n"
             return self.render_template(content, st=st)
+
+        work_path = f"{repo['path']}.work"
+        scopes_to_show = ["active", "completed", "proposed"] if scope == "all" else [scope]
 
         content_parts = []
         nav_parts = []
@@ -1441,17 +1501,46 @@ class NomadNetworkNode():
         cmplt_s = "`_" if scope == "completed" else ""
         prpsd_s = "`_" if scope == "proposed" else ""
         all_s = "`_" if scope == "all" else ""
+
+        # Count work documents
+        scope_counts = {"active": 0, "completed": 0, "proposed": 0}
+        for s in ["active", "completed", "proposed"]:
+            try:
+                folder_path = os.path.join(work_path, s)
+                if os.path.isdir(folder_path):
+                    for entry in os.listdir(folder_path):
+                        try:
+                            doc_dir = os.path.join(folder_path, entry)
+                            if not os.path.isdir(doc_dir): continue
+
+                            doc_id = int(entry)
+                            read_access = self.resolve_doc_permission(remote_identity, group_name, repo_name, doc_id, self.owner.PERM_READ)
+                            if not read_access: continue
+
+                            root_path = os.path.join(doc_dir, "root")
+                            if not os.path.isfile(root_path): continue
+                            scope_counts[s] += 1
+                        except Exception as e: RNS.trace_exception(e)
+            except Exception as e: RNS.trace_exception(e)
+        
+        force_counts = True
+        adc = scope_counts['active']
+        cdc = scope_counts['completed']
+        pdc = scope_counts['proposed']
+        tdc = adc+cdc+pdc
+        adc_str = f" ({adc})" if force_counts or (not scope == "active"    and adc) else ""
+        cdc_str = f" ({cdc})" if force_counts or (not scope == "completed" and cdc) else ""
+        pdc_str = f" ({pdc})" if force_counts or (not scope == "proposed"  and pdc) else ""
+        tdc_str = f" ({tdc})" if force_counts or (not scope == "all"       and tdc) else ""
+
         filter_links = []
-        filter_links.append(active_s+self.m_link("Active", self.PATH_WORK, g=group_name, r=repo_name, scope="active")+active_s)
-        filter_links.append(cmplt_s+self.m_link("Completed", self.PATH_WORK, g=group_name, r=repo_name, scope="completed")+cmplt_s)
-        filter_links.append(prpsd_s+self.m_link("Proposed", self.PATH_WORK, g=group_name, r=repo_name, scope="proposed")+prpsd_s)
-        filter_links.append(all_s+self.m_link("All", self.PATH_WORK, g=group_name, r=repo_name, scope="all")+all_s)
+        filter_links.append(active_s+self.m_link("Active", self.PATH_WORK, g=group_name, r=repo_name, scope="active")+active_s+adc_str)
+        filter_links.append(cmplt_s+self.m_link("Completed", self.PATH_WORK, g=group_name, r=repo_name, scope="completed")+cmplt_s+cdc_str)
+        filter_links.append(prpsd_s+self.m_link("Proposed", self.PATH_WORK, g=group_name, r=repo_name, scope="proposed")+prpsd_s+pdc_str)
+        filter_links.append(all_s+self.m_link("All", self.PATH_WORK, g=group_name, r=repo_name, scope="all")+all_s+tdc_str)
         content_parts.append(f" {sep} ".join(filter_links) + "\n\n")
 
         # Load work documents
-        work_path = f"{repo['path']}.work"
-        scopes_to_show = ["active", "completed", "proposed"] if scope == "all" else [scope]
-
         for s in scopes_to_show:
             folder_path = os.path.join(work_path, s)
 
@@ -1483,11 +1572,11 @@ class NomadNetworkNode():
             docs.sort(key=lambda x: max(x["created"], x["edited"]), reverse=True)
 
             if not docs:
-                content_parts.append(self.m_heading(f"{s.capitalize()} ({len(docs)})", 2)+f"\n`*No {s} work documents`*\n")
+                content_parts.append(self.m_heading(f"{s.capitalize()}", 2)+f"\n`*No {s} work documents`*\n")
                 content_parts.append("\n")
 
             else:
-                content_parts.append(self.m_heading(f"{s.capitalize()} ({len(docs)})", 2))
+                content_parts.append(self.m_heading(f"{s.capitalize()}", 2))
                 content_parts.append("\n")
 
                 for doc in docs:
@@ -1521,6 +1610,9 @@ class NomadNetworkNode():
         if not group_name or not repo_name or not doc_id:
             content = self.m_heading("Error", 2) + "\nInvalid request\n"
             return self.render_template(content, st=st)
+
+        if not remote_identity and self.null_ident.hash in self.owner.blocked_identities:
+            return self.render_template("", template="no_ident", st=st)
 
         try: doc_id = int(doc_id)
         except:
@@ -1671,7 +1763,7 @@ class NomadNetworkNode():
 
         repo = self.get_accessible_repository(remote_identity, group_name, repo_name)
         if not repo:
-            RNS.log(f"Repository not found or no access for artifact request {group_name}/{repo_name}/{tag}/{artifact}", RNS.LOG_WARNING)
+            RNS.log(f"Repository not found or no access for artifact request {group_name}/{repo_name}/{tag}/{artifact}", RNS.LOG_DEBUG)
             return None
 
         releases_path = f"{repo['path']}.releases"
@@ -1715,6 +1807,69 @@ class NomadNetworkNode():
         self.owner.release_download_succeeded(group_name, repo_name, remote_identity)
         return [open(artifact_path, "rb"), {"name": artifact.encode("utf-8")}]
 
+    def serve_media(self, path, data, request_id, link_id, remote_identity, requested_at):
+        st = time.time()
+        RNS.log(f"Media request from {remote_identity}", RNS.LOG_DEBUG)
+
+        if not data or not type(data) == dict: data = {}
+        if not "key" in data:
+            RNS.log(f"Missing request key in media request", RNS.LOG_DEBUG)
+            return False
+
+        media_path = data.get("path", None)
+        if not media_path:
+            RNS.log(f"Missing path in media request", RNS.LOG_DEBUG)
+            return False
+
+        comps = media_path.removeprefix("/media").lstrip("/").split("/")
+        if len(comps) < 4:
+            RNS.log(f"Insufficient path components in media request", RNS.LOG_DEBUG)
+            return False
+
+        group_name = comps[0]
+        repo_name  = comps[1]
+        ref        = comps[2]
+        file_path  = "/".join(comps[3:])
+        file_path  = urllib.parse.unquote_plus(file_path)
+        file_name  = os.path.basename(file_path)
+
+        repo = self.get_accessible_repository(remote_identity, group_name, repo_name)
+        if not repo:
+            RNS.log(f"Repository not found or no access for media request {group_name}/{repo_name}/{ref}/{file_path}", RNS.LOG_DEBUG)
+            return False
+
+        repo_path = repo["path"]
+
+        resolved_ref = self.resolve_ref(repo_path, ref)
+        if not resolved_ref:
+            RNS.log(f"Ref not found for media request {group_name}/{repo_name}/{ref}/{file_path}", RNS.LOG_WARNING)
+            return False
+
+        if not file_path:
+            RNS.log(f"No file path for media request {group_name}/{repo_name}/{ref}/{file_path}", RNS.LOG_WARNING)
+            return False
+
+        blob_info = self.get_blob_info(repo_path, resolved_ref, file_path)
+        if blob_info is None:
+            RNS.log(f"File not found at ref for media request {group_name}/{repo_name}/{ref}/{file_path}", RNS.LOG_WARNING)
+            return False
+        
+        else:
+            stream = None
+            response_name = file_name
+            file_ext = os.path.splitext(file_path)[1].lower()
+            if self.media_conversion and file_ext in self.IMAGE_EXTS and file_ext != ".webp":
+                converted = self.get_webp_stream(repo_path, resolved_ref, file_path, link_id)
+                if converted: stream, response_name = converted
+
+            if not stream: stream = self.get_blob_stream(repo_path, resolved_ref, file_path)
+            if stream: return [stream, {"name": response_name.encode("utf-8")}]
+            else:
+                RNS.log(f"Could not resolve blob stream for media request {group_name}/{repo_name}/{ref}/{file_path}", RNS.LOG_WARNING)
+                return None
+
+        return None
+
     def serve_download(self, path, data, request_id, link_id, remote_identity, requested_at):
         st = time.time()
         RNS.log(f"File download request from {remote_identity}", RNS.LOG_DEBUG)
@@ -1723,13 +1878,19 @@ class NomadNetworkNode():
         group_name = data.get("var_g", "")   if data else ""
         repo_name = data.get("var_r", "")    if data else ""
         ref = data.get("var_ref", "HEAD")    if data else "HEAD"
+        file_fmt  = data.get("var_fmt", "")  if data else ""
         file_path = data.get("var_path", "") if data else ""
         file_path = urllib.parse.unquote_plus(file_path)
         file_name = os.path.basename(file_path)
+        file_ext  = os.path.splitext(file_path)[1].lower()
+        convertable = file_ext in self.CONVERTABLE_EXTS
+        if file_fmt and not convertable:
+            RNS.log(f"Download conversion request for non-convertable file", RNS.LOG_DEBUG)
+            return None
 
         repo = self.get_accessible_repository(remote_identity, group_name, repo_name)
         if not repo:
-            RNS.log(f"Repository not found or no access for download request {group_name}/{repo_name}/{ref}/{file_path}", RNS.LOG_WARNING)
+            RNS.log(f"Repository not found or no access for download request {group_name}/{repo_name}/{ref}/{file_path}", RNS.LOG_DEBUG)
             return None
 
         repo_path = repo["path"]
@@ -1752,7 +1913,47 @@ class NomadNetworkNode():
             stream = self.get_blob_stream(repo_path, resolved_ref, file_path)
             if stream is not None:
                 self.owner.download_succeeded(group_name, repo_name, remote_identity)
-                return [stream, {"name": file_name.encode("utf-8")}]
+                if not file_fmt: return [stream, {"name": file_name.encode("utf-8")}]
+                elif file_fmt == "mu":
+                    link = self.active_links.get(link_id)
+                    if not link:
+                        RNS.log(f"Could not resolve link for file conversion of {file_path}", RNS.LOG_WARNING)
+                        return None
+
+                    if not hasattr(link, "temporary_directories"): link.temporary_directories = []
+                    tmpdir = tempfile.TemporaryDirectory()
+                    link.temporary_directories.append(tmpdir)
+
+                    stem = os.path.splitext(os.path.basename(file_path))[0]
+                    response_name = stem + ".mu"
+
+                    try:
+                        path_components = file_path.strip("/").split("/")
+                        path = "/".join(path_components[:-1])+"/" if len(path_components) > 1 else ""
+                        url_scope = f":/page/blob.mu`g={group_name}|r={repo_name}|ref={ref}|path={path}"
+                        mdc = MarkdownToMicron(max_width=self.MAX_RENDER_WIDTH, syntax_highlighter=self.highlighter, url_scope=url_scope)
+                        mu = mdc.format_block(stream.read().decode("utf-8")).rstrip().encode("utf-8")
+
+                        if not mu:
+                            if tmpdir in link.temporary_directories: link.temporary_directories.remove(tmpdir)
+                            tmpdir.cleanup()
+                            return None
+
+                        fd, spool_path = tempfile.mkstemp(prefix=stem+".", suffix=".mu", dir=tmpdir.name)
+                        os.close(fd)
+                        with open(spool_path, "wb") as f: f.write(mu)
+
+                        spool = open(spool_path, "rb")
+                        return [spool, {"name": f"{os.path.splitext(file_name)[0]}.mu".encode("utf-8")}]
+
+                    except Exception as e:
+                        RNS.log(f"Error during file conversion of {file_path} for {link}: {e}", RNS.LOG_WARNING)
+                        if tmpdir in link.temporary_directories: link.temporary_directories.remove(tmpdir)
+                        try: tmpdir.cleanup()
+                        except Exception: pass
+                        return None
+
+                else: return None
             
             else:
                 RNS.log(f"Could not resolve blob stream for download request {group_name}/{repo_name}/{ref}/{file_path}", RNS.LOG_WARNING)
@@ -1783,7 +1984,7 @@ class NomadNetworkNode():
 
         repo = self.get_accessible_repository(remote_identity, group_name, repo_name)
         if not repo:
-            RNS.log(f"Repository not found or no access for workdoc download request {group_name[:128]}/{repo_name[:128]}/{doc_id}", RNS.LOG_WARNING)
+            RNS.log(f"Repository not found or no access for workdoc download request {group_name[:128]}/{repo_name[:128]}/{doc_id}", RNS.LOG_DEBUG)
             return None
 
         doc_access = self.resolve_doc_permission(remote_identity, group_name, repo_name, doc_id, self.owner.PERM_READ)
@@ -2083,6 +2284,40 @@ class NomadNetworkNode():
         except Exception as e:            RNS.log(f"Error getting blob content handle: {e}", RNS.LOG_WARNING)
         
         return None
+
+    def get_webp_stream(self, repo_path, ref, file_path, link_id):
+        file_path = file_path.strip("/")
+        link = self.active_links.get(link_id)
+        if not link:
+            RNS.log(f"Could not resolve link for media conversion of {file_path}", RNS.LOG_WARNING)
+            return None
+
+        if not hasattr(link, "temporary_directories"): link.temporary_directories = []
+        tmpdir = tempfile.TemporaryDirectory()
+        link.temporary_directories.append(tmpdir)
+
+        stem = os.path.splitext(os.path.basename(file_path))[0]
+        response_name = stem + ".webp"
+
+        try:
+            fd, spool_path = tempfile.mkstemp(prefix=stem+".", suffix=".webp", dir=tmpdir.name)
+            os.close(fd)
+
+            converted = media.convert_to_webp(["git", "show", f"{ref}:{file_path}"], spool_path, cwd=repo_path)
+            if not converted:
+                if tmpdir in link.temporary_directories: link.temporary_directories.remove(tmpdir)
+                tmpdir.cleanup()
+                return None
+
+            spool = open(spool_path, "rb")
+            return spool, response_name
+
+        except Exception as e:
+            RNS.log(f"Error during media conversion of {file_path} for {link}: {e}", RNS.LOG_WARNING)
+            if tmpdir in link.temporary_directories: link.temporary_directories.remove(tmpdir)
+            try: tmpdir.cleanup()
+            except Exception: pass
+            return None
 
     def get_refs_info(self, repo_path, default_branch=None):
         refs = {"heads": [], "tags": []}
@@ -2695,11 +2930,38 @@ class NomadNetworkNode():
 
     def remote_connected(self, link):
         RNS.log(f"Peer connected to {self.destination}", RNS.LOG_DEBUG)
+        self.active_links[link.link_id] = link
         link.set_remote_identified_callback(self.remote_identified)
         link.set_link_closed_callback(self.remote_disconnected)
 
     def remote_disconnected(self, link):
         RNS.log(f"Peer disconnected from {self.destination}", RNS.LOG_DEBUG)
+        if link.link_id in self.active_links: self.active_links.pop(link.link_id)
+        self.cleanup_link_temporary_resources(link)
+
+    def clean_links(self):
+        stale_links = []
+        for link_id, link in self.active_links.items():
+            if not link.status == RNS.Link.ACTIVE: stale_links.append(link_id)
+
+        cleaned_links = 0
+        for link_id in stale_links:
+            link = self.active_links.pop(link_id, None)
+            if link:
+                self.cleanup_link_temporary_resources(link)
+                cleaned_links += 1
+
+        if cleaned_links > 0: RNS.log(f"Cleaned {cleaned_links} stale link{'s' if cleaned_links != 1 else ''}", RNS.LOG_DEBUG)
+
+    def cleanup_link_temporary_resources(self, link):
+        if hasattr(link, "temporary_directories"):
+            for tmpdir in link.temporary_directories:
+                try:
+                    tmpdir.cleanup()
+                    RNS.log(f"Cleaned up {tmpdir.name}", RNS.LOG_DEBUG)
+                except Exception as e: RNS.log(f"Error while cleaning temporary directory: {e}", RNS.LOG_ERROR)
+
+            link.temporary_directories = []
 
     def remote_identified(self, link, identity):
         RNS.log(f"Peer identified as {link.get_remote_identity()} on {link}", RNS.LOG_DEBUG)
@@ -2794,6 +3056,9 @@ DEFAULT_STATS_TEMPLATE = """{PAGE_CONTENT}"""
 DEFAULT_WORK_TEMPLATE = """{PAGE_CONTENT}"""
 
 DEFAULT_WORK_DOC_TEMPLATE = """{PAGE_CONTENT}"""
+
+# Error state templates
+DEFAULT_NO_IDENT_TEMPLATE = """>>No Identity\n\nThis page requires identification, and none was received.\n"""
 
 # Fallback template
 FALLBACK_TEMPLATE = """{PAGE_CONTENT}"""

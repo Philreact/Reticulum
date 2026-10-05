@@ -1,6 +1,6 @@
 # Reticulum License
 #
-# Copyright (c) 2016-2025 Mark Qvist
+# Copyright (c) 2016-2026 Mark Qvist
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -282,12 +282,9 @@ class RNodeInterface(Interface):
         if (port != None or device_serial != None) and (enable_bluetooth or disable_bluetooth or pairing_mode):
             serial = None
             bluetooth_state = None
-            if pairing_mode:
-                bluetooth_state = 0x01
-            elif enable_bluetooth:
-                bluetooth_state = 0x01
-            elif disable_bluetooth:
-                bluetooth_state = 0x00
+            if pairing_mode:        bluetooth_state = 0x01
+            elif enable_bluetooth:  bluetooth_state = 0x01
+            elif disable_bluetooth: bluetooth_state = 0x00
 
             if port != None:
                 RNS.log("Opening serial port "+port+"...")
@@ -518,6 +515,7 @@ class RNodeInterface(Interface):
 
         self.packet_queue    = []
         self.flow_control    = flow_control
+        self.shared_medium   = True
         self.interface_ready = False
         self.announce_rate_target = None
         self.last_port_io = 0
@@ -1506,13 +1504,13 @@ class RNodeInterface(Interface):
 
         except Exception as e:
             self.online = False
-            RNS.log("A serial port error occurred, the contained exception was: "+str(e), RNS.LOG_ERROR)
-            RNS.log("The interface "+str(self)+" experienced an unrecoverable error and is now offline.", RNS.LOG_ERROR)
+            if not self.detached:
+                RNS.log("A serial port error occurred, the contained exception was: "+str(e), RNS.LOG_ERROR)
+                RNS.log("The interface "+str(self)+" experienced an unrecoverable error and is now offline.", RNS.LOG_ERROR)
 
-            if RNS.Reticulum.panic_on_interface_error:
-                RNS.panic()
+                if RNS.Reticulum.panic_on_interface_error: RNS.panic()
 
-            RNS.log("Reticulum will attempt to reconnect the interface periodically.", RNS.LOG_ERROR)
+                RNS.log("Reticulum will attempt to reconnect the interface periodically.", RNS.LOG_ERROR)
 
         self.online = False
 
@@ -1572,10 +1570,14 @@ class RNodeInterface(Interface):
         except Exception as e:
             RNS.log(f"An error occurred while detaching {self}: {e}", RNS.LOG_ERROR)
 
-        if self.use_ble: self.ble.close()
-        if self.use_tcp:
+        if self.use_ble:
+            self.ble.close()
+            self.ble.cleanup()
+        elif self.use_tcp:
             time.sleep(0.5)
             self.tcp.close()
+        else:
+            self.serial.close()
 
     def should_ingress_limit(self):
         return False
@@ -1653,6 +1655,9 @@ class BLEConnection(BluetoothDispatcher):
             data = self.owner.ble_rx_queue
             self.owner.ble_rx_queue = b""
             return data
+
+    def cleanup(self):
+        self.should_run = False
 
     def close(self):
         try:
@@ -1742,7 +1747,7 @@ class BLEConnection(BluetoothDispatcher):
                         ble_devices = self.find_target_devices()
                     
                     if len(ble_devices) > 0: self.ble_device = ble_devices.pop()
-                    else:                    self.ble_device == None
+                    else:                    self.ble_device = None
 
                     if self.ble_device != None:
                         if self.was_connected:

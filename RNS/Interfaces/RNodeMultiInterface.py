@@ -1,6 +1,6 @@
 # Reticulum License
 #
-# Copyright (c) 2016-2025 Mark Qvist
+# Copyright (c) 2016-2026 Mark Qvist
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -269,6 +269,7 @@ class RNodeMultiInterface(Interface):
         self.r_stat_tx   = None
         self.r_stat_rssi = None
         self.r_stat_snr  = None
+        self.r_stat_q    = None
         self.r_st_alock  = None
         self.r_lt_alock  = None
         self.r_random    = None
@@ -276,6 +277,8 @@ class RNodeMultiInterface(Interface):
         self.packet_queue    = []
         self.interface_ready = False
         self.announce_rate_target = None
+        self.reports_phy_stats    = True
+
 
         self.validcfg  = True
         if id_interval != None and id_callsign != None:
@@ -543,17 +546,25 @@ class RNodeMultiInterface(Interface):
             if written != len(frame):
                 raise IOError("Serial interface only wrote "+str(written)+" bytes of "+str(len(data)))
 
-    def received_announce(self, from_spawned=False):
-        if from_spawned: self.ia_freq_deque.append(time.time())
+    def received_announce(self, size=0, from_spawned=False):
+        if from_spawned:
+            self.ia_freq_deque.append(time.time())
+            self.arxb += size
 
-    def sent_announce(self, from_spawned=False):
-        if from_spawned: self.oa_freq_deque.append(time.time())
+    def sent_announce(self, size=0, from_spawned=False):
+        if from_spawned:
+            self.oa_freq_deque.append(time.time())
+            self.atxb += size
 
-    def received_path_request(self, from_spawned=False):
-        if from_spawned: self.ip_freq_deque.append(time.time())
+    def received_path_request(self, size=0, from_spawned=False):
+        if from_spawned:
+            self.ip_freq_deque.append(time.time())
+            self.prxb += size
 
-    def sent_path_request(self, from_spawned=False):
-        if from_spawned: self.op_freq_deque.append(time.time())
+    def sent_path_request(self, size=0, from_spawned=False):
+        if from_spawned:
+            self.op_freq_deque.append(time.time())
+            self.ptxb += size
 
     def readLoop(self):
         try:
@@ -905,6 +916,7 @@ class RNodeMultiInterface(Interface):
             if interface != 0:
                 self.setRadioState(KISS.RADIO_STATE_OFF, interface)
         self.leave()
+        self.serial.close()
 
     def teardown_subinterfaces(self):
         for interface in self.subinterfaces:
@@ -993,6 +1005,7 @@ class RNodeSubInterface(Interface):
         self.r_premable_time_ms = None
 
         self.packet_queue    = []
+        self.shared_medium   = True
         self.interface_ready = False
         self.parent_interface = parent_interface
         self.announce_rate_target = None
@@ -1116,10 +1129,9 @@ class RNodeSubInterface(Interface):
             self.bitrate = 0
 
     def process_incoming(self, data):
+        if not data: return
         self.rxb += len(data)
         self.owner.inbound(data, self)
-        self.r_stat_rssi = None
-        self.r_stat_snr = None
 
     def process_outgoing(self,data):
         if self.online:

@@ -191,7 +191,7 @@ class Link:
 
                 if len(data) == Link.ECPUBSIZE+Link.LINK_MTU_SIZE:
                     RNS.log("Link request includes MTU signalling", RNS.LOG_EXTREME) if RNS.sl(RNS.LOG_EXTREME) else None
-                    try: link.mtu = Link.mtu_from_lr_packet(packet) or Reticulum.MTU
+                    try: link.mtu = Link.mtu_from_lr_packet(packet) or RNS.Reticulum.MTU
                     except Exception as e:
                         RNS.trace_exception(e)
                         link.mtu = RNS.Reticulum.MTU
@@ -597,7 +597,7 @@ class Link:
 
     def get_expected_rate(self):
         """
-        :returns: The packet expected in-flight data rate of an established link.
+        :returns: The expected in-flight data rate of an established link.
         """
         if self.status == Link.ACTIVE: return self.expected_rate
         else:                          return None
@@ -687,8 +687,8 @@ class Link:
         except Exception as e: pass
 
     def link_closed(self):
-        for resource in self.incoming_resources: resource.cancel()
-        for resource in self.outgoing_resources: resource.cancel()
+        for resource in self.incoming_resources.copy(): resource.cancel()
+        for resource in self.outgoing_resources.copy(): resource.cancel()
         if self._channel: self._channel._shutdown()
             
         self.prv = None
@@ -933,6 +933,13 @@ class Link:
 
     def receive(self, packet):
         self.watchdog_lock = True
+        try: self.__receive(packet)
+        except Exception as e:
+            RNS.log(f"Error on {self} while receiving packet: {e}", RNS.LOG_ERROR)
+            RNS.trace_exception(e)
+        finally: self.watchdog_lock = False
+
+    def __receive(self, packet):
         if not self.status == Link.CLOSED and not (self.initiator and packet.context == RNS.Packet.KEEPALIVE and packet.data == bytes([0xFF])):
             if packet.receiving_interface != self.attached_interface:
                 RNS.log(f"Link-associated packet received on unexpected interface {packet.receiving_interface} instead of {self.attached_interface}! Someone might be trying to manipulate your communication!", RNS.LOG_ERROR)
@@ -1165,8 +1172,6 @@ class Link:
                                 def job(resource=resource): resource.validate_proof(packet.data)
                                 threading.Thread(target=job, daemon=True).start()
                                 self.__update_phy_stats(packet, query_shared=True)
-
-        self.watchdog_lock = False
 
     def encrypt(self, plaintext):
         try:
