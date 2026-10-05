@@ -367,6 +367,7 @@ class EventedSocketIO:
         client_socket.setblocking(0)
         fileno = client_socket.fileno()
         with EventedSocketIO._selector_lock:
+            interface._evented_write_interest_armed = False
             EventedSocketIO.spawned_interface_filenos[fileno] = interface
             if not EventedSocketIO.register_in(fileno):
                 if EventedSocketIO.spawned_interface_filenos.get(fileno) is interface:
@@ -414,7 +415,7 @@ class EventedSocketIO:
                 server_socket.close()
 
     @staticmethod
-    def tx_ready(interface):
+    def tx_ready(interface, force=False):
         with EventedSocketIO._selector_lock:
             client_socket = interface.socket
             if client_socket:
@@ -426,8 +427,15 @@ class EventedSocketIO:
                 return
             if EventedSocketIO.spawned_interface_filenos.get(fileno) is interface and interface.socket is client_socket:
                 EventedSocketIO._note_tx_buffer(EventedSocketIO._pending_length(interface))
+                if not force and getattr(interface, "_evented_write_interest_armed", False):
+                    return
+                # A failed selector update may leave the socket unregistered.
+                # Keep normal transmit retries enabled until success is known.
+                interface._evented_write_interest_armed = False
                 try:
                     recovered = EventedSocketIO._modify_or_recover_fileno(fileno, EventedSocketIO._read_write_mask(), interface)
+                    if recovered:
+                        interface._evented_write_interest_armed = True
                     EventedSocketIO.wake()
                     if not recovered:
                         RNS.log(f"Deferred local I/O write interest update for {interface}; socket remains open", RNS.LOG_DEBUG)
@@ -437,17 +445,25 @@ class EventedSocketIO:
 
     @staticmethod
     def _set_client_interest(fileno, interface):
-        if EventedSocketIO._pending_length(interface) > 0:
-            mask = EventedSocketIO._read_write_mask()
-        else:
-            mask = EventedSocketIO._read_mask()
+        with EventedSocketIO._selector_lock:
+            if EventedSocketIO._pending_length(interface) > 0:
+                mask = EventedSocketIO._read_write_mask()
+            else:
+                mask = EventedSocketIO._read_mask()
 
-        updated = EventedSocketIO._modify_or_recover_fileno(fileno, mask, interface)
-        # Do not let a producer's write-ready update get overwritten by a
-        # concurrent transition back to read-only interest.
-        if updated and mask == EventedSocketIO._read_mask() and EventedSocketIO._pending_length(interface) > 0:
-            updated = EventedSocketIO._modify_or_recover_fileno(fileno, EventedSocketIO._read_write_mask(), interface)
-        return updated
+            # Invalidate before modifying: some selectors unregister first,
+            # so an exception does not guarantee the old interest survived.
+            interface._evented_write_interest_armed = False
+            updated = EventedSocketIO._modify_or_recover_fileno(fileno, mask, interface)
+            interface._evented_write_interest_armed = bool(
+                updated and mask == EventedSocketIO._read_write_mask()
+            )
+            # Do not let a producer's write-ready update get overwritten by a
+            # concurrent transition back to read-only interest.
+            if updated and mask == EventedSocketIO._read_mask() and EventedSocketIO._pending_length(interface) > 0:
+                updated = EventedSocketIO._modify_or_recover_fileno(fileno, EventedSocketIO._read_write_mask(), interface)
+                interface._evented_write_interest_armed = bool(updated)
+            return updated
 
     @staticmethod
     def _pending_length(interface):
@@ -498,6 +514,7 @@ class EventedSocketIO:
     @staticmethod
     def detach_client_interface(interface):
         with EventedSocketIO._selector_lock:
+            interface._evented_write_interest_armed = False
             for fileno, mapped_interface in list(EventedSocketIO.spawned_interface_filenos.items()):
                 if mapped_interface is interface:
                     EventedSocketIO.deregister_fileno(fileno)
@@ -523,6 +540,7 @@ class EventedSocketIO:
                 return
             EventedSocketIO.deregister_fileno(fileno)
             EventedSocketIO.spawned_interface_filenos.pop(fileno, None)
+            spawned_interface._evented_write_interest_armed = False
         if error:
             EventedSocketIO._note_stat("socket_error_count")
         else:

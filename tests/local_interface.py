@@ -1,9 +1,12 @@
+import errno
 import select
 import selectors
+import socket
 import threading
 import time
 import unittest
 from collections import deque
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from RNS.Interfaces.BackboneInterface import BackboneInterface
@@ -49,7 +52,88 @@ class _ConcurrentModifyDetector:
             self.active -= 1
 
 
+class _UnregisteringSelector(selectors.SelectSelector):
+    # Model the unregister/register transition used by BaseSelector.modify(),
+    # including KqueueSelector, on any test platform.
+    modify = selectors.BaseSelector.modify
+    fail_next_register = False
+
+    def register(self, *args, **kwargs):
+        if self.fail_next_register:
+            self.fail_next_register = False
+            raise OSError(errno.ENOMEM, "simulated transient registration failure")
+        return super().register(*args, **kwargs)
+
+
 class TestLocalInterfaceIo(unittest.TestCase):
+    def test_interest_update_exception_allows_next_transmit_to_recover(self):
+        for pending in (b"", b"queued"):
+            with self.subTest(pending=pending):
+                client, peer = socket.socketpair()
+                with client, peer, _UnregisteringSelector() as selector:
+                    client.setblocking(False)
+                    peer.settimeout(1.0)
+                    fileno = client.fileno()
+                    interface = SimpleNamespace(
+                        socket=client, transmit_buffer=pending,
+                        _evented_write_interest_armed=True,
+                        detached=False, parent_interface=None, txb=0,
+                    )
+                    selector.register(fileno, selectors.EVENT_READ | selectors.EVENT_WRITE)
+                    with patch.object(EventedSocketIO, "event_backend", "test-selector"), patch.object(
+                        EventedSocketIO, "selector", selector
+                    ), patch.object(
+                        EventedSocketIO, "spawned_interface_filenos", {fileno: interface}
+                    ), patch.object(EventedSocketIO, "wake"), patch("RNS.log"):
+                        selector.fail_next_register = True
+                        with self.assertRaises(OSError):
+                            EventedSocketIO._set_client_interest(fileno, interface)
+
+                        self.assertNotIn(fileno, selector.get_map())
+                        self.assertFalse(interface._evented_write_interest_armed)
+                        interface.transmit_buffer += b"next packet"
+                        expected = interface.transmit_buffer
+                        BackboneInterface.tx_ready(interface)
+                        self.assertEqual(
+                            selector.get_key(fileno).events,
+                            selectors.EVENT_READ | selectors.EVENT_WRITE,
+                        )
+                        self.assertTrue(interface._evented_write_interest_armed)
+                        self.assertFalse(EventedSocketIO._write_client_socket(fileno, interface, client))
+                        self.assertEqual(peer.recv(len(expected)), expected)
+                        self.assertEqual(interface.transmit_buffer, b"")
+                        self.assertFalse(interface._evented_write_interest_armed)
+
+    def test_failed_forced_transmit_update_allows_normal_retry(self):
+        for registered in (True, False):
+            with self.subTest(registered=registered):
+                client, peer = socket.socketpair()
+                with client, peer, _UnregisteringSelector() as selector:
+                    fileno = client.fileno()
+                    interface = SimpleNamespace(
+                        socket=client, transmit_buffer=b"queued",
+                        _evented_write_interest_armed=True,
+                    )
+                    if registered:
+                        selector.register(fileno, selectors.EVENT_READ | selectors.EVENT_WRITE)
+                    with patch.object(EventedSocketIO, "event_backend", "test-selector"), patch.object(
+                        EventedSocketIO, "selector", selector
+                    ), patch.object(
+                        EventedSocketIO, "spawned_interface_filenos", {fileno: interface}
+                    ), patch.object(EventedSocketIO, "wake"), patch("RNS.log"):
+                        selector.fail_next_register = True
+                        EventedSocketIO.tx_ready(interface, force=True)
+
+                        self.assertNotIn(fileno, selector.get_map())
+                        self.assertFalse(interface._evented_write_interest_armed)
+                        self.assertNotEqual(client.fileno(), -1)
+                        BackboneInterface.tx_ready(interface)
+                        self.assertEqual(
+                            selector.get_key(fileno).events,
+                            selectors.EVENT_READ | selectors.EVENT_WRITE,
+                        )
+                        self.assertTrue(interface._evented_write_interest_armed)
+
     def test_failed_client_registration_is_rolled_back(self):
         fileno = 42
         interface = type("Interface", (), {"socket": _FakeSocket(fileno)})()
@@ -107,6 +191,94 @@ class TestLocalInterfaceIo(unittest.TestCase):
             BackboneInterface.tx_ready(interface)
 
         self.assertEqual(fake_epoll.modifications, [])
+
+    def test_tx_ready_skips_redundant_write_interest_and_wakeup(self):
+        fileno = 42
+        interface = type(
+            "Interface",
+            (),
+            {
+                "socket": _FakeSocket(fileno),
+                "transmit_buffer": b"queued",
+                "_evented_write_interest_armed": True,
+            },
+        )()
+
+        with patch.object(
+            EventedSocketIO,
+            "spawned_interface_filenos",
+            {fileno: interface},
+        ), patch.object(
+            EventedSocketIO, "_modify_or_recover_fileno"
+        ) as modify, patch.object(EventedSocketIO, "wake") as wake:
+            EventedSocketIO.tx_ready(interface)
+
+        modify.assert_not_called()
+        wake.assert_not_called()
+
+    def test_forced_tx_ready_preserves_selector_recovery(self):
+        fileno = 42
+        interface = type(
+            "Interface",
+            (),
+            {
+                "socket": _FakeSocket(fileno),
+                "transmit_buffer": b"queued",
+                "_evented_write_interest_armed": True,
+            },
+        )()
+
+        with patch.object(
+            EventedSocketIO,
+            "spawned_interface_filenos",
+            {fileno: interface},
+        ), patch.object(
+            EventedSocketIO, "_modify_or_recover_fileno", return_value=True
+        ) as modify, patch.object(EventedSocketIO, "wake") as wake:
+            EventedSocketIO.tx_ready(interface, force=True)
+
+        modify.assert_called_once_with(
+            fileno, EventedSocketIO._read_write_mask(), interface
+        )
+        wake.assert_called_once_with()
+
+    def test_read_only_transition_allows_next_write_rearm(self):
+        fileno = 42
+        interface = type(
+            "Interface",
+            (),
+            {
+                "socket": _FakeSocket(fileno),
+                "transmit_buffer": b"",
+                "_evented_write_interest_armed": True,
+            },
+        )()
+
+        with patch.object(
+            EventedSocketIO, "_modify_or_recover_fileno", return_value=True
+        ) as modify:
+            self.assertTrue(EventedSocketIO._set_client_interest(fileno, interface))
+
+        self.assertFalse(interface._evented_write_interest_armed)
+        modify.assert_called_once_with(
+            fileno, EventedSocketIO._read_mask(), interface
+        )
+
+        interface.transmit_buffer = b"queued"
+        with patch.object(
+            EventedSocketIO,
+            "spawned_interface_filenos",
+            {fileno: interface},
+        ), patch.object(
+            EventedSocketIO, "_modify_or_recover_fileno", return_value=True
+        ) as modify, patch.object(EventedSocketIO, "wake") as wake:
+            EventedSocketIO.tx_ready(interface)
+
+        self.assertTrue(interface._evented_write_interest_armed)
+        modify.assert_called_once_with(
+            fileno, EventedSocketIO._read_write_mask(), interface
+        )
+        wake.assert_called_once_with()
 
     def test_selector_interest_updates_are_serialized(self):
         selector = _ConcurrentModifyDetector()

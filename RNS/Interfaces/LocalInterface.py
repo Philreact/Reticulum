@@ -355,7 +355,7 @@ class LocalClientInterface(Interface):
             if stalled_for >= LOCAL_TX_RECOVERY_SECONDS:
                 self._request_transmit_recovery()
             elif stalled_for >= LOCAL_TX_REARM_SECONDS:
-                EventedSocketIO.tx_ready(self)
+                EventedSocketIO.tx_ready(self, force=True)
 
 
     def send_keepalive(self):
